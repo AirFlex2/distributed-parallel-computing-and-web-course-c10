@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dpc-c10-postgres
+    environment:
+      POSTGRES_USER: dpc_user
+      POSTGRES_PASSWORD: dpc_password
+      POSTGRES_DB: dpc_c10
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dpc_user -d dpc_c10"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  app-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dpc-c10-api
+    hostname: app-a
+    networks:
+      default:
+        aliases:
+          - api
+          - app-a
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_URLS: "http://+:8080"
+      INSTANCE_ID: "app-a"
+      DB_CONNECTION_STRING: "${DB_CONNECTION_STRING:-Host=postgres;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50}"
+      API_AUTH_TOKEN: "${API_AUTH_TOKEN:-secret-c10-token-2026}"
+      QUEUE_CAPACITY: "${QUEUE_CAPACITY:-100}"
+      WORKERS: "${WORKERS:-3}"
+      UNSAFE_MODE: "${UNSAFE_MODE:-false}"
+      EXECUTION_MODEL: "${EXECUTION_MODEL:-async_tasks}"
+      QUEUE_ENGINE: "${QUEUE_ENGINE:-custom_monitor}"
+      SLOW_CALL_MIN_MS: "${SLOW_CALL_MIN_MS:-200}"
+      SLOW_CALL_MAX_MS: "${SLOW_CALL_MAX_MS:-700}"
+      ALLOW_TEST_OVERRIDES: "${ALLOW_TEST_OVERRIDES:-false}"
+    stop_grace_period: 60s
+
+  app-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dpc-c10-app-b
+    hostname: app-b
+    networks:
+      default:
+        aliases:
+          - app-b
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_URLS: "http://+:8080"
+      INSTANCE_ID: "app-b"
+      DB_CONNECTION_STRING: "${DB_CONNECTION_STRING:-Host=postgres;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50}"
+      API_AUTH_TOKEN: "${API_AUTH_TOKEN:-secret-c10-token-2026}"
+      QUEUE_CAPACITY: "${QUEUE_CAPACITY:-100}"
+      WORKERS: "${WORKERS:-3}"
+      UNSAFE_MODE: "${UNSAFE_MODE:-false}"
+      EXECUTION_MODEL: "${EXECUTION_MODEL:-async_tasks}"
+      QUEUE_ENGINE: "${QUEUE_ENGINE:-custom_monitor}"
+      SLOW_CALL_MIN_MS: "${SLOW_CALL_MIN_MS:-200}"
+      SLOW_CALL_MAX_MS: "${SLOW_CALL_MAX_MS:-700}"
+      ALLOW_TEST_OVERRIDES: "${ALLOW_TEST_OVERRIDES:-false}"
+    stop_grace_period: 60s
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: dpc-c10-nginx
+    depends_on:
+      - app-a
+      - app-b
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: dpc-c10-prometheus
+    depends_on:
+      - app-a
+      - app-b
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+volumes:
+  pgdata:

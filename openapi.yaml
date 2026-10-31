@@ -1,0 +1,1377 @@
+openapi: 3.1.0
+info:
+  title: "C10: Запис на вибіркові дисципліни — Спільний контракт API (Web + РПО, ЛР1)"
+  version: "1.2.0"
+  description: |
+    Єдиний контракт API у форматі OpenAPI 3.1 для спільної теми **С10 «Запис на вибіркові дисципліни»**:
+    - **Курс «Обмін даними у Web-застосунках» (ЛР1: О1.1–О1.7, Д1.1–Д1.5)**:
+      - Головна операція `POST /v1/enrollments` (атомарна транзакція БД поверх єдиного ресурсу `discipline_group`, `201 Created` із заголовком `Location`, помилки `400`, `403`, `404`, `409`, `422` у форматі `Problem Details` RFC 9457);
+      - Обов'язковий заголовок `X-User-Id` на користувацьких маршрутах (заборона визначення власника з тіла запиту);
+      - Курсорне пагінування `GET /v1/enrollments?limit=...&after=...` за парою `(created_at DESC, id DESC)`;
+      - Каталог дисциплін і груп `GET /v1/disciplines` із часовим вікном `[opens_at, closes_at)` (`Europe/Kyiv`) та кредитами ЄКТС (`<= 30.0`), довідник студентів `GET /v1/students`;
+      - Скасування запису `POST /v1/enrollments/{id}/cancel` та закриття групи `POST /v1/groups/{id}/close`;
+      - Наскрізний `X-Request-ID` та підтримка `traceparent` (W3C Trace Context).
+    - **Курс «Розподілені та паралельні обчислення» (ЛР1: О1.1–О1.5, Д1.1–Д1.4)**:
+      - Приймання заявок у внутрішню обмежену чергу `POST /v1/enrollment-requests` (`202 Accepted`, відсікання перевантаження `429 Too Many Requests` + `Retry-After: 1`, `503 Service Unavailable` під час SIGTERM);
+      - Опитування стану заявки `GET /v1/enrollment-requests/{id}` із одноразовою фіксацією `first_read_at`;
+      - Стан спільного ресурсу через SQL-представлення `VIEW group_seats` (`GET /v1/group-seats`, `GET /v1/group-seats/{id}`) та метрики черги і закону Літтла `GET /metrics`.
+
+servers:
+  - url: http://localhost:8080
+    description: Вхідна точка через балансувальник навантаження Nginx (least_conn між app-a та app-b)
+
+tags:
+  - name: Shared
+    description: Спільні службові та стендові маршрути обох курсів
+  - name: Web
+    description: Маршрути курсу «Обмін даними у Web-застосунках» (ЛР1)
+  - name: DPC
+    description: Маршрути курсу «Розподілені та паралельні обчислення» (ЛР1)
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Фіксований токен авторизації для маршрутів РПО (`secret-c10-token-2026`)
+
+  parameters:
+    XRequestIdHeader:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: Наскрізний ідентифікатор HTTP-запиту (О1.6 Web). Якщо не передано клієнтом — генерується сервером і повертається у відповіді.
+      schema:
+        type: string
+      example: "req-c10-2026-0001"
+    XUserIdRequiredHeader:
+      name: X-User-Id
+      in: header
+      required: true
+      description: Обов'язковий ідентифікатор наперед створеного студента в БД до введення автентифікації в ЛР3 (О1.4 Web). Якщо відсутній — повертається 400 Bad Request Problem Details.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+      example: "student-1"
+    XUserIdOptionalHeader:
+      name: X-User-Id
+      in: header
+      required: false
+      description: Опційний ідентифікатор користувача для запису в журнал запитів.
+      schema:
+        type: string
+      example: "student-1"
+    TraceparentHeader:
+      name: traceparent
+      in: header
+      required: false
+      description: Заголовок W3C Trace Context для трасування (Д1.4 Web). Валідний trace-id записується в однорядковий JSON-журнал.
+      schema:
+        type: string
+      example: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+  headers:
+    XRequestIdResponseHeader:
+      description: Наскрізний ідентифікатор запиту (О1.6 Web)
+      schema:
+        type: string
+    XInstanceIdResponseHeader:
+      description: Ідентифікатор екземпляра додатка за балансувальником nginx (`app-a` або `app-b`)
+      schema:
+        type: string
+        enum: [app-a, app-b]
+    RetryAfterHeader:
+      description: Рекомендована пауза у секундах перед повторною спробою при переповненні черги (О1.2 РПО)
+      schema:
+        type: string
+      example: "1"
+
+  schemas:
+    ProblemDetails:
+      type: object
+      description: Повідомлення про помилку у форматі RFC 9457 Problem Details (application/problem+json)
+      required: [type, title, status, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        error_code:
+          type: string
+        request_id:
+          type: string
+        instance_id:
+          type: string
+        timestamp_utc:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required: [status, instance_id, timestamp_utc, queue_length, queue_capacity, allow_test_overrides]
+      properties:
+        status:
+          type: string
+          enum: [ok, shutting_down]
+        instance_id:
+          type: string
+        timestamp_utc:
+          type: string
+          format: date-time
+        queue_length:
+          type: integer
+        queue_capacity:
+          type: integer
+        allow_test_overrides:
+          type: boolean
+
+    WebStudent:
+      type: object
+      required: [id, email, full_name, max_disciplines, active_count, active_ects, max_ects]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+        max_disciplines:
+          type: integer
+        active_count:
+          type: integer
+        active_ects:
+          type: number
+        max_ects:
+          type: number
+
+    WebStudentListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebStudent"
+
+    CreateWebEnrollmentRequest:
+      type: object
+      required: [group_id]
+      properties:
+        group_id:
+          type: string
+          description: Рядковий ідентифікатор групи вибіркової дисципліни (посилання на discipline_group.id). Поле student_id у тілі заборонено (422).
+        evaluated_at:
+          type: string
+          format: date-time
+          description: Опційний момент часу в ISO 8601 для стендової перевірки меж вікна [opens_at, closes_at). Дозволений лише при ALLOW_TEST_OVERRIDES=true (інакше 403).
+
+    WebEnrollmentResponse:
+      type: object
+      required:
+        - id
+        - student_id
+        - group_id
+        - discipline_id
+        - discipline_title
+        - ects
+        - status
+        - version
+        - created_at
+        - expires_at
+        - created_at_local
+        - expires_at_local
+        - university_tz
+      properties:
+        id:
+          type: string
+          description: Рядковий UUID запису студента на дисципліну (О1.4)
+        student_id:
+          type: string
+        group_id:
+          type: string
+        discipline_id:
+          type: string
+        discipline_title:
+          type: string
+        ects:
+          type: number
+          description: Точна кількість кредитів ЄКТС дисципліни (numeric(4,1))
+        status:
+          type: string
+          enum: [held, confirmed, expired, cancelled]
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        created_at_local:
+          type: string
+          description: Час створення у часовому поясі університету (Europe/Kyiv, ISO 8601)
+        expires_at_local:
+          type: string
+          description: Час закінчення утримання місця у часовому поясі університету (Europe/Kyiv, ISO 8601)
+        university_tz:
+          type: string
+          example: "Europe/Kyiv"
+        instance_id:
+          type: string
+          example: "app-a"
+        extra_server_field:
+          type: string
+          description: Додаткове поле для перевірки ігнорування невідомих полів клієнтом (О1.7)
+
+    WebEnrollmentListResponse:
+      type: object
+      required: [items, next_cursor, limit, student_id, active_count, max_disciplines, active_ects, max_ects]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebEnrollmentResponse"
+        next_cursor:
+          type: [string, "null"]
+          description: Непрозорий курсор для переходу до наступної сторінки або null, якщо досягнуто кінця списку (О1.5)
+        limit:
+          type: integer
+        student_id:
+          type: string
+        active_count:
+          type: integer
+        max_disciplines:
+          type: integer
+        active_ects:
+          type: number
+        max_ects:
+          type: number
+
+    WebDisciplineGroup:
+      type: object
+      required: [id, discipline_id, group_code, seats, available, opens_at, closes_at, opens_at_local, closes_at_local, university_tz, closed, window_active]
+      properties:
+        id:
+          type: string
+        discipline_id:
+          type: string
+        group_code:
+          type: string
+        seats:
+          type: integer
+        available:
+          type: integer
+        opens_at:
+          type: string
+          format: date-time
+        closes_at:
+          type: string
+          format: date-time
+        opens_at_local:
+          type: string
+        closes_at_local:
+          type: string
+        university_tz:
+          type: string
+        closed:
+          type: boolean
+        window_active:
+          type: boolean
+
+    WebDiscipline:
+      type: object
+      required: [id, code, title, ects, groups]
+      properties:
+        id:
+          type: string
+        code:
+          type: string
+        title:
+          type: string
+        ects:
+          type: number
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebDisciplineGroup"
+
+    WebDisciplineListResponse:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebDiscipline"
+        next_cursor:
+          type: [string, "null"]
+
+    CreateDpcEnrollmentRequest:
+      type: object
+      required: [student_id, group_id]
+      properties:
+        student_id:
+          type: string
+        group_id:
+          type: string
+        second_choice_group_id:
+          type: [string, "null"]
+          description: Необов'язкова група другого вибору для розподілу після закриття запису в основну групу (С10 п. 2, 6 РПО)
+        request_id:
+          type: string
+          format: uuid
+
+    DpcEnrollmentAcceptedResponse:
+      type: object
+      required: [id, student_id, group_id, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        group_id:
+          type: string
+        second_choice_group_id:
+          type: [string, "null"]
+        status:
+          type: string
+          enum: [queued, processing, done, rejected, failed]
+        created_at:
+          type: string
+          format: date-time
+
+    DpcEnrollmentStatusResponse:
+      type: object
+      required: [id, student_id, group_id, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        group_id:
+          type: string
+        second_choice_group_id:
+          type: [string, "null"]
+        assigned_group_id:
+          type: [string, "null"]
+        recorded_in_roster:
+          type: boolean
+        status:
+          type: string
+          enum: [queued, processing, done, rejected, failed]
+        rejection_reason:
+          type: [string, "null"]
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        finished_at:
+          type: [string, "null"]
+          format: date-time
+        first_read_at:
+          type: [string, "null"]
+          format: date-time
+        queue_wait_ms:
+          type: [number, "null"]
+        processing_time_ms:
+          type: [number, "null"]
+        delivery_wait_ms:
+          type: [number, "null"]
+
+    GroupSeatsResponse:
+      type: object
+      required: [group_id, discipline_title, seats, taken, free_seats, invariant_holds]
+      properties:
+        group_id:
+          type: string
+        discipline_title:
+          type: string
+        seats:
+          type: integer
+        taken:
+          type: integer
+        free_seats:
+          type: integer
+        roster_count:
+          type: integer
+        invariant_holds:
+          type: boolean
+
+    DecanateRosterEntry:
+      type: object
+      required: [request_id, student_id, group_id, discipline_id, discipline_title, ects, assignment_type, created_at]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        group_id:
+          type: string
+        discipline_id:
+          type: string
+        discipline_title:
+          type: string
+        ects:
+          type: number
+        enrollment_id:
+          type: [string, "null"]
+        assignment_type:
+          type: string
+          enum: [primary_roster, second_choice]
+        created_at:
+          type: string
+          format: date-time
+
+    SecondChoiceDistributionRequest:
+      type: object
+      properties:
+        student_id:
+          type: string
+        second_choice_group_id:
+          type: string
+        request_id:
+          type: string
+          format: uuid
+
+    SecondChoiceDistributionItem:
+      type: object
+      required: [request_id, student_id, primary_group_id, second_choice_group_id, status, recorded_in_roster]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        primary_group_id:
+          type: string
+        second_choice_group_id:
+          type: string
+        status:
+          type: string
+        enrollment_id:
+          type: [string, "null"]
+        recorded_in_roster:
+          type: boolean
+        rejection_reason:
+          type: [string, "null"]
+
+    SecondChoiceDistributionResponse:
+      type: object
+      required: [primary_group_id, primary_group_closed, distributed_count, rejected_count, items]
+      properties:
+        primary_group_id:
+          type: string
+        primary_group_closed:
+          type: boolean
+        distributed_count:
+          type: integer
+        rejected_count:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SecondChoiceDistributionItem"
+
+    AdminResetResponse:
+      type: object
+      required: [message, unsafe_mode, execution_model]
+      properties:
+        message:
+          type: string
+        unsafe_mode:
+          type: boolean
+        execution_model:
+          type: string
+        instance_id:
+          type: string
+
+paths:
+  /:
+    get:
+      operationId: getApiDiscovery
+      tags: [Shared]
+      summary: Кореневий опис сервісу та перелік основних маршрутів API
+      description: Повертає метадані екземпляра API та перелік доступних маршрутів. Окремий вебклієнт запускається поза Docker Compose (§1.2).
+      x-course: shared
+      responses:
+        "200":
+          description: Опис сервісу та маршрутів
+          content:
+            application/json:
+              example:
+                service: "C10 Enrollment Service (Web + DPC, Lab 1)"
+                instance_id: "app-a"
+                standalone_client: "Запустіть окремий клієнт поза Docker Compose: pwsh client/start_client.ps1 (http://localhost:3000)"
+
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Shared]
+      summary: Перевірка живучості сервісу (О1.6 Web та О1.2 РПО)
+      description: Миттєво відповідає з пам'яті процесу без звернення до бази даних (p95 <= 100 мс під піковим навантаженням).
+      x-course: shared
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Сервіс живий і готовий приймати запити
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIdResponseHeader"
+            X-Instance-Id:
+              $ref: "#/components/headers/XInstanceIdResponseHeader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: "ok"
+                instance_id: "app-a"
+                timestamp_utc: "2026-10-30T08:00:00Z"
+                queue_length: 0
+                queue_capacity: 100
+                allow_test_overrides: false
+
+  /v1/students:
+    get:
+      operationId: listPrecreatedStudents
+      tags: [Web]
+      summary: Довідник наперед створених студентів у БД для вибору X-User-Id до введення автентифікації в ЛР3
+      description: Повертає перелік тестових і робочих профілів студентів із поточними лічильниками активних дисциплін та кредитів ЄКТС.
+      x-course: web
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Список студентів
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebStudentListResponse"
+              example:
+                items:
+                  - id: "student-1"
+                    email: "timur.zinkivskyi@inf.edu.ua"
+                    full_name: "Зінківський Тимур Євгенійович (ІТІНФ-23-2)"
+                    max_disciplines: 5
+                    active_count: 1
+                    active_ects: 6.0
+                    max_ects: 30.0
+
+  /v1/disciplines:
+    get:
+      operationId: listDisciplines
+      tags: [Web]
+      summary: Список вибіркових дисциплін із групами, часовими вікнами та актуальним залишком місць (О1.3, О1.5 Web)
+      description: Читає каталог дисциплін і груп із єдиного спільного ресурсу discipline_group з підтримкою курсорної пагінації за id.
+      x-course: web
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdOptionalHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+        - name: limit
+          in: query
+          required: false
+          description: Кількість дисциплін на сторінці (від 1 до 50)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+        - name: after
+          in: query
+          required: false
+          description: Ідентифікатор останньої дисципліни попередньої сторінки
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Список дисциплін та їхніх груп
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebDisciplineListResponse"
+              example:
+                items:
+                  - id: "DISC-WEB"
+                    code: "CS-402"
+                    title: "Обмін даними у Web-застосунках"
+                    ects: 6.0
+                    groups:
+                      - id: "DISC-WEB-01"
+                        discipline_id: "DISC-WEB"
+                        group_code: "WEB-G1"
+                        seats: 25
+                        available: 24
+                        opens_at: "2025-01-01T08:00:00Z"
+                        closes_at: "2027-12-31T20:00:00Z"
+                        opens_at_local: "2025-01-01T10:00:00+02:00"
+                        closes_at_local: "2027-12-31T22:00:00+02:00"
+                        university_tz: "Europe/Kyiv"
+                        closed: false
+                        window_active: true
+                next_cursor: null
+        "400":
+          description: Некоректний параметр limit
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/enrollments:
+    post:
+      operationId: createEnrollment
+      tags: [Web]
+      summary: Головна операція запису студента на групу вибіркової дисципліни в одній транзакції БД (О1.4, Д1.1, Д1.5 Web)
+      description: |
+        Виконує перевірку інваріантів (вікно `[opens_at, closes_at)`, ліміт K дисциплін, ліміт `30.0` ЄКТС, наявність вільних місць),
+        зменшення `discipline_group.available` та створення запису `enrollment` в одній транзакції PostgreSQL.
+        Власник визначається виключно із заголовка `X-User-Id` (передача `student_id` у тілі повертає `422`).
+      x-course: web
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdRequiredHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWebEnrollmentRequest"
+            examples:
+              standard_enrollment:
+                summary: Успішний запис у відкриту групу
+                value:
+                  group_id: "DISC-WEB-01"
+              boundary_opens_at:
+                summary: Запис рівно в момент відкриття вікна opens_at (при ALLOW_TEST_OVERRIDES=true -> 201 Created)
+                value:
+                  group_id: "DISC-WINDOW-TEST"
+                  evaluated_at: "2026-09-01T07:00:00Z"
+              boundary_closes_at:
+                summary: Запис рівно в момент закриття вікна closes_at (при ALLOW_TEST_OVERRIDES=true -> 409 Conflict)
+                value:
+                  group_id: "DISC-WINDOW-TEST"
+                  evaluated_at: "2026-09-15T15:00:00Z"
+      responses:
+        "201":
+          description: Запис успішно створено після COMMIT транзакції БД
+          headers:
+            Location:
+              description: URI створеного ресурсу запису
+              schema:
+                type: string
+              example: "/v1/enrollments/8f14e45f-ceea-467a-9a38-1b241d45b001"
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIdResponseHeader"
+            X-Instance-Id:
+              $ref: "#/components/headers/XInstanceIdResponseHeader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebEnrollmentResponse"
+              example:
+                id: "8f14e45f-ceea-467a-9a38-1b241d45b001"
+                student_id: "student-1"
+                group_id: "DISC-WEB-01"
+                discipline_id: "DISC-WEB"
+                discipline_title: "Обмін даними у Web-застосунках"
+                ects: 6.0
+                status: "held"
+                version: 1
+                created_at: "2026-10-30T08:15:00Z"
+                expires_at: "2026-10-30T08:30:00Z"
+                created_at_local: "2026-10-30T10:15:00+02:00"
+                expires_at_local: "2026-10-30T10:30:00+02:00"
+                university_tz: "Europe/Kyiv"
+                instance_id: "app-a"
+                extra_server_field: "forward_compatible_o1_7"
+        "400":
+          description: Синтаксично некоректний JSON або відсутній обов'язковий заголовок X-User-Id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/missing_user_header"
+                title: "Відсутній обов'язковий заголовок X-User-Id"
+                status: 400
+                detail: "До введення автентифікації в ЛР3 ідентифікатор студента має обов'язково передаватися у заголовку X-User-Id."
+                instance: "/v1/enrollments"
+                error_code: "missing_user_header"
+                request_id: "req-400-demo"
+        "403":
+          description: Спроба використати тестове перевизначення часу evaluated_at при ALLOW_TEST_OVERRIDES=false
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/test_override_disabled"
+                title: "Тестове перевизначення часу заборонено"
+                status: 403
+                detail: "Передача evaluated_at або заголовка X-Simulated-Now вимкнена у штатному режимі (ALLOW_TEST_OVERRIDES=false)."
+                instance: "/v1/enrollments"
+                error_code: "test_override_disabled"
+        "404":
+          description: Навчальну групу або студента не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/group_not_found"
+                title: "Групу дисципліни не знайдено"
+                status: 404
+                detail: "Група з ідентифікатором 'DISC-UNKNOWN' не існує."
+                instance: "/v1/enrollments"
+                error_code: "group_not_found"
+                request_id: "req-404-demo"
+        "409":
+          description: Конфлікт стану або недостатньо ресурсу (немає вільних місць, поза вікном [opens_at, closes_at), перевищено ліміт K або 30.0 ЄКТС)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/ects_limit_exceeded"
+                title: "Перевищено семестровий ліміт кредитів ЄКТС"
+                status: 409
+                detail: "Сума кредитів після запису становить 30.5 ЄКТС, що перевищує максимум 30.0 ЄКТС."
+                instance: "/v1/enrollments"
+                error_code: "ects_limit_exceeded"
+                request_id: "req-409-demo"
+        "422":
+          description: Некоректні дані у валідному JSON (порожній group_id або заборонене поле student_id у тілі)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/invalid_group_id_format"
+                title: "Некоректні дані запиту (Unprocessable Entity)"
+                status: 422
+                detail: "Поле 'group_id' є обов'язковим, не може бути порожнім або містити пробіли."
+                instance: "/v1/enrollments"
+                error_code: "invalid_group_id_format"
+                request_id: "req-422-demo"
+
+    get:
+      operationId: listStudentEnrollments
+      tags: [Web]
+      summary: Список записів студента з курсорним пагінуванням за парою (created_at DESC, id DESC) (О1.5 Web)
+      description: Повертає сторінку записів виключно для користувача із заголовка `X-User-Id` із непрозорим курсором `next_cursor`.
+      x-course: web
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdRequiredHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+        - name: limit
+          in: query
+          required: false
+          description: Розмір сторінки від 1 до 50
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+        - name: after
+          in: query
+          required: false
+          description: Непрозорий курсор next_cursor із попередньої відповіді
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Сторінка списку записів студента з непрозорим курсором next_cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebEnrollmentListResponse"
+        "400":
+          description: Відсутній X-User-Id, пошкоджений курсор або некоректний limit поза діапазоном [1, 50]
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/invalid_cursor"
+                title: "Пошкоджений або некоректний курсор пагінації"
+                status: 400
+                detail: "Значення курсора 'corrupted-cursor-xyz' не вдалося розпізнати."
+                instance: "/v1/enrollments"
+                error_code: "invalid_cursor"
+
+  /v1/enrollments/{id}:
+    get:
+      operationId: getStudentEnrollmentById
+      tags: [Web]
+      summary: Отримання конкретного запису студента за ідентифікатором із перевіркою власника X-User-Id (С10 Web)
+      description: Повертає запис студента за рядковим UUID, якщо він належить поточному користувачу `X-User-Id`.
+      x-course: web
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Рядковий UUID запису студента
+          schema:
+            type: string
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdRequiredHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Дані запису на дисципліну
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebEnrollmentResponse"
+        "400":
+          description: Відсутній заголовок X-User-Id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Запис не знайдено або належить іншому студенту
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Ідентифікатор запису не є коректним UUID
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/enrollments/{id}/cancel:
+    post:
+      operationId: cancelStudentEnrollment
+      tags: [Web]
+      summary: Скасування запису студентом із поверненням вільного місця в групі (С10 Web)
+      description: Переводить власний запис користувача `X-User-Id` у стан `cancelled` і повертає місце в `discipline_group` у канонічному порядку блокувань (`student -> discipline_group -> enrollment`).
+      x-course: web
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Рядковий UUID запису студента
+          schema:
+            type: string
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdRequiredHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+            examples:
+              cancel_example:
+                summary: Скасування існуючого запису
+                value:
+                  reason: "Студент змінив індивідуальний навчальний план"
+      responses:
+        "200":
+          description: Запис успішно переведено у стан cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebEnrollmentResponse"
+        "400":
+          description: Відсутній заголовок X-User-Id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Запис не знайдено або належить іншому користувачу
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/groups/{id}/close:
+    post:
+      operationId: closeDisciplineGroup
+      tags: [Web]
+      summary: Закриття запису на навчальну групу працівником деканату (С10 Web)
+      description: Встановлює прапорець `closed = true` для групи дисципліни в `discipline_group`, після чого як синхронні Web-записи, так і асинхронні заявки РПО відхиляються.
+      x-course: web
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Ідентифікатор групи дисципліни
+          schema:
+            type: string
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+            examples:
+              close_group_example:
+                summary: Закриття набору в групу
+                value:
+                  reason: "Формування відомості групи завершено деканатом"
+      responses:
+        "200":
+          description: Групу успішно закрито (closed = true)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebDisciplineGroup"
+        "404":
+          description: Групу не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/groups/{id}/distribute-second-choice:
+    post:
+      operationId: distributeSecondChoiceAfterGroupClose
+      tags: [DPC]
+      summary: Окремий механізм розподілу студентів у групи другого вибору після закриття запису (С10 п. 2, 6 РПО)
+      description: |
+        Виконується виключно після закриття запису в основну групу `{id}` (`closed = true`).
+        Розподільник DPC тією самою атомарною умовою місць зменшує `available` у групі другого вибору (`second_choice_group_id`),
+        перевіряє обмеження `max_disciplines` (K) та `30.0` ЄКТС, створює підтверджений запис у `enrollment`
+        (щоб Web не міг повторно записати того самого студента) та фіксує результат у відомості деканату (`decanate_roster`) за `request_id`.
+      x-course: dpc
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Ідентифікатор закритої основної групи першого вибору
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecondChoiceDistributionRequest"
+            examples:
+              distribute_single:
+                summary: Розподіл конкретного студента у групу другого вибору після закриття основної групи
+                value:
+                  student_id: "student-3"
+                  second_choice_group_id: "DISC-SEC-04"
+      responses:
+        "200":
+          description: Результат розподілу за групами другого вибору
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecondChoiceDistributionResponse"
+              example:
+                primary_group_id: "DISC-SEC-03"
+                primary_group_closed: true
+                distributed_count: 1
+                rejected_count: 0
+                items:
+                  - request_id: "ef1db6d7-fa03-4dca-be78-686dccc0ab29"
+                    student_id: "student-3"
+                    primary_group_id: "DISC-SEC-03"
+                    second_choice_group_id: "DISC-SEC-04"
+                    status: "done"
+                    enrollment_id: "8f14e45f-ceea-467a-9a38-1b241d45b001"
+                    recorded_in_roster: true
+                    rejection_reason: null
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Основну групу не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "409":
+          description: Основна група ще відкрита (розподіл можливий лише після закриття запису)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/decanate-roster:
+    get:
+      operationId: listDecanateRoster
+      tags: [DPC]
+      summary: Перегляд відомості деканату за ключем request_id, group_id або student_id (С10 п. 2, 6 РПО)
+      description: Повертає записи відомості деканату (`decanate_roster`), сформовані воркерами РПО під час обробки заявок (`primary_roster`) та після закриття запису (`second_choice`).
+      x-course: dpc
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: group_id
+          in: query
+          required: false
+          description: Фільтр за ідентифікатором групи
+          schema:
+            type: string
+        - name: student_id
+          in: query
+          required: false
+          description: Фільтр за ідентифікатором студента
+          schema:
+            type: string
+        - name: request_id
+          in: query
+          required: false
+          description: Фільтр за UUID заявки request_id
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Список записів у відомості деканату
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, count]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DecanateRosterEntry"
+                  count:
+                    type: integer
+              example:
+                items:
+                  - request_id: "ef1db6d7-fa03-4dca-be78-686dccc0ab29"
+                    student_id: "student-1"
+                    group_id: "DISC-DPC-01"
+                    discipline_id: "DISC-DPC"
+                    discipline_title: "Розподілені та паралельні обчислення"
+                    ects: 6.0
+                    enrollment_id: "8f14e45f-ceea-467a-9a38-1b241d45b001"
+                    assignment_type: "primary_roster"
+                    created_at: "2026-10-30T08:00:00Z"
+                count: 1
+        "400":
+          description: Некоректний UUID у параметрі request_id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/enrollment-requests:
+    post:
+      operationId: enqueueDpcEnrollmentRequest
+      tags: [DPC]
+      summary: Приймання заявки у внутрішню обмежену чергу з негайною відповіддю 202 Accepted (О1.1, О1.2, Д1.4 РПО)
+      description: Послідовно під семафором перевіряє дублікати, місткість обмеженої черги `QUEUE_CAPACITY`, зберігає запис зі статусом `queued` у PostgreSQL і ставить задачу у внутрішню чергу.
+      x-course: dpc
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDpcEnrollmentRequest"
+            examples:
+              dpc_enqueue:
+                summary: Постановка заявки в чергу РПО
+                value:
+                  student_id: "student-1"
+                  group_id: "DISC-DPC-01"
+      responses:
+        "202":
+          description: Заявку збережено в БД зі статусом queued і поставлено у внутрішню чергу
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DpcEnrollmentAcceptedResponse"
+        "400":
+          description: Відсутні обов'язкові поля student_id або group_id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "409":
+          description: Конфлікт даних повторного запиту з тим самим request_id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          description: Обмежена черга заповнена (Backpressure), повертається заголовок Retry-After
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfterHeader"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: Сервіс отримав сигнал SIGTERM і завершує поточні задачі
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/enrollment-requests/{id}:
+    get:
+      operationId: getDpcEnrollmentRequestStatus
+      tags: [DPC]
+      summary: Отримання стану заявки в черзі РПО та фіксація часу першої видачі first_read_at (О1.1, О1.5 РПО)
+      description: Повертає поточний статус заявки (`queued | processing | done | rejected | failed`) та часові інтервали `queue_wait_ms`, `processing_time_ms`, `delivery_wait_ms`.
+      x-course: dpc
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID заявки в черзі РПО
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Стан заявки та часові інтервали черги й обробки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DpcEnrollmentStatusResponse"
+              example:
+                id: "ef1db6d7-fa03-4dca-be78-686dccc0ab29"
+                student_id: "student-1"
+                group_id: "DISC-DPC-01"
+                status: "done"
+                rejection_reason: null
+                created_at: "2026-10-30T08:00:00Z"
+                started_at: "2026-10-30T08:00:00.001Z"
+                finished_at: "2026-10-30T08:00:00.439Z"
+                first_read_at: "2026-10-30T08:00:00.533Z"
+                queue_wait_ms: 0.92
+                processing_time_ms: 438.06
+                delivery_wait_ms: 94.06
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Заявку не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/group-seats:
+    get:
+      operationId: listGroupSeats
+      tags: [DPC]
+      summary: Стан усіх навчальних груп через представлення VIEW group_seats поверх єдиного ресурсу discipline_group (О1.1, О1.4 РПО)
+      description: Відображає актуальний баланс місць (`seats`, `taken`, `free_seats`, `invariant_holds`) для всіх груп.
+      x-course: dpc
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Список станів місць у навчальних групах
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GroupSeatsResponse"
+              example:
+                - group_id: "DISC-DPC-01"
+                  discipline_title: "Розподілені та паралельні обчислення"
+                  seats: 30
+                  taken: 1
+                  free_seats: 29
+                  invariant_holds: true
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/group-seats/{id}:
+    get:
+      operationId: getGroupSeatsById
+      tags: [DPC]
+      summary: Стан місць конкретної навчальної групи та перевірка інваріанта taken <= seats (О1.1, О1.4 РПО)
+      description: Повертає `seats`, `taken = seats - available`, `free_seats` та булевий прапорець дотримання інваріанта `invariant_holds` із представлення `VIEW group_seats`.
+      x-course: dpc
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Ідентифікатор навчальної групи
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Стан місць у вибраній групі
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupSeatsResponse"
+              example:
+                group_id: "DISC-TEST-SAFE"
+                discipline_title: "Ізольований стенд перевірки конкурентності (О1.4 РПО)"
+                seats: 5
+                taken: 5
+                free_seats: 0
+                invariant_holds: true
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Групу не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/admin/reset:
+    post:
+      operationId: resetTestEnvironment
+      tags: [Shared]
+      summary: Стендове скидання даних та перемикання режимів дослідів (лише при ALLOW_TEST_OVERRIDES=true)
+      description: Очищує заявки й записи, відновлює `discipline_group.available = seats` та скидає метрики. У штатному режимі (`ALLOW_TEST_OVERRIDES=false`) повертає `403 Forbidden`.
+      x-course: shared
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: unsafeMode
+          in: query
+          required: false
+          description: Увімкнути або вимкнути демонстраційний небезпечний режим О1.4 на групі DISC-TEST-UNSAFE
+          schema:
+            type: boolean
+        - name: metricsOnly
+          in: query
+          required: false
+          description: Перезапустити лише вікно вимірювань закону Літтла після 10 с розігріву (Д1.2)
+          schema:
+            type: boolean
+        - name: executionModel
+          in: query
+          required: false
+          description: Перемкнути модель пулу воркерів між async_tasks та dedicated_threads (Д1.1)
+          schema:
+            type: string
+            enum: [async_tasks, dedicated_threads]
+      responses:
+        "200":
+          description: Стенд успішно скинуто до початкового стану
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminResetResponse"
+              example:
+                message: "Стан груп, дисциплін, студентів, черги, заявок та метрик успішно скинуто."
+                unsafe_mode: false
+                execution_model: "async_tasks"
+                instance_id: "app-a"
+        "401":
+          description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          description: Стендовий режим вимкнено за замовчуванням (ALLOW_TEST_OVERRIDES=false)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /metrics:
+    get:
+      operationId: getServiceMetrics
+      tags: [DPC]
+      summary: Метрики черги, перцентилі p50/p95/p99 та перевірка закону Літтла L = lambda * W (О1.5, Д1.2 РПО)
+      description: Повертає детальний JSON-звіт (включно з часовим зважуванням та незалежною 100-мс вибіркою довжини черги) або текстовий формат Prometheus (`?format=prometheus`).
+      x-course: dpc
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: Формат виводу метрик (`json` або `prometheus`)
+          schema:
+            type: string
+            enum: [json, prometheus]
+            default: json
+      responses:
+        "200":
+          description: Знімок метрик у форматі JSON або Prometheus
+          content:
+            application/json:
+              example:
+                queue_length: 0
+                in_processing: 0
+                littles_law:
+                  observation_window_sec: 50.52
+                  lambda_arrival_rate_rps: 3.959
+                  w_avg_queue_wait_sec: 0.0861
+                  l_theoretical_avg_queue_length: 0.3409
+                  l_observed_avg_queue_length: 0.3409
+                  l_observed_independent_sampled: 0.3451
+                  independent_sample_count: 505
+            text/plain:
+              example: |
+                # HELP dpc_queue_length Поточна довжина черги запитів
+                # TYPE dpc_queue_length gauge
+                dpc_queue_length 0
