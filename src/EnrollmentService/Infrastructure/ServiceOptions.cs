@@ -34,6 +34,14 @@ public sealed class ServiceOptions
         if (int.TryParse(config["SLOW_CALL_MAX_MS"], out var maxMs)) options.SlowCallMaxMs = maxMs;
         if (bool.TryParse(config["ENABLE_WORKERS"], out var ew)) options.EnableWorkers = ew;
 
+        bool isProduction = string.Equals(config["ASPNETCORE_ENVIRONMENT"], "Production", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(config["DOTNET_ENVIRONMENT"], "Production", StringComparison.OrdinalIgnoreCase);
+
+        if (isProduction && string.Equals(options.ApiAuthToken, "secret-c10-token-2026", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine("[SECURITY WARNING]: У виробничому середовищі (Production) використовується стандартний навчальний API_AUTH_TOKEN. Необхідно задати виділений секрет через конфігурацію виробничого оточення.");
+        }
+
         return options;
     }
 }

@@ -95,7 +95,11 @@ public sealed class RestartAndRecoveryTests
             cmd.Parameters.AddWithValue("id", id);
             await cmd.ExecuteNonQueryAsync();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[RestartAndRecoveryTests Error]: Помилка очищення заявки '{id}': {ex}");
+            throw;
+        }
     }
 
     // 1. Перезапуск застосунку з однією заявкою queued

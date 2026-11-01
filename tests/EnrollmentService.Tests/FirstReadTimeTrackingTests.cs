@@ -44,7 +44,11 @@ public sealed class FirstReadTimeTrackingTests
             cmd.Parameters.AddWithValue("id", id);
             await cmd.ExecuteNonQueryAsync();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[FirstReadTimeTrackingTests Error]: Помилка видалення тестової заявки '{id}': {ex}");
+            throw;
+        }
     }
 
     // 1. Перший GET при queued фіксує t4
