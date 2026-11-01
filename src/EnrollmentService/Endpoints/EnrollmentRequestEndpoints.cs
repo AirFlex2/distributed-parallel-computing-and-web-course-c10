@@ -118,6 +118,7 @@ public static class EnrollmentRequestEndpoints
             }
 
             bool slotConsumedByQueue = false;
+            QueuedRequestItem? item = null;
 
             try
             {
@@ -151,7 +152,7 @@ public static class EnrollmentRequestEndpoints
                 }
 
                 var createdAtUtc = DateTimeOffset.UtcNow;
-                var item = new QueuedRequestItem
+                item = new QueuedRequestItem
                 {
                     Id = requestId,
                     StudentId = studentId,
@@ -218,9 +219,11 @@ public static class EnrollmentRequestEndpoints
                         "service_shutting_down");
                 }
 
+                workerPool.TrackEnqueued(item.Id);
                 bool enqueued = metrics.TryEnqueueReservedAndRecordAccepted(queue, item);
                 if (!enqueued)
                 {
+                    workerPool.UntrackEnqueued(item.Id);
                     await requestRepo.DeleteRequestAsync(item.Id, conn, httpContext.RequestAborted);
                     return ProblemDetailsMapper.CreateProblemResult(
                         httpContext, opts,
@@ -246,6 +249,10 @@ public static class EnrollmentRequestEndpoints
                 if (!slotConsumedByQueue)
                 {
                     queue.ReleaseSlot();
+                    if (item != null)
+                    {
+                        workerPool.UntrackEnqueued(item.Id);
+                    }
                 }
             }
         });
@@ -267,8 +274,7 @@ public static class EnrollmentRequestEndpoints
                     "invalid_request_id_format");
             }
 
-            var status = await requestRepo.MarkFirstReadAndGetStatusAsync(parsedId, DateTimeOffset.UtcNow, ctx.RequestAborted)
-                ?? await requestRepo.GetStatusByIdAsync(parsedId, ctx.RequestAborted);
+            var status = await requestRepo.MarkFirstReadAndGetStatusAsync(parsedId, DateTimeOffset.UtcNow, ctx.RequestAborted);
 
             if (status == null)
             {
@@ -280,11 +286,7 @@ public static class EnrollmentRequestEndpoints
                     "request_not_found");
             }
 
-            bool isTerminal = status.Status is "done" or "rejected" or "failed";
-            if (isTerminal)
-            {
-                metrics.RecordFirstReadIfCompleted(parsedId);
-            }
+            metrics.RecordFirstRead(parsedId);
             var (qWait, proc, deliv) = metrics.GetItemTimings(parsedId);
 
             return Results.Ok(status with

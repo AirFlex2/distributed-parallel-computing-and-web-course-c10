@@ -229,6 +229,8 @@ public sealed class MetricsCollector
         PruneTrackedItemsIfNeeded();
     }
 
+    public void RecordFirstRead(Guid id) => RecordFirstReadIfCompleted(id);
+
     public void RecordFirstReadIfCompleted(Guid id)
     {
         if (!_trackedItems.TryGetValue(id, out var item))

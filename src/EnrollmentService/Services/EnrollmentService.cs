@@ -82,9 +82,9 @@ public sealed class EnrollmentService
             {
                 await tx.RollbackAsync(cancellationToken);
                 return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                    StatusCodes.Status409Conflict,
+                    policy.GetHttpStatusCode(),
                     policy.ErrorCode ?? "policy_violation",
-                    "Відхилено правилами запису",
+                    policy.GetErrorTitle(),
                     policy.RejectionReason ?? "Запит відхилено правилами предметної області.");
             }
 

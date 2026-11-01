@@ -151,7 +151,7 @@ if (-not (Get-Command "dotnet" -ErrorAction SilentlyContinue)) {
 
 $testOut = (& dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj -c Release 2>&1) -join "`n"
 if ($LASTEXITCODE -eq 0) {
-    Write-Pass "Модульні тести (Domain, чисті функції вікна [opens_at, closes_at), черги Monitor та Channel, BearerAuth): УСІ ПРОЙДЕНО (22 тестові випадки: 14 [Fact] та 8 [InlineData])"
+    Write-Pass "Модульні та інтеграційні тести (Domain, черги Monitor/Channel, відновлення queued/processing, фіксація t4 first_read_at, статуси 400/404/409/422): УСІ ПРОЙДЕНО (43 тестові випадки)"
 } else {
     Write-Fail "Помилка модульних тестів:`n$testOut"
 }
@@ -865,33 +865,33 @@ try {
         Write-Fail "Помилка перевірки невідомої групи у Web: status=$([int]$unknownWebGroupRes.StatusCode)"
     }
 
-    # 10.3 Відхилення через закрите часове вікно -> 409 Conflict (О1.1 Web)
+    # 10.3 Відхилення через закрите часове вікно -> 422 Unprocessable Content (О1.1 Web)
     $windowRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-WINDOW-TEST"}' -SkipHttpErrorCheck
     $windowJson = (Get-ResponseText $windowRes) | ConvertFrom-Json
-    if ([int]$windowRes.StatusCode -eq 409 -and $windowJson.error_code -eq "enrollment_window_closed") {
-        Write-Pass "Web О1.1: Спроба запису поза вікном (DISC-WINDOW-TEST) відхилена з HTTP 409 Conflict (error_code=enrollment_window_closed)"
+    if ([int]$windowRes.StatusCode -eq 422 -and $windowJson.error_code -eq "enrollment_window_closed") {
+        Write-Pass "Web О1.1: Спроба запису поза вікном (DISC-WINDOW-TEST) відхилена з HTTP 422 Unprocessable Content (error_code=enrollment_window_closed)"
     } else {
-        Write-Fail "Очікувався 409 enrollment_window_closed, отримано: $([int]$windowRes.StatusCode)"
+        Write-Fail "Очікувався 422 enrollment_window_closed, отримано: $([int]$windowRes.StatusCode)"
     }
 
-    # 10.4 Відхилення через перевищення ліміту K дисциплін -> 409 Conflict (О1.1 Web)
+    # 10.4 Відхилення через перевищення ліміту K дисциплін -> 422 Unprocessable Content (О1.1 Web)
     $limitMaxHeaders = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-limit-max"; "Authorization" = "Bearer $Token" }
     $limitKRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $limitMaxHeaders -Body '{"group_id":"DISC-SEC-04"}' -SkipHttpErrorCheck
     $limitKJson = (Get-ResponseText $limitKRes) | ConvertFrom-Json
-    if ([int]$limitKRes.StatusCode -eq 409 -and $limitKJson.error_code -eq "discipline_limit_exceeded") {
-        Write-Pass "Web О1.1: Перевищення ліміту K дисциплін (5/5) відхилено з HTTP 409 Conflict (error_code=discipline_limit_exceeded)"
+    if ([int]$limitKRes.StatusCode -eq 422 -and $limitKJson.error_code -eq "discipline_limit_exceeded") {
+        Write-Pass "Web О1.1: Перевищення ліміту K дисциплін (5/5) відхилено з HTTP 422 Unprocessable Content (error_code=discipline_limit_exceeded)"
     } else {
-        Write-Fail "Очікувався 409 discipline_limit_exceeded, отримано: $([int]$limitKRes.StatusCode)"
+        Write-Fail "Очікувався 422 discipline_limit_exceeded, отримано: $([int]$limitKRes.StatusCode)"
     }
 
-    # 10.5 Відхилення через перевищення 30.0 ЄКТС -> 409 Conflict (О1.1, Д1.5 Web)
+    # 10.5 Відхилення через перевищення 30.0 ЄКТС -> 422 Unprocessable Content (О1.1, Д1.5 Web)
     $ects20Headers = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-ects-20"; "Authorization" = "Bearer $Token" }
     $limitEctsRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $ects20Headers -Body '{"group_id":"DISC-ECTS-10-5-G1"}' -SkipHttpErrorCheck
     $limitEctsJson = (Get-ResponseText $limitEctsRes) | ConvertFrom-Json
-    if ([int]$limitEctsRes.StatusCode -eq 409 -and $limitEctsJson.error_code -eq "ects_limit_exceeded") {
-        Write-Pass "Web О1.1: Перевищення семестрового ліміту 30.0 ЄКТС (20.0 + 10.5 = 30.5) відхилено з HTTP 409 Conflict (error_code=ects_limit_exceeded)"
+    if ([int]$limitEctsRes.StatusCode -eq 422 -and $limitEctsJson.error_code -eq "ects_limit_exceeded") {
+        Write-Pass "Web О1.1: Перевищення семестрового ліміту 30.0 ЄКТС (20.0 + 10.5 = 30.5) відхилено з HTTP 422 Unprocessable Content (error_code=ects_limit_exceeded)"
     } else {
-        Write-Fail "Очікувався 409 ects_limit_exceeded, отримано: $([int]$limitEctsRes.StatusCode)"
+        Write-Fail "Очікувався 422 ects_limit_exceeded, отримано: $([int]$limitEctsRes.StatusCode)"
     }
 
     # 10.6 Відхилення через брак місць у групі -> 409 Conflict (О1.1 Web, група DISC-ONE-SEAT)

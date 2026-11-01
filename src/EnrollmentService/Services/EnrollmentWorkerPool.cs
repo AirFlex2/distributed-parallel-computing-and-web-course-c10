@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Threading.Channels;
 using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
@@ -24,7 +26,11 @@ public sealed class EnrollmentWorkerPool : IHostedService
     private readonly List<Thread> _dedicatedThreads = new();
     private readonly CancellationTokenSource _workerEpochCts = new();
     private readonly CancellationTokenSource _samplerCts = new();
+    private readonly ConcurrentDictionary<Guid, byte> _enqueuedItemIds = new();
+    private readonly Channel<byte> _replenishSignal = Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropOldest });
+
     private Task? _periodicSamplerTask;
+    private Task? _replenishmentTask;
     private volatile bool _isShuttingDown;
     private int _shutdownInitiated;
 
@@ -46,6 +52,9 @@ public sealed class EnrollmentWorkerPool : IHostedService
         _lifetime = lifetime;
     }
 
+    public void TrackEnqueued(Guid id) => _enqueuedItemIds.TryAdd(id, 0);
+    public void UntrackEnqueued(Guid id) => _enqueuedItemIds.TryRemove(id, out _);
+
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         if (!_options.EnableWorkers)
@@ -57,6 +66,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
             return;
         }
 
+        // 1. Відновлення заявок у стані processing (визначення фінального стану done/failed)
         try
         {
             int recovered = await _requestRepo.RecoverStuckProcessingRequestsAsync(cancellationToken);
@@ -76,9 +86,135 @@ public sealed class EnrollmentWorkerPool : IHostedService
             });
         }
 
+        // 2. Відновлення збережених заявок у стані queued із PostgreSQL до оперативної черги
+        try
+        {
+            int recoveredQueued = await ReplenishQueueFromDatabaseAsync(cancellationToken);
+            if (recoveredQueued > 0)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "recovered_queued_requests", new Dictionary<string, object?>
+                {
+                    ["recovered_count"] = recoveredQueued,
+                    ["current_queue_length"] = _queue.Count
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            StructuredJsonLogger.LogEvent(_options.InstanceId, "recover_queued_requests_failed", new Dictionary<string, object?>
+            {
+                ["error"] = ex.Message
+            });
+        }
+
         _lifetime.ApplicationStopping.Register(() => InitiateShutdown());
         _periodicSamplerTask = Task.Run(() => RunIndependentQueueSamplerAsync(_samplerCts.Token));
         StartWorkers();
+        _replenishmentTask = Task.Run(() => RunQueueReplenishmentLoopAsync(_workerEpochCts.Token));
+    }
+
+    // Послідовна дозавантаження заявок зі статусом queued із PostgreSQL у вільні слоти черги
+    public async Task<int> ReplenishQueueFromDatabaseAsync(CancellationToken cancellationToken = default)
+    {
+        if (_isShuttingDown) return 0;
+
+        int enqueuedCount = 0;
+        while (!_isShuttingDown && !cancellationToken.IsCancellationRequested)
+        {
+            int freeSlots = _queue.Capacity - _queue.Count;
+            if (freeSlots <= 0)
+            {
+                break;
+            }
+
+            var pending = await _requestRepo.GetQueuedRequestsAsync(freeSlots, cancellationToken);
+            if (pending.Count == 0)
+            {
+                break;
+            }
+
+            bool anyAddedThisBatch = false;
+            foreach (var item in pending)
+            {
+                if (_isShuttingDown || cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                // Захист від повторного додавання заявки, яка вже перебуває в черзі пам'яті
+                if (!_enqueuedItemIds.TryAdd(item.Id, 0))
+                {
+                    continue;
+                }
+
+                if (!_queue.TryReserveSlot())
+                {
+                    _enqueuedItemIds.TryRemove(item.Id, out _);
+                    break;
+                }
+
+                bool enqueued = _metrics.TryEnqueueReservedAndRecordAccepted(_queue, item);
+                if (enqueued)
+                {
+                    enqueuedCount++;
+                    anyAddedThisBatch = true;
+                }
+                else
+                {
+                    _queue.ReleaseSlot();
+                    _enqueuedItemIds.TryRemove(item.Id, out _);
+                    break;
+                }
+            }
+
+            if (!anyAddedThisBatch)
+            {
+                break;
+            }
+        }
+
+        return enqueuedCount;
+    }
+
+    private async Task RunQueueReplenishmentLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested && !_isShuttingDown)
+        {
+            try
+            {
+                using var delayCts = new CancellationTokenSource(250);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, delayCts.Token);
+                try
+                {
+                    await _replenishSignal.Reader.ReadAsync(linkedCts.Token);
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                }
+
+                if (token.IsCancellationRequested || _isShuttingDown)
+                {
+                    break;
+                }
+
+                if (_queue.Count < _queue.Capacity)
+                {
+                    await ReplenishQueueFromDatabaseAsync(token);
+                }
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "queue_replenishment_error", new Dictionary<string, object?>
+                {
+                    ["error"] = ex.Message
+                });
+                try { await Task.Delay(100, token); } catch { }
+            }
+        }
     }
 
     // Д1.2: Незалежне періодичне опитування довжини черги з фіксованим кроком 100 мс (поза подіями приходу/виходу)
@@ -176,6 +312,12 @@ public sealed class EnrollmentWorkerPool : IHostedService
                 }
             }
 
+            _workerEpochCts.Cancel();
+            if (_replenishmentTask != null)
+            {
+                try { await _replenishmentTask; } catch { }
+            }
+
             _samplerCts.Cancel();
             if (_periodicSamplerTask != null)
             {
@@ -253,6 +395,11 @@ public sealed class EnrollmentWorkerPool : IHostedService
                     ["error"] = ex.Message
                 });
             }
+            finally
+            {
+                _enqueuedItemIds.TryRemove(item.Id, out _);
+                _replenishSignal.Writer.TryWrite(1);
+            }
         }
     }
 
@@ -291,6 +438,11 @@ public sealed class EnrollmentWorkerPool : IHostedService
                     ["request_id"] = item.Id,
                     ["error"] = ex.Message
                 });
+            }
+            finally
+            {
+                _enqueuedItemIds.TryRemove(item.Id, out _);
+                _replenishSignal.Writer.TryWrite(1);
             }
         }
     }

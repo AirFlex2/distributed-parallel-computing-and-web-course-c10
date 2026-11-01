@@ -40,12 +40,12 @@ public sealed class EnrollmentRequestProcessor
         IBoundedRequestQueue queue,
         CancellationToken cancellationToken = default)
     {
-        _metrics.RecordWorkerStarted(item, queue.Count);
         var startedAtUtc = DateTimeOffset.UtcNow;
+        bool started = false;
 
         try
         {
-            await _requestRepo.MarkStartedAsync(item.Id, startedAtUtc, cancellationToken);
+            started = await _requestRepo.TryMarkStartedAsync(item.Id, startedAtUtc, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -61,6 +61,19 @@ public sealed class EnrollmentRequestProcessor
                 ["error"] = ex.Message
             });
         }
+
+        if (!started)
+        {
+            StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_request_already_claimed", new Dictionary<string, object?>
+            {
+                ["worker_id"] = workerId,
+                ["request_id"] = item.Id,
+                ["detail"] = "Заявку вже було взято в обробку іншим воркером або завершено під час відновлення."
+            });
+            return;
+        }
+
+        _metrics.RecordWorkerStarted(item, queue.Count);
 
         string finalStatus = "failed";
         string? rejectionReason = null;

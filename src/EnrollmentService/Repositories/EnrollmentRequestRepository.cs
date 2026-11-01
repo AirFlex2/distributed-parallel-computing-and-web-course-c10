@@ -107,7 +107,7 @@ public sealed class EnrollmentRequestRepository
         await using var cmd = new NpgsqlCommand(@"
             UPDATE enrollment_requests
             SET first_read_at = COALESCE(first_read_at, @now)
-            WHERE id = @id AND status IN ('done', 'rejected', 'failed')
+            WHERE id = @id
             RETURNING id, student_id, group_id, status, rejection_reason,
                       created_at, started_at, finished_at, first_read_at,
                       assigned_group_id,
@@ -238,17 +238,59 @@ public sealed class EnrollmentRequestRepository
         await deleteCmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task MarkStartedAsync(
+    public async Task<List<QueuedRequestItem>> GetQueuedRequestsAsync(
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT id, student_id, group_id, created_at, idempotency_key, request_payload_hash
+            FROM enrollment_requests
+            WHERE status = 'queued'
+            ORDER BY created_at ASC, id ASC
+            LIMIT @limit;", conn);
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        var list = new List<QueuedRequestItem>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            list.Add(new QueuedRequestItem
+            {
+                Id = reader.GetGuid(0),
+                StudentId = reader.GetString(1),
+                GroupId = reader.GetString(2),
+                CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(3),
+                IdempotencyKey = reader.IsDBNull(4) ? null : reader.GetString(4),
+                RequestPayloadHash = reader.IsDBNull(5) ? null : reader.GetString(5),
+                EnqueueTimestamp = System.Diagnostics.Stopwatch.GetTimestamp()
+            });
+        }
+        return list;
+    }
+
+    public async Task<bool> TryMarkStartedAsync(
         Guid id,
         DateTimeOffset startedAt,
         CancellationToken cancellationToken = default)
     {
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-        await using var cmd = new NpgsqlCommand(
-            "UPDATE enrollment_requests SET status = 'processing', started_at = @startedAt WHERE id = @id", conn);
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE enrollment_requests
+            SET status = 'processing', started_at = @startedAt
+            WHERE id = @id AND status = 'queued';", conn);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("startedAt", startedAt);
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+        int rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
+    }
+
+    public async Task MarkStartedAsync(
+        Guid id,
+        DateTimeOffset startedAt,
+        CancellationToken cancellationToken = default)
+    {
+        await TryMarkStartedAsync(id, startedAt, cancellationToken);
     }
 
     public async Task UpdateStatusAsync(

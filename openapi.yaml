@@ -773,7 +773,21 @@ paths:
                 error_code: "group_not_found"
                 request_id: "req-404-demo"
         "409":
-          description: Конфлікт стану або недостатньо ресурсу (немає вільних місць, поза вікном [opens_at, closes_at), перевищено ліміт K або 30.0 ЄКТС)
+          description: Конфлікт стану (немає вільних місць у групі або повторний запис на ту саму дисципліну)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/group_full"
+                title: "У групі немає вільних місць"
+                status: 409
+                detail: "Вичерпано ліміт місць у навчальній групі 'DISC-WEB-01' (доступно 0 місць)."
+                instance: "/v1/enrollments"
+                error_code: "group_full"
+                request_id: "req-409-demo"
+        "422":
+          description: Семантична неможливість обробки (перевищення семестрового ліміту ЄКТС або кількості дисциплін, запит поза часовим вікном, закрита група або невалідні поля)
           content:
             application/problem+json:
               schema:
@@ -781,24 +795,10 @@ paths:
               example:
                 type: "https://urn.c10.edu.ua/problems/ects_limit_exceeded"
                 title: "Перевищено семестровий ліміт кредитів ЄКТС"
-                status: 409
+                status: 422
                 detail: "Сума кредитів після запису становить 30.5 ЄКТС, що перевищує максимум 30.0 ЄКТС."
                 instance: "/v1/enrollments"
                 error_code: "ects_limit_exceeded"
-                request_id: "req-409-demo"
-        "422":
-          description: Некоректні дані у валідному JSON (порожній group_id або заборонене поле student_id у тілі)
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/ProblemDetails"
-              example:
-                type: "https://urn.c10.edu.ua/problems/invalid_group_id_format"
-                title: "Некоректні дані запиту (Unprocessable Entity)"
-                status: 422
-                detail: "Поле 'group_id' є обов'язковим, не може бути порожнім або містити пробіли."
-                instance: "/v1/enrollments"
-                error_code: "invalid_group_id_format"
                 request_id: "req-422-demo"
 
     get:
