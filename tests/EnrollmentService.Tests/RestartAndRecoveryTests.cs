@@ -11,18 +11,6 @@ namespace EnrollmentService.Tests;
 
 public sealed class RestartAndRecoveryTests
 {
-    private const string ConnectionString = "Host=localhost;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=20";
-
-    private sealed class TestConnectionFactory : IDbConnectionFactory
-    {
-        public async Task<NpgsqlConnection> OpenConnectionAsync(CancellationToken cancellationToken = default)
-        {
-            var conn = new NpgsqlConnection(ConnectionString);
-            await conn.OpenAsync(cancellationToken);
-            return conn;
-        }
-    }
-
     private sealed class DummyHostLifetime : IHostApplicationLifetime
     {
         private readonly CancellationTokenSource _stoppingCts = new();
@@ -33,7 +21,7 @@ public sealed class RestartAndRecoveryTests
         public void StopApplication() => _stoppingCts.Cancel();
     }
 
-    private readonly TestConnectionFactory _factory = new();
+    private readonly IDbConnectionFactory _factory = TestEnvironment.CreateDbConnectionFactory();
     private readonly EnrollmentRequestRepository _requestRepo;
     private readonly GroupRepository _groupRepo;
     private readonly EnrollmentRepository _enrollmentRepo;
@@ -48,18 +36,7 @@ public sealed class RestartAndRecoveryTests
         _decanateRepo = new DecanateRepository(_factory);
     }
 
-    private async Task<bool> IsDatabaseAvailableAsync()
-    {
-        try
-        {
-            await using var conn = await _factory.OpenConnectionAsync();
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private static Task<bool> IsDatabaseAvailableAsync() => TestEnvironment.IsDatabaseAvailableAsync();
 
     private async Task InsertRequestWithStatusAsync(Guid id, string studentId, string groupId, string status, DateTimeOffset? createdAt = null)
     {

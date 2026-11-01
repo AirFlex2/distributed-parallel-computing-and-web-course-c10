@@ -149,11 +149,50 @@ if (-not (Get-Command "dotnet" -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-$testOut = (& dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj -c Release 2>&1) -join "`n"
-if ($LASTEXITCODE -eq 0) {
-    Write-Pass "Модульні та інтеграційні тести (Domain, черги Monitor/Channel, відновлення queued/processing, фіксація t4 first_read_at, E2E HTTP статуси 400/404/409/422): УСІ ПРОЙДЕНО (57 тестових випадків)"
+$trxFile = Join-Path $RepoRoot "tests/EnrollmentService.Tests/TestResults/verify_test_results.trx"
+if (Test-Path $trxFile) { Remove-Item $trxFile -Force -ErrorAction SilentlyContinue }
+
+$testOut = (& dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj -c Release --logger "trx;LogFileName=verify_test_results.trx" 2>&1) -join "`n"
+$testExit = $LASTEXITCODE
+
+$passed = 0
+$failed = 0
+$skipped = 0
+$total = 0
+
+if (Test-Path $trxFile) {
+    try {
+        [xml]$trx = Get-Content $trxFile
+        $counters = $trx.TestRun.ResultSummary.Counters
+        $passed = [int]$counters.passed
+        $failed = [int]$counters.failed
+        $total = [int]$counters.total
+        $executed = [int]$counters.executed
+
+        $nonPassed = ($trx.TestRun.Results.UnitTestResult | Where-Object { $_.outcome -eq "NotExecuted" -or $_.outcome -eq "Ignored" -or $_.outcome -eq "Inconclusive" })
+        if ($null -ne $nonPassed) {
+            $skipped = @($nonPassed).Count
+        } elseif ($total -gt $executed) {
+            $skipped = $total - $executed
+        }
+    } catch { }
+}
+
+if ($total -eq 0) {
+    if ($testOut -match '(?i)(?:пройдено|Passed)\s*[:=]\s*(\d+)') { $passed = [int]$Matches[1] }
+    if ($testOut -match '(?i)(?:не пройдено|Failed)\s*[:=]\s*(\d+)') { $failed = [int]$Matches[1] }
+    if ($testOut -match '(?i)(?:пропущено|Skipped)\s*[:=]\s*(\d+)') { $skipped = [int]$Matches[1] }
+    if ($testOut -match '(?i)(?:всього|Total)\s*[:=]\s*(\d+)') { $total = [int]$Matches[1] }
+}
+
+if ($testExit -eq 0 -and $failed -eq 0 -and $skipped -eq 0 -and $passed -ge 57) {
+    Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
-    Write-Fail "Помилка модульних тестів:`n$testOut"
+    if ($skipped -gt 0) {
+        Write-Fail "Обов'язкові інтеграційні тести були ПРОПУЩЕНІ (можливо, недоступний PostgreSQL): Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total"
+    } else {
+        Write-Fail "Помилка тестування (Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total):`n$testOut"
+    }
 }
 
 # ------------------------------------------------------------------------------

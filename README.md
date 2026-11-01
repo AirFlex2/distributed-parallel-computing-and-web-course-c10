@@ -359,7 +359,10 @@ pojekt/
         ├── BusinessErrorStatusTests.cs            # 9 тестів відповідності бізнес-відмов HTTP-статусам (400/404/409/422)
         ├── FirstReadTimeTrackingTests.cs          # 6 тестів атомарної фіксації t4 first_read_at для всіх статусів
         ├── RestartAndRecoveryTests.cs             # 8 тестів відновлення queued/processing із PostgreSQL при старті
-        └── E2EHttpEndpointTests.cs                # 12 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
+        ├── E2EHttpEndpointTests.cs                # 12 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
+        ├── TestEnvironment.cs                    # Виділена конфігурація тестового середовища (TEST_DB_CONNECTION_STRING) та очищення даних
+        ├── TestCollectionOrder.cs                # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])
+        └── appsettings.Test.json                 # Локальна конфігурація тестового запуску
 ```
 
 ---
