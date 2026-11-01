@@ -9,7 +9,6 @@ public static class DiagnosticsEndpoints
 {
     public static IEndpointRouteBuilder MapDiagnosticsEndpoints(this IEndpointRouteBuilder app)
     {
-        // Опис кореневої точки API
         app.MapGet("/", (ServiceOptions opts) => Results.Ok(new
         {
             service = "C10 Enrollment Service (Web + DPC, Lab 1)",
@@ -22,10 +21,9 @@ public static class DiagnosticsEndpoints
                 enrollments = "/v1/enrollments",
                 enrollment_requests = "/v1/enrollment-requests",
                 group_seats = "/v1/group-seats",
-                decanate_roster = "/v1/decanate-roster",
-                distribute_second_choice = "/v1/groups/{id}/distribute-second-choice"
+                decanate_roster = "/v1/decanate-roster"
             },
-            standalone_client = "Запустіть окремий клієнт поза Docker Compose: pwsh client/start_client.ps1 (http://localhost:3000)"
+            client = "http://localhost:3000"
         }));
 
         // ПУНКТ О1.6 (Web) та О1.2 (РПО): Службовий маршрут перевірки живучості GET /health
@@ -42,21 +40,13 @@ public static class DiagnosticsEndpoints
             });
         });
 
-        // ПУНКТ О1.5 та Д1.2 (РПО): Службовий маршрут GET /metrics
+        // ПУНКТ О1.5 та Д1.2 (РПО): Службовий маршрут GET /metrics (JSON)
         app.MapGet("/metrics", (
-            HttpContext ctx,
             MetricsCollector metrics,
             IBoundedRequestQueue queue,
             ServiceOptions opts,
             EnrollmentWorkerPool pool) =>
         {
-            string? format = ctx.Request.Query["format"];
-            if (string.Equals(format, "prometheus", StringComparison.OrdinalIgnoreCase) ||
-                (ctx.Request.Headers.Accept.ToString().Contains("text/plain", StringComparison.OrdinalIgnoreCase) && format != "json"))
-            {
-                return Results.Text(metrics.BuildPrometheusText(queue.Count), "text/plain; version=0.0.4; charset=utf-8");
-            }
-
             var snapshot = metrics.BuildMetricsSnapshot(queue.Count, opts, pool.IsShuttingDown);
             return Results.Ok(snapshot);
         });

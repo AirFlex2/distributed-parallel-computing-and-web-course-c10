@@ -1,11 +1,7 @@
 namespace EnrollmentService.Http;
 
-public sealed class RequestIdentity
+public static class RequestIdentity
 {
-    public string? UserId { get; set; }
-    public string RequestId { get; set; } = string.Empty;
-    public string? TraceId { get; set; }
-
     public static bool TryRequireCallerStudentId(
         HttpContext ctx,
         ServiceOptions opts,

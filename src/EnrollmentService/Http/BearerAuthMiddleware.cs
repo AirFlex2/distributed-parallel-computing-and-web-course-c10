@@ -13,31 +13,38 @@ public sealed class BearerAuthMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (context.Request.Path.StartsWithSegments("/v1"))
+        if (HttpMethods.IsOptions(context.Request.Method))
         {
-            bool isDpcRoute = context.Request.Path.StartsWithSegments("/v1/enrollment-requests")
-                || context.Request.Path.StartsWithSegments("/v1/group-seats")
-                || context.Request.Path.StartsWithSegments("/v1/decanate-roster")
-                || context.Request.Path.StartsWithSegments("/v1/admin")
-                || (context.Request.Path.Value?.EndsWith("/distribute-second-choice", StringComparison.OrdinalIgnoreCase) == true);
+            await _next(context);
+            return;
+        }
 
-            string authHeader = context.Request.Headers.Authorization.ToString();
-            string expected = $"Bearer {_options.ApiAuthToken}";
+        bool requiresBearerAuth = context.Request.Path.StartsWithSegments("/metrics")
+            || context.Request.Path.StartsWithSegments("/v1/enrollment-requests")
+            || context.Request.Path.StartsWithSegments("/v1/group-seats")
+            || context.Request.Path.StartsWithSegments("/v1/decanate-roster")
+            || context.Request.Path.StartsWithSegments("/v1/admin")
+            || context.Request.Path.StartsWithSegments("/v1/groups");
 
-            if (isDpcRoute)
+        string authHeader = context.Request.Headers.Authorization.ToString();
+        string expected = $"Bearer {_options.ApiAuthToken}";
+
+        if (requiresBearerAuth)
+        {
+            if (string.IsNullOrWhiteSpace(authHeader) || !string.Equals(authHeader.Trim(), expected, StringComparison.Ordinal))
             {
-                if (string.IsNullOrWhiteSpace(authHeader) || !string.Equals(authHeader.Trim(), expected, StringComparison.Ordinal))
-                {
-                    await ProblemDetailsMapper.WriteProblemResponseAsync(
-                        context, _options,
-                        StatusCodes.Status401Unauthorized,
-                        "Неавторизований доступ",
-                        "Відсутній або недійсний токен у заголовку Authorization: Bearer.",
-                        "unauthorized");
-                    return;
-                }
+                await ProblemDetailsMapper.WriteProblemResponseAsync(
+                    context, _options,
+                    StatusCodes.Status401Unauthorized,
+                    "Неавторизований доступ",
+                    "Відсутній або недійсний токен у заголовку Authorization: Bearer.",
+                    "unauthorized");
+                return;
             }
-            else if (!string.IsNullOrWhiteSpace(authHeader) && !string.Equals(authHeader.Trim(), expected, StringComparison.Ordinal))
+        }
+        else if (context.Request.Path.StartsWithSegments("/v1"))
+        {
+            if (!string.IsNullOrWhiteSpace(authHeader) && !string.Equals(authHeader.Trim(), expected, StringComparison.Ordinal))
             {
                 await ProblemDetailsMapper.WriteProblemResponseAsync(
                     context, _options,

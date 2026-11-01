@@ -2,7 +2,17 @@ using Npgsql;
 
 namespace EnrollmentService.Repositories;
 
-public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
+public sealed record ExistingRequestRecord(
+    Guid Id,
+    string StudentId,
+    string GroupId,
+    string Status,
+    DateTimeOffset CreatedAt,
+    string? RequestPayloadHash,
+    string? IdempotencyKey
+);
+
+public sealed class EnrollmentRequestRepository
 {
     private readonly IDbConnectionFactory _connectionFactory;
 
@@ -17,7 +27,7 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
     {
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(
-            "SELECT id, student_id, group_id, status, created_at, second_choice_group_id FROM enrollment_requests WHERE id = @id;", conn);
+            "SELECT id, student_id, group_id, status, created_at FROM enrollment_requests WHERE id = @id;", conn);
         cmd.Parameters.AddWithValue("id", id);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -31,8 +41,61 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
             reader.GetString(1),
             reader.GetString(2),
             reader.GetString(3),
+            reader.GetFieldValue<DateTimeOffset>(4));
+    }
+
+    public async Task<ExistingRequestRecord?> GetRecordByIdAsync(
+        Guid id,
+        NpgsqlConnection conn,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT id, student_id, group_id, status, created_at, request_payload_hash, idempotency_key
+            FROM enrollment_requests
+            WHERE id = @id;", conn);
+        cmd.Parameters.AddWithValue("id", id);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new ExistingRequestRecord(
+            reader.GetGuid(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetString(3),
             reader.GetFieldValue<DateTimeOffset>(4),
-            reader.IsDBNull(5) ? null : reader.GetString(5));
+            reader.IsDBNull(5) ? null : reader.GetString(5),
+            reader.IsDBNull(6) ? null : reader.GetString(6));
+    }
+
+    public async Task<ExistingRequestRecord?> GetByIdempotencyKeyAsync(
+        string idempotencyKey,
+        NpgsqlConnection conn,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT id, student_id, group_id, status, created_at, request_payload_hash, idempotency_key
+            FROM enrollment_requests
+            WHERE idempotency_key = @idempotencyKey;", conn);
+        cmd.Parameters.AddWithValue("idempotencyKey", idempotencyKey);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new ExistingRequestRecord(
+            reader.GetGuid(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetString(3),
+            reader.GetFieldValue<DateTimeOffset>(4),
+            reader.IsDBNull(5) ? null : reader.GetString(5),
+            reader.IsDBNull(6) ? null : reader.GetString(6));
     }
 
     public async Task<EnrollmentStatusResponseDto?> MarkFirstReadAndGetStatusAsync(
@@ -47,7 +110,7 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
             WHERE id = @id AND status IN ('done', 'rejected', 'failed')
             RETURNING id, student_id, group_id, status, rejection_reason,
                       created_at, started_at, finished_at, first_read_at,
-                      second_choice_group_id, assigned_group_id,
+                      assigned_group_id,
                       EXISTS(SELECT 1 FROM decanate_roster dr WHERE dr.request_id = enrollment_requests.id);", conn);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("now", now);
@@ -62,9 +125,8 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
         var startedAt = reader.IsDBNull(6) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(6);
         var finishedAt = reader.IsDBNull(7) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(7);
         var firstReadAt = reader.IsDBNull(8) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(8);
-        string? secondChoice = reader.IsDBNull(9) ? null : reader.GetString(9);
-        string? assignedGroup = reader.IsDBNull(10) ? null : reader.GetString(10);
-        bool recordedInRoster = reader.GetBoolean(11);
+        string? assignedGroup = reader.IsDBNull(9) ? null : reader.GetString(9);
+        bool recordedInRoster = reader.GetBoolean(10);
 
         return new EnrollmentStatusResponseDto(
             reader.GetGuid(0),
@@ -79,7 +141,6 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
             null,
             null,
             null,
-            secondChoice,
             assignedGroup,
             recordedInRoster);
     }
@@ -92,7 +153,7 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
         await using var selectCmd = new NpgsqlCommand(@"
             SELECT id, student_id, group_id, status, rejection_reason,
                    created_at, started_at, finished_at, first_read_at,
-                   second_choice_group_id, assigned_group_id,
+                   assigned_group_id,
                    EXISTS(SELECT 1 FROM decanate_roster dr WHERE dr.request_id = enrollment_requests.id)
             FROM enrollment_requests
             WHERE id = @id;", conn);
@@ -108,9 +169,8 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
         var actStartedAt = selectReader.IsDBNull(6) ? (DateTimeOffset?)null : selectReader.GetFieldValue<DateTimeOffset>(6);
         var actFinishedAt = selectReader.IsDBNull(7) ? (DateTimeOffset?)null : selectReader.GetFieldValue<DateTimeOffset>(7);
         var actFirstReadAt = selectReader.IsDBNull(8) ? (DateTimeOffset?)null : selectReader.GetFieldValue<DateTimeOffset>(8);
-        string? actSecondChoice = selectReader.IsDBNull(9) ? null : selectReader.GetString(9);
-        string? actAssignedGroup = selectReader.IsDBNull(10) ? null : selectReader.GetString(10);
-        bool actRecordedInRoster = selectReader.GetBoolean(11);
+        string? actAssignedGroup = selectReader.IsDBNull(9) ? null : selectReader.GetString(9);
+        bool actRecordedInRoster = selectReader.GetBoolean(10);
 
         return new EnrollmentStatusResponseDto(
             selectReader.GetGuid(0),
@@ -125,29 +185,46 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
             null,
             null,
             null,
-            actSecondChoice,
             actAssignedGroup,
             actRecordedInRoster);
     }
 
-    public async Task InsertQueuedRequestAsync(
+    public async Task<bool> TryInsertQueuedRequestAsync(
         QueuedRequestItem item,
         NpgsqlConnection conn,
         CancellationToken cancellationToken = default)
     {
-        await using var insertCmd = new NpgsqlCommand(@"
-            INSERT INTO enrollment_requests (id, student_id, group_id, second_choice_group_id, status, created_at)
-            VALUES (@id, @studentId, @groupId, @secondChoiceGroupId, 'queued', @createdAt);", conn);
-        insertCmd.Parameters.AddWithValue("id", item.Id);
-        insertCmd.Parameters.AddWithValue("studentId", item.StudentId);
-        insertCmd.Parameters.AddWithValue("groupId", item.GroupId);
-        insertCmd.Parameters.Add(new NpgsqlParameter("secondChoiceGroupId", NpgsqlTypes.NpgsqlDbType.Text)
+        try
         {
-            Value = (object?)item.SecondChoiceGroupId ?? DBNull.Value
-        });
-        insertCmd.Parameters.AddWithValue("createdAt", item.CreatedAtUtc);
+            await using var insertCmd = new NpgsqlCommand(@"
+                INSERT INTO enrollment_requests (
+                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash
+                ) VALUES (
+                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash
+                )
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id;", conn);
+            insertCmd.Parameters.AddWithValue("id", item.Id);
+            insertCmd.Parameters.AddWithValue("studentId", item.StudentId);
+            insertCmd.Parameters.AddWithValue("groupId", item.GroupId);
+            insertCmd.Parameters.AddWithValue("createdAt", item.CreatedAtUtc);
+            insertCmd.Parameters.Add(new NpgsqlParameter("idempotencyKey", NpgsqlTypes.NpgsqlDbType.Text)
+            {
+                Value = (object?)item.IdempotencyKey ?? DBNull.Value
+            });
+            insertCmd.Parameters.Add(new NpgsqlParameter("payloadHash", NpgsqlTypes.NpgsqlDbType.Text)
+            {
+                Value = (object?)item.RequestPayloadHash ?? DBNull.Value
+            });
 
-        await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+            var result = await insertCmd.ExecuteScalarAsync(cancellationToken);
+            return result != null;
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            // Унікальний конфлікт по student_id + idempotency_key
+            return false;
+        }
     }
 
     public async Task DeleteRequestAsync(
@@ -184,100 +261,51 @@ public sealed class EnrollmentRequestRepository : IEnrollmentRequestRepository
         NpgsqlTransaction? tx = null,
         CancellationToken cancellationToken = default)
     {
-        await using var updateReqCmd = new NpgsqlCommand(@"
+        await using var cmd = new NpgsqlCommand(@"
             UPDATE enrollment_requests
             SET status = @status,
-                rejection_reason = @reason,
-                assigned_group_id = COALESCE(@assignedGroupId, assigned_group_id),
+                rejection_reason = @rejectionReason,
+                assigned_group_id = @assignedGroupId,
                 finished_at = @finishedAt
             WHERE id = @id;", conn, tx);
-        updateReqCmd.Parameters.AddWithValue("id", id);
-        updateReqCmd.Parameters.AddWithValue("status", status);
-        updateReqCmd.Parameters.Add(new NpgsqlParameter("reason", NpgsqlTypes.NpgsqlDbType.Text)
+        cmd.Parameters.AddWithValue("id", id);
+        cmd.Parameters.AddWithValue("status", status);
+        cmd.Parameters.Add(new NpgsqlParameter("rejectionReason", NpgsqlTypes.NpgsqlDbType.Text)
         {
             Value = (object?)rejectionReason ?? DBNull.Value
         });
-        updateReqCmd.Parameters.Add(new NpgsqlParameter("assignedGroupId", NpgsqlTypes.NpgsqlDbType.Text)
+        cmd.Parameters.Add(new NpgsqlParameter("assignedGroupId", NpgsqlTypes.NpgsqlDbType.Text)
         {
             Value = (object?)assignedGroupId ?? DBNull.Value
         });
-        updateReqCmd.Parameters.AddWithValue("finishedAt", finishedAt);
-        await updateReqCmd.ExecuteNonQueryAsync(cancellationToken);
+        cmd.Parameters.AddWithValue("finishedAt", finishedAt);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task UpsertSecondChoiceRequestAsync(
-        Guid id,
-        string studentId,
-        string primaryGroupId,
-        string secondChoiceGroupId,
-        DateTimeOffset now,
-        NpgsqlConnection conn,
-        CancellationToken cancellationToken = default)
+    public async Task<int> RecoverStuckProcessingRequestsAsync(CancellationToken cancellationToken = default)
     {
-        await using var upsertCmd = new NpgsqlCommand(@"
-            INSERT INTO enrollment_requests (
-                id, student_id, group_id, second_choice_group_id, status, created_at, started_at
-            ) VALUES (
-                @id, @studentId, @primaryGroupId, @secondChoiceGroupId, 'processing', @now, @now
-            )
-            ON CONFLICT (id) DO UPDATE
-            SET second_choice_group_id = EXCLUDED.second_choice_group_id;", conn);
-        upsertCmd.Parameters.AddWithValue("id", id);
-        upsertCmd.Parameters.AddWithValue("studentId", studentId);
-        upsertCmd.Parameters.AddWithValue("primaryGroupId", primaryGroupId);
-        upsertCmd.Parameters.AddWithValue("secondChoiceGroupId", secondChoiceGroupId);
-        upsertCmd.Parameters.AddWithValue("now", now);
-        await upsertCmd.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    public async Task<IReadOnlyList<(Guid RequestId, string StudentId, string SecondChoiceGroupId)>> GetSecondChoiceCandidatesAsync(
-        string primaryGroupId,
-        Guid? filterRequestId,
-        NpgsqlConnection conn,
-        CancellationToken cancellationToken = default)
-    {
-        var candidates = new List<(Guid RequestId, string StudentId, string SecondChoiceGroupId)>();
-        string candidateSql = filterRequestId.HasValue
-            ? @"
-                SELECT r.id, r.student_id, r.second_choice_group_id
-                FROM enrollment_requests r
-                WHERE r.id = @requestId
-                  AND r.group_id = @primaryGroupId
-                  AND r.second_choice_group_id IS NOT NULL
-                ORDER BY r.created_at ASC, r.id ASC;"
-            : @"
-                SELECT r.id, r.student_id, r.second_choice_group_id
-                FROM enrollment_requests r
-                LEFT JOIN decanate_roster dr ON dr.request_id = r.id
-                WHERE r.group_id = @primaryGroupId
-                  AND r.second_choice_group_id IS NOT NULL
-                  AND dr.request_id IS NULL
-                ORDER BY r.created_at ASC, r.id ASC;";
-
-        await using var candCmd = new NpgsqlCommand(candidateSql, conn);
-        candCmd.Parameters.AddWithValue("primaryGroupId", primaryGroupId);
-        if (filterRequestId.HasValue)
-        {
-            candCmd.Parameters.AddWithValue("requestId", filterRequestId.Value);
-        }
-
-        await using var candReader = await candCmd.ExecuteReaderAsync(cancellationToken);
-        while (await candReader.ReadAsync(cancellationToken))
-        {
-            candidates.Add((
-                candReader.GetGuid(0),
-                candReader.GetString(1),
-                candReader.GetString(2)));
-        }
-
-        return candidates;
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE enrollment_requests r
+            SET status = CASE
+                    WHEN EXISTS (SELECT 1 FROM decanate_roster d WHERE d.request_id = r.id) THEN 'done'
+                    ELSE 'failed'
+                END,
+                rejection_reason = CASE
+                    WHEN EXISTS (SELECT 1 FROM decanate_roster d WHERE d.request_id = r.id) THEN NULL
+                    ELSE 'Обробку перервано аварійним перезапуском сервісу до завершення.'
+                END,
+                finished_at = COALESCE(finished_at, NOW())
+            WHERE status = 'processing';", conn);
+        return await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task ResetRequestsAsync(
         NpgsqlConnection conn,
         CancellationToken cancellationToken = default)
     {
-        await using var cmd = new NpgsqlCommand(@"DELETE FROM enrollment_requests;", conn);
+        await using var cmd = new NpgsqlCommand("DELETE FROM enrollment_requests;", conn);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }

@@ -1,6 +1,6 @@
 using System.Globalization;
-using System.Text.Json;
 using EnrollmentService.Http;
+using EnrollmentService.Repositories;
 using EnrollmentService.Services;
 using Microsoft.AspNetCore.Routing;
 
@@ -10,17 +10,26 @@ public static class EnrollmentEndpoints
 {
     public static IEndpointRouteBuilder MapEnrollmentEndpoints(this IEndpointRouteBuilder app)
     {
-        // Довідковий маршрут: список наперед створених студентів у БД (для вибору X-User-Id у клієнті О1.4, О1.7)
-        app.MapGet("/v1/students", async (IEnrollmentService enrollmentService, HttpContext ctx) =>
+        // Довідковий маршрут: список студентів у БД (для вибору X-User-Id у клієнті О1.4, О1.7)
+        app.MapGet("/v1/students", async (EnrollmentRepository enrollmentRepo, HttpContext ctx) =>
         {
-            var students = await enrollmentService.GetStudentsAsync(ctx.RequestAborted);
-            return Results.Ok(new { items = students });
+            var students = await enrollmentRepo.GetStudentsAsync(ctx.RequestAborted);
+            var dtos = students.Select(s => new WebStudentDto(
+                s.Id,
+                s.Email,
+                s.FullName,
+                s.MaxDisciplines,
+                s.ActiveCount,
+                s.ActiveEcts,
+                EnrollmentDomainRules.MaxSemesterEcts
+            )).ToList();
+            return Results.Ok(new { items = dtos });
         });
 
-        // Маршрут С10 (Web): GET /v1/disciplines — список дисциплін із групами, вікнами запису та актуальним залишком місць
+        // Маршрут С10 (Web): GET /v1/disciplines — список дисциплін із групами, вікнами запису та залишком місць
         app.MapGet("/v1/disciplines", async (
             HttpContext ctx,
-            IEnrollmentService enrollmentService,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
             ServiceOptions opts) =>
         {
             int limit = 20;
@@ -37,14 +46,14 @@ public static class EnrollmentEndpoints
                 }
             }
 
-            string? afterDisciplineId = ctx.Request.Query["after"].FirstOrDefault()
+            string? cursorRaw = ctx.Request.Query["after"].FirstOrDefault()
                 ?? ctx.Request.Query["cursor"].FirstOrDefault();
 
             bool includeTest = opts.AllowTestOverrides
                 && bool.TryParse(ctx.Request.Query["include_test"].FirstOrDefault(), out var incTest)
                 && incTest;
 
-            var result = await enrollmentService.GetDisciplinesAsync(limit, afterDisciplineId, includeTest, ctx.RequestAborted);
+            var result = await enrollmentService.GetDisciplinesAsync(limit, cursorRaw, includeTest, ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);
@@ -53,10 +62,10 @@ public static class EnrollmentEndpoints
             return Results.Ok(result.Value);
         });
 
-        // Головна операція POST /v1/enrollments (Web О1.4, Д1.1, Д1.3, Д1.5)
+        // Головна операція POST /v1/enrollments (Web О1.4, Д1.1, Д1.5)
         app.MapPost("/v1/enrollments", async (
             HttpContext ctx,
-            IEnrollmentService enrollmentService,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
             ServiceOptions opts) =>
         {
             if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string studentId, out var userHeaderProblem))
@@ -64,48 +73,13 @@ public static class EnrollmentEndpoints
                 return userHeaderProblem!;
             }
 
-            CreateWebEnrollmentDto? dto;
-            try
+            var (dto, problemResult) = await HttpPayloadHelper.ReadAndValidateAsync<CreateWebEnrollmentDto>(ctx, opts);
+            if (problemResult != null)
             {
-                dto = await JsonSerializer.DeserializeAsync<CreateWebEnrollmentDto>(
-                    ctx.Request.Body,
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true },
-                    ctx.RequestAborted);
-            }
-            catch (JsonException)
-            {
-                return ProblemDetailsMapper.CreateProblemResult(
-                    ctx, opts,
-                    StatusCodes.Status400BadRequest,
-                    "Синтаксично некоректний JSON",
-                    "Тіло запиту не є коректним JSON-документом.",
-                    "malformed_json");
+                return problemResult;
             }
 
-            if (dto == null)
-            {
-                return ProblemDetailsMapper.CreateProblemResult(
-                    ctx, opts,
-                    StatusCodes.Status400BadRequest,
-                    "Порожнє тіло запиту",
-                    "Очікується JSON-об'єкт із полем group_id.",
-                    "empty_json_body");
-            }
-
-            // Заборона визначення власника з тіла запиту (типова помилка ЛР1 Web)
-            if (dto.StudentId != null)
-            {
-                return ProblemDetailsMapper.CreateProblemResult(
-                    ctx, opts,
-                    StatusCodes.Status422UnprocessableEntity,
-                    "Визначення власника з тіла запиту заборонено",
-                    "Поле 'student_id' не дозволено передавати у тілі POST /v1/enrollments. Власник запису визначається виключно із заголовка X-User-Id.",
-                    "owner_in_body_forbidden");
-            }
-
-            string? simulatedNowHeader = ctx.Request.Headers["X-Simulated-Now"].FirstOrDefault();
-            var result = await enrollmentService.CreateEnrollmentAsync(studentId, dto, simulatedNowHeader, ctx.RequestAborted);
-
+            var result = await enrollmentService.CreateEnrollmentAsync(studentId, dto!, ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);
@@ -119,7 +93,7 @@ public static class EnrollmentEndpoints
         // Список записів студента з курсорним пагінуванням (Web О1.5)
         app.MapGet("/v1/enrollments", async (
             HttpContext ctx,
-            IEnrollmentService enrollmentService,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
             ServiceOptions opts) =>
         {
             if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string studentId, out var userHeaderProblem))
@@ -154,7 +128,7 @@ public static class EnrollmentEndpoints
             string? cursorRaw = ctx.Request.Query["after"].FirstOrDefault()
                 ?? ctx.Request.Query["cursor"].FirstOrDefault();
 
-            var result = await enrollmentService.GetEnrollmentsAsync(studentId, limit, cursorRaw, ctx.RequestAborted);
+            var result = await enrollmentService.GetStudentEnrollmentsAsync(studentId, limit, cursorRaw, ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);
@@ -167,7 +141,7 @@ public static class EnrollmentEndpoints
         app.MapGet("/v1/enrollments/{id}", async (
             string id,
             HttpContext ctx,
-            IEnrollmentService enrollmentService,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
             ServiceOptions opts) =>
         {
             if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string callerStudentId, out var userHeaderProblem))
@@ -175,7 +149,48 @@ public static class EnrollmentEndpoints
                 return userHeaderProblem!;
             }
 
-            var result = await enrollmentService.GetEnrollmentByIdAsync(callerStudentId, id, ctx.RequestAborted);
+            if (!Guid.TryParse(id, out var enrollmentGuid))
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний ідентифікатор запису",
+                    "Параметр id має бути валідним UUID.",
+                    "invalid_enrollment_id");
+            }
+
+            var result = await enrollmentService.GetEnrollmentByIdAsync(callerStudentId, enrollmentGuid, ctx.RequestAborted);
+            if (!result.IsSuccess)
+            {
+                return result.ToProblemResult(ctx, opts);
+            }
+
+            return Results.Ok(result.Value);
+        });
+
+        // Підтвердження запису студентом (Web О1.1: held -> confirmed)
+        app.MapPost("/v1/enrollments/{id}/confirm", async (
+            string id,
+            HttpContext ctx,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
+            ServiceOptions opts) =>
+        {
+            if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string callerStudentId, out var userHeaderProblem))
+            {
+                return userHeaderProblem!;
+            }
+
+            if (!Guid.TryParse(id, out var enrollmentGuid))
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний ідентифікатор запису",
+                    "Параметр id має бути валідним UUID.",
+                    "invalid_enrollment_id");
+            }
+
+            var result = await enrollmentService.ConfirmEnrollmentAsync(callerStudentId, enrollmentGuid, ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);
@@ -188,7 +203,7 @@ public static class EnrollmentEndpoints
         app.MapPost("/v1/enrollments/{id}/cancel", async (
             string id,
             HttpContext ctx,
-            IEnrollmentService enrollmentService,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
             ServiceOptions opts) =>
         {
             if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string callerStudentId, out var userHeaderProblem))
@@ -196,7 +211,17 @@ public static class EnrollmentEndpoints
                 return userHeaderProblem!;
             }
 
-            var result = await enrollmentService.CancelEnrollmentAsync(callerStudentId, id, ctx.RequestAborted);
+            if (!Guid.TryParse(id, out var enrollmentGuid))
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний ідентифікатор запису",
+                    "Параметр id має бути валідним UUID.",
+                    "invalid_enrollment_id");
+            }
+
+            var result = await enrollmentService.CancelEnrollmentAsync(callerStudentId, enrollmentGuid, ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);

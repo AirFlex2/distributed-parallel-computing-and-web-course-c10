@@ -92,29 +92,8 @@ public sealed class DatabaseInitializer
                                 continue;
                             }
 
-                            await using (var reapplyCmd = new NpgsqlCommand(sql, conn, tx))
-                            {
-                                await reapplyCmd.ExecuteNonQueryAsync(cancellationToken);
-                            }
-
-                            await using (var updateChecksumCmd = new NpgsqlCommand(@"
-                                UPDATE schema_migrations
-                                SET checksum = @checksum, applied_at = NOW()
-                                WHERE version = @version;", conn, tx))
-                            {
-                                updateChecksumCmd.Parameters.AddWithValue("version", version);
-                                updateChecksumCmd.Parameters.AddWithValue("checksum", checksum);
-                                await updateChecksumCmd.ExecuteNonQueryAsync(cancellationToken);
-                            }
-
-                            appliedNow++;
-                            StructuredJsonLogger.LogEvent(_options.InstanceId, "migration_updated", new Dictionary<string, object?>
-                            {
-                                ["version"] = version,
-                                ["filename"] = fileName,
-                                ["checksum"] = checksum
-                            });
-                            continue;
+                            throw new InvalidOperationException(
+                                $"Помилка цілісності міграцій бази даних: файл міграції '{fileName}' (версія {version}) раніше було застосовано з контрольною сумою {appliedChecksum}, проте локальний файл має суму {checksum}. Модифікація застосованих міграцій заборонена. Будь-які зміни схеми слід додавати новим файлом міграції (наприклад, 007_...sql).");
                         }
 
                         await using (var applyCmd = new NpgsqlCommand(sql, conn, tx))
@@ -150,6 +129,12 @@ public sealed class DatabaseInitializer
                     ["applied_now"] = appliedNow
                 });
                 return;
+            }
+            catch (InvalidOperationException)
+            {
+                // Помилка цілісності міграцій (невідповідність SHA-256) є фатальною конфігураційною помилкою.
+                // Негайно припиняємо роботу процесу без тривалого циклу повторних спроб (fail-fast).
+                throw;
             }
             catch (Exception ex) when (attempt < 12)
             {

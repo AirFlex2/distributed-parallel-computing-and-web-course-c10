@@ -33,7 +33,7 @@ services:
     environment:
       ASPNETCORE_URLS: "http://+:8080"
       INSTANCE_ID: "app-a"
-      DB_CONNECTION_STRING: "${DB_CONNECTION_STRING:-Host=postgres;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50}"
+      DB_CONNECTION_STRING: "${DB_CONNECTION_STRING:-Host=postgres;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=20}"
       API_AUTH_TOKEN: "${API_AUTH_TOKEN:-secret-c10-token-2026}"
       QUEUE_CAPACITY: "${QUEUE_CAPACITY:-100}"
       WORKERS: "${WORKERS:-3}"
@@ -43,6 +43,13 @@ services:
       SLOW_CALL_MIN_MS: "${SLOW_CALL_MIN_MS:-200}"
       SLOW_CALL_MAX_MS: "${SLOW_CALL_MAX_MS:-700}"
       ALLOW_TEST_OVERRIDES: "${ALLOW_TEST_OVERRIDES:-false}"
+      ENABLE_WORKERS: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
     stop_grace_period: 60s
 
   app-b:
@@ -61,7 +68,7 @@ services:
     environment:
       ASPNETCORE_URLS: "http://+:8080"
       INSTANCE_ID: "app-b"
-      DB_CONNECTION_STRING: "${DB_CONNECTION_STRING:-Host=postgres;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50}"
+      DB_CONNECTION_STRING: "${DB_CONNECTION_STRING:-Host=postgres;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=20}"
       API_AUTH_TOKEN: "${API_AUTH_TOKEN:-secret-c10-token-2026}"
       QUEUE_CAPACITY: "${QUEUE_CAPACITY:-100}"
       WORKERS: "${WORKERS:-3}"
@@ -71,29 +78,27 @@ services:
       SLOW_CALL_MIN_MS: "${SLOW_CALL_MIN_MS:-200}"
       SLOW_CALL_MAX_MS: "${SLOW_CALL_MAX_MS:-700}"
       ALLOW_TEST_OVERRIDES: "${ALLOW_TEST_OVERRIDES:-false}"
+      ENABLE_WORKERS: "false"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
     stop_grace_period: 60s
 
   nginx:
     image: nginx:1.27-alpine
     container_name: dpc-c10-nginx
     depends_on:
-      - app-a
-      - app-b
+      app-a:
+        condition: service_healthy
+      app-b:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-
-  prometheus:
-    image: prom/prometheus:v2.51.0
-    container_name: dpc-c10-prometheus
-    depends_on:
-      - app-a
-      - app-b
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
 
 volumes:
   pgdata:

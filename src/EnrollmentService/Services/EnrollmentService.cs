@@ -1,27 +1,26 @@
 using System.Globalization;
+using System.Text;
 using EnrollmentService.Domain;
 using EnrollmentService.Repositories;
+using Npgsql;
 
 namespace EnrollmentService.Services;
 
-public sealed class EnrollmentService : IEnrollmentService
+public sealed class EnrollmentService
 {
-    private readonly IGroupRepository _groupRepo;
-    private readonly IEnrollmentRepository _enrollmentRepo;
-    private readonly IDecanateRepository _decanateRepo;
+    private readonly GroupRepository _groupRepo;
+    private readonly EnrollmentRepository _enrollmentRepo;
     private readonly IDbConnectionFactory _connectionFactory;
     private readonly ServiceOptions _options;
 
     public EnrollmentService(
-        IGroupRepository groupRepo,
-        IEnrollmentRepository enrollmentRepo,
-        IDecanateRepository decanateRepo,
+        GroupRepository groupRepo,
+        EnrollmentRepository enrollmentRepo,
         IDbConnectionFactory connectionFactory,
         ServiceOptions options)
     {
         _groupRepo = groupRepo;
         _enrollmentRepo = enrollmentRepo;
-        _decanateRepo = decanateRepo;
         _connectionFactory = connectionFactory;
         _options = options;
     }
@@ -29,10 +28,8 @@ public sealed class EnrollmentService : IEnrollmentService
     public async Task<ServiceResult<WebEnrollmentResponseDto>> CreateEnrollmentAsync(
         string studentId,
         CreateWebEnrollmentDto dto,
-        string? simulatedNowHeader,
         CancellationToken cancellationToken = default)
     {
-        // 1. Валідація ідентифікатора групи
         if (string.IsNullOrWhiteSpace(dto.GroupId) || dto.GroupId.Trim().Length > 64 || dto.GroupId.Contains(' '))
         {
             return ServiceResult<WebEnrollmentResponseDto>.Failure(
@@ -44,424 +41,473 @@ public sealed class EnrollmentService : IEnrollmentService
 
         string groupId = dto.GroupId.Trim();
 
-        // 2. Симуляція поточного часу (evaluated_at / X-Simulated-Now) дозволена ВИКЛЮЧНО при ALLOW_TEST_OVERRIDES=true
-        DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
-        bool hasBodyEval = !string.IsNullOrWhiteSpace(dto.EvaluatedAt);
-        bool hasHeaderSim = !string.IsNullOrWhiteSpace(simulatedNowHeader);
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
 
-        if (hasBodyEval || hasHeaderSim)
+        try
         {
-            if (!_options.AllowTestOverrides)
+            var student = await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
+            if (student == null)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                    StatusCodes.Status403Forbidden,
-                    "test_override_disabled",
-                    "Тестове перевизначення часу заборонено",
-                    "Передача evaluated_at або заголовка X-Simulated-Now вимкнена у штатному режимі (ALLOW_TEST_OVERRIDES=false).");
+                    StatusCodes.Status404NotFound,
+                    "student_not_found",
+                    "Студента не знайдено",
+                    $"Студент з ідентифікатором '{studentId}' відсутній у базі даних.");
             }
 
-            string simulatedTimeRaw = hasBodyEval ? dto.EvaluatedAt!.Trim() : simulatedNowHeader!.Trim();
-            if (!DateTimeOffset.TryParse(simulatedTimeRaw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out nowUtc))
+            var groupWithDisc = await _groupRepo.GetGroupWithDisciplineForUpdateAsync(groupId, conn, tx, cancellationToken);
+            if (!groupWithDisc.HasValue)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                    StatusCodes.Status422UnprocessableEntity,
-                    "invalid_evaluated_at",
-                    "Некоректний формат часу evaluated_at",
-                    "Поле evaluated_at має бути у форматі ISO 8601 (наприклад, 2026-09-01T07:00:00Z).");
+                    StatusCodes.Status404NotFound,
+                    "group_not_found",
+                    "Групу дисципліни не знайдено",
+                    $"Група з ідентифікатором '{groupId}' не існує.");
             }
+
+            var group = groupWithDisc.Value.Group;
+            string disciplineId = group.DisciplineId;
+            string disciplineTitle = groupWithDisc.Value.DisciplineTitle;
+            decimal disciplineEcts = groupWithDisc.Value.DisciplineEcts;
+
+            bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(studentId, disciplineId, conn, tx, cancellationToken);
+
+            // Фіксуємо точний час безпосередньо перед перевіркою правил після отримання блокувань студента і групи
+            DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+            var policy = EnrollmentPolicy.Check(student, group, disciplineEcts, nowUtc, alreadyEnrolled);
+            if (!policy.Allowed)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    policy.ErrorCode ?? "policy_violation",
+                    "Відхилено правилами запису",
+                    policy.RejectionReason ?? "Запит відхилено правилами предметної області.");
+            }
+
+            var enrollmentId = Guid.NewGuid();
+            var expiresAtUtc = nowUtc.AddMinutes(15);
+
+            // П. 2: Перевірка результату декременту available
+            bool decremented = await _groupRepo.DecrementAvailableAsync(groupId, conn, tx, cancellationToken);
+            if (!decremented)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "group_full",
+                    "У групі немає вільних місць",
+                    $"У навчальній групі '{groupId}' вичерпано доступні місця.");
+            }
+
+            await _enrollmentRepo.UpdateStudentStatsAsync(studentId, +1, disciplineEcts, conn, tx, cancellationToken);
+
+            await _enrollmentRepo.CreateEnrollmentAsync(
+                enrollmentId,
+                studentId,
+                groupId,
+                disciplineId,
+                "held",
+                1,
+                nowUtc,
+                expiresAtUtc,
+                conn,
+                tx,
+                cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+
+            var responseDto = new WebEnrollmentResponseDto(
+                enrollmentId.ToString("D"),
+                studentId,
+                groupId,
+                disciplineId,
+                disciplineTitle,
+                disciplineEcts,
+                "held",
+                1,
+                nowUtc,
+                expiresAtUtc,
+                EnrollmentDomainRules.FormatInUniversityTimeZone(nowUtc, group.UniversityTz),
+                EnrollmentDomainRules.FormatInUniversityTimeZone(expiresAtUtc, group.UniversityTz),
+                group.UniversityTz,
+                _options.InstanceId);
+
+            return ServiceResult<WebEnrollmentResponseDto>.Ok(responseDto);
         }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task<ServiceResult<WebEnrollmentResponseDto>> ConfirmEnrollmentAsync(
+        string studentId,
+        Guid enrollmentId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            // Канонічний порядок блокувань: student -> discipline_group -> enrollment
+            var student = await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
+            if (student == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "student_not_found",
+                    "Студента не знайдено",
+                    $"Студент '{studentId}' відсутній у базі даних.");
+            }
+
+            var basicInfo = await _enrollmentRepo.GetEnrollmentBasicInfoAsync(enrollmentId, studentId, conn, tx, cancellationToken);
+            if (basicInfo == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "enrollment_not_found",
+                    "Запис не знайдено",
+                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не знайдено.");
+            }
+
+            var group = await _groupRepo.GetGroupForUpdateAsync(basicInfo.Value.GroupId, conn, tx, cancellationToken);
+            if (group == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "group_not_found",
+                    "Групу не знайдено",
+                    $"Групу '{basicInfo.Value.GroupId}' не знайдено.");
+            }
+
+            var enrollment = await _enrollmentRepo.GetEnrollmentForUpdateAsync(enrollmentId, studentId, conn, tx, cancellationToken);
+            if (enrollment == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "enrollment_not_found",
+                    "Запис не знайдено",
+                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не знайдено.");
+            }
+
+            if (enrollment.Status == "confirmed")
+            {
+                await tx.CommitAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(enrollment);
+            }
+
+            if (enrollment.Status == "cancelled")
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_cancelled",
+                    "Запис скасовано",
+                    "Неможливо підтвердити скасований запис.");
+            }
+
+            if (enrollment.Status == "expired" || enrollment.ExpiresAt < DateTimeOffset.UtcNow)
+            {
+                // Атомарне звільнення простроченого запису без взаємоблокувань
+                if (enrollment.Status != "expired")
+                {
+                    await using var expCmd = new NpgsqlCommand(
+                        "UPDATE enrollment SET status = 'expired', version = version + 1 WHERE id = @id;", conn, tx);
+                    expCmd.Parameters.AddWithValue("id", enrollmentId);
+                    await expCmd.ExecuteNonQueryAsync(cancellationToken);
+
+                    await _groupRepo.IncrementAvailableAsync(enrollment.GroupId, conn, tx, cancellationToken);
+                    await _enrollmentRepo.UpdateStudentStatsAsync(studentId, -1, -enrollment.Ects, conn, tx, cancellationToken);
+                }
+                await tx.CommitAsync(cancellationToken);
+
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_expired",
+                    "Термін резервування сплив",
+                    "Час утримання місця (held, 15 хв) завершився, запис перейшов у стан 'expired'.");
+            }
+
+            await _enrollmentRepo.ConfirmEnrollmentHeldAsync(enrollmentId, conn, tx, cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+
+            var updated = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
+            return ServiceResult<WebEnrollmentResponseDto>.Ok(updated!);
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task<ServiceResult<WebEnrollmentResponseDto>> CancelEnrollmentAsync(
+        string studentId,
+        Guid enrollmentId,
+        CancellationToken cancellationToken = default)
+    {
+        DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
 
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var tx = await conn.BeginTransactionAsync(cancellationToken);
 
-        // 3. Блокування рядка студента (FOR UPDATE — крок 1 канонічного порядку блокувань)
-        var student = await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
-        if (student == null)
+        try
+        {
+            // Канонічний порядок блокувань: student -> discipline_group -> enrollment
+            var student = await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
+            if (student == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "student_not_found",
+                    "Студента не знайдено",
+                    $"Студент '{studentId}' відсутній у базі даних.");
+            }
+
+            var basicInfo = await _enrollmentRepo.GetEnrollmentBasicInfoAsync(enrollmentId, studentId, conn, tx, cancellationToken);
+            if (basicInfo == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "enrollment_not_found",
+                    "Запис не знайдено",
+                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не існує.");
+            }
+
+            var group = await _groupRepo.GetGroupForUpdateAsync(basicInfo.Value.GroupId, conn, tx, cancellationToken);
+            if (group == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "group_not_found",
+                    "Групу не знайдено",
+                    $"Групу '{basicInfo.Value.GroupId}' не знайдено.");
+            }
+
+            var enrollment = await _enrollmentRepo.GetEnrollmentForUpdateAsync(enrollmentId, studentId, conn, tx, cancellationToken);
+            if (enrollment == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "enrollment_not_found",
+                    "Запис не знайдено",
+                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не існує.");
+            }
+
+            if (enrollment.Status == "cancelled" || enrollment.Status == "expired")
+            {
+                await tx.CommitAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(enrollment);
+            }
+
+            int newVersion = enrollment.Version + 1;
+            await _groupRepo.IncrementAvailableAsync(enrollment.GroupId, conn, tx, cancellationToken);
+            await _enrollmentRepo.UpdateStudentStatsAsync(studentId, -1, -enrollment.Ects, conn, tx, cancellationToken);
+            await _enrollmentRepo.CancelEnrollmentAsync(enrollmentId, newVersion, nowUtc, conn, tx, cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+
+            var updated = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
+            return ServiceResult<WebEnrollmentResponseDto>.Ok(updated!);
+        }
+        catch
         {
             await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status404NotFound,
-                "student_not_found",
-                "Студента не знайдено",
-                $"Студент з ідентифікатором '{studentId}' відсутній у базі даних.");
+            throw;
         }
-
-        // 4. Блокування рядка групи дисципліни (FOR UPDATE — крок 2 канонічного порядку блокувань)
-        var groupWithDisc = await _groupRepo.GetGroupWithDisciplineForUpdateAsync(groupId, conn, tx, cancellationToken);
-        if (!groupWithDisc.HasValue)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status404NotFound,
-                "group_not_found",
-                "Групу дисципліни не знайдено",
-                $"Група з ідентифікатором '{groupId}' не існує.");
-        }
-
-        var group = groupWithDisc.Value.Group;
-        string disciplineId = group.DisciplineId;
-        string disciplineTitle = groupWithDisc.Value.DisciplineTitle;
-        decimal disciplineEcts = groupWithDisc.Value.DisciplineEcts;
-
-        // 5. Перевірка інваріантів предметної області (О1.1, О1.4, Д1.1, Д1.5)
-        if (group.Closed)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "group_closed",
-                "Запис у групу закрито",
-                $"Навчальна група '{groupId}' закрита працівником деканату (closed = true).");
-        }
-
-        if (!EnrollmentDomainRules.IsWithinEnrollmentWindow(nowUtc, group.OpensAt, group.ClosesAt))
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "outside_enrollment_window",
-                "Поза вікном запису на дисципліну",
-                $"Момент запиту ({EnrollmentDomainRules.FormatInUniversityTimeZone(nowUtc, group.UniversityTz)}) не входить у напіввідкрите вікно [{EnrollmentDomainRules.FormatInUniversityTimeZone(group.OpensAt, group.UniversityTz)}, {EnrollmentDomainRules.FormatInUniversityTimeZone(group.ClosesAt, group.UniversityTz)}).",
-                new Dictionary<string, object?>
-                {
-                    ["evaluated_at_utc"] = nowUtc,
-                    ["opens_at_utc"] = group.OpensAt,
-                    ["closes_at_utc"] = group.ClosesAt,
-                    ["opens_at_local"] = EnrollmentDomainRules.FormatInUniversityTimeZone(group.OpensAt, group.UniversityTz),
-                    ["closes_at_local"] = EnrollmentDomainRules.FormatInUniversityTimeZone(group.ClosesAt, group.UniversityTz)
-                });
-        }
-
-        bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(
-            studentId, disciplineId, conn, tx, cancellationToken);
-        if (alreadyEnrolled)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "already_enrolled_in_discipline",
-                "Повторний запис на дисципліну",
-                $"Студент '{studentId}' вже має активний запис на дисципліну '{disciplineId}'.");
-        }
-
-        if (group.Available <= 0)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "no_available_seats",
-                "Немає вільних місць у групі",
-                $"У групі '{groupId}' вичерпано всі {group.Seats} місць (available = 0).");
-        }
-
-        if (!EnrollmentDomainRules.CanEnrollWithDisciplineLimit(student.ActiveCount, student.MaxDisciplines))
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "max_disciplines_exceeded",
-                "Перевищено ліміт активних дисциплін",
-                $"Студент '{studentId}' вже має {student.ActiveCount} із {student.MaxDisciplines} дозволених вибіркових дисциплін.");
-        }
-
-        if (!EnrollmentDomainRules.CanEnrollWithEcts(student.ActiveEcts, disciplineEcts))
-        {
-            decimal projectedEcts = student.ActiveEcts + disciplineEcts;
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "ects_limit_exceeded",
-                "Перевищено семестровий ліміт кредитів ЄКТС",
-                $"Сума кредитів після запису становить {projectedEcts.ToString("0.0", CultureInfo.InvariantCulture)} ЄКТС, що перевищує максимум {EnrollmentDomainRules.MaxSemesterEcts.ToString("0.0", CultureInfo.InvariantCulture)} ЄКТС.",
-                new Dictionary<string, object?>
-                {
-                    ["current_ects"] = student.ActiveEcts,
-                    ["discipline_ects"] = disciplineEcts,
-                    ["projected_ects"] = projectedEcts,
-                    ["max_ects"] = EnrollmentDomainRules.MaxSemesterEcts
-                });
-        }
-
-        // 6. Атомарне оновлення єдиного спільного ресурсу discipline_group, студента та вставка enrollment
-        bool decremented = await _groupRepo.DecrementAvailableAsync(groupId, conn, tx, cancellationToken);
-        if (!decremented)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status409Conflict,
-                "no_available_seats",
-                "Немає вільних місць у групі",
-                $"У групі '{groupId}' не залишилося вільних місць.");
-        }
-
-        await _enrollmentRepo.UpdateStudentStatsAsync(studentId, +1, disciplineEcts, conn, tx, cancellationToken);
-
-        Guid enrollmentId = Guid.NewGuid();
-        DateTimeOffset createdAtUtc = (hasBodyEval || hasHeaderSim) ? nowUtc : DateTimeOffset.UtcNow;
-        DateTimeOffset expiresAtUtc = createdAtUtc.AddMinutes(15);
-
-        await _enrollmentRepo.CreateEnrollmentAsync(
-            enrollmentId,
-            studentId,
-            groupId,
-            disciplineId,
-            "held",
-            1,
-            createdAtUtc,
-            expiresAtUtc,
-            conn,
-            tx,
-            cancellationToken);
-
-        // О1.4: Фіксуємо транзакцію ПЕРЕД створенням успішної відповіді 201 Created
-        await tx.CommitAsync(cancellationToken);
-
-        var responseDto = new WebEnrollmentResponseDto(
-            enrollmentId.ToString("D"),
-            studentId,
-            groupId,
-            disciplineId,
-            disciplineTitle,
-            disciplineEcts,
-            "held",
-            1,
-            createdAtUtc,
-            expiresAtUtc,
-            EnrollmentDomainRules.FormatInUniversityTimeZone(createdAtUtc, group.UniversityTz),
-            EnrollmentDomainRules.FormatInUniversityTimeZone(expiresAtUtc, group.UniversityTz),
-            group.UniversityTz,
-            _options.InstanceId);
-
-        return ServiceResult<WebEnrollmentResponseDto>.Ok(responseDto, StatusCodes.Status201Created);
     }
 
-    public async Task<ServiceResult<WebEnrollmentListResponseDto>> GetEnrollmentsAsync(
+    public async Task<ServiceResult<WebEnrollmentListResponseDto>> GetStudentEnrollmentsAsync(
         string studentId,
         int limit,
         string? cursorRaw,
         CancellationToken cancellationToken = default)
     {
-        bool hasCursor = !string.IsNullOrWhiteSpace(cursorRaw);
+        var student = await _enrollmentRepo.GetStudentByIdAsync(studentId, cancellationToken);
+        if (student == null)
+        {
+            return ServiceResult<WebEnrollmentListResponseDto>.Failure(
+                StatusCodes.Status404NotFound,
+                "student_not_found",
+                "Студента не знайдено",
+                $"Студент '{studentId}' відсутній у базі даних.");
+        }
+
         DateTimeOffset cursorCreatedAt = default;
-        Guid cursorId = Guid.Empty;
+        Guid cursorId = default;
+        bool hasCursor = !string.IsNullOrWhiteSpace(cursorRaw);
 
         if (hasCursor && !EnrollmentDomainRules.TryDecodeCursor(cursorRaw, out cursorCreatedAt, out cursorId))
         {
             return ServiceResult<WebEnrollmentListResponseDto>.Failure(
                 StatusCodes.Status400BadRequest,
                 "invalid_cursor",
-                "Пошкоджений або некоректний курсор пагінації",
-                $"Значення курсора '{cursorRaw}' не вдалося розпізнати. Очікується непрозорий курсор next_cursor із попередньої сторінки.");
+                "Некоректний курсор",
+                "Переданий курсор пагінації не відповідає очікуваному непрозорому формату Base64.");
         }
 
-        var student = await _enrollmentRepo.GetStudentByIdAsync(studentId, cancellationToken);
-        int activeCount = student?.ActiveCount ?? 0;
-        int maxDisciplines = student?.MaxDisciplines ?? 5;
-        decimal activeEcts = student?.ActiveEcts ?? 0.0m;
-
-        var items = (await _enrollmentRepo.GetStudentEnrollmentsCursorAsync(
-            studentId,
-            limit,
-            hasCursor ? cursorCreatedAt : null,
-            hasCursor ? cursorId : null,
-            cancellationToken)).ToList();
+        var items = await _enrollmentRepo.GetStudentEnrollmentsCursorAsync(
+            studentId, limit, hasCursor ? cursorCreatedAt : null, hasCursor ? cursorId : null, cancellationToken);
 
         string? nextCursor = null;
+        var visibleItems = items.Take(limit).ToList();
         if (items.Count > limit)
         {
-            var lastVisible = items[limit - 1];
+            var lastVisible = visibleItems.Last();
             nextCursor = EnrollmentDomainRules.EncodeCursor(lastVisible.CreatedAt, Guid.Parse(lastVisible.Id));
-            items.RemoveAt(items.Count - 1);
         }
 
-        var resultDto = new WebEnrollmentListResponseDto(
-            items,
+        var responseDto = new WebEnrollmentListResponseDto(
+            visibleItems,
             nextCursor,
             limit,
-            studentId,
-            activeCount,
-            maxDisciplines,
-            activeEcts,
+            student.Id,
+            student.ActiveCount,
+            student.MaxDisciplines,
+            student.ActiveEcts,
             EnrollmentDomainRules.MaxSemesterEcts);
 
-        return ServiceResult<WebEnrollmentListResponseDto>.Ok(resultDto);
+        return ServiceResult<WebEnrollmentListResponseDto>.Ok(responseDto);
     }
 
     public async Task<ServiceResult<WebEnrollmentResponseDto>> GetEnrollmentByIdAsync(
         string studentId,
-        string enrollmentIdRaw,
+        Guid enrollmentId,
         CancellationToken cancellationToken = default)
     {
-        if (!Guid.TryParse(enrollmentIdRaw, out Guid enrollmentId))
-        {
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status422UnprocessableEntity,
-                "invalid_enrollment_id",
-                "Некоректний формат ідентифікатора запису",
-                $"Ідентифікатор '{enrollmentIdRaw}' не є коректним UUID.");
-        }
-
-        var enrollment = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
-        if (enrollment == null)
+        var item = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
+        if (item == null)
         {
             return ServiceResult<WebEnrollmentResponseDto>.Failure(
                 StatusCodes.Status404NotFound,
                 "enrollment_not_found",
-                "Запис на дисципліну не знайдено",
-                $"Запис з ідентифікатором '{enrollmentIdRaw}' відсутній або не належить користувачу '{studentId}'.");
+                "Запис не знайдено",
+                $"Запис '{enrollmentId}' для студента '{studentId}' не існує.");
         }
 
-        return ServiceResult<WebEnrollmentResponseDto>.Ok(enrollment);
-    }
-
-    public async Task<ServiceResult<WebEnrollmentResponseDto>> CancelEnrollmentAsync(
-        string studentId,
-        string enrollmentIdRaw,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Guid.TryParse(enrollmentIdRaw, out Guid enrollmentId))
-        {
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status422UnprocessableEntity,
-                "invalid_enrollment_id",
-                "Некоректний формат ідентифікатора запису",
-                $"Ідентифікатор '{enrollmentIdRaw}' не є коректним UUID.");
-        }
-
-        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
-
-        // Попереднє читання ідентифікаторів без блокування для визначення порядку захоплення FOR UPDATE
-        var lookup = await _enrollmentRepo.GetEnrollmentLookupAsync(enrollmentId, conn, tx, cancellationToken);
-        if (!lookup.HasValue)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status404NotFound,
-                "enrollment_not_found",
-                "Запис на дисципліну не знайдено",
-                $"Запис з ідентифікатором '{enrollmentIdRaw}' відсутній у базі даних.");
-        }
-
-        string ownerStudentId = lookup.Value.StudentId;
-        string targetGroupId = lookup.Value.GroupId;
-
-        if (!string.Equals(ownerStudentId, studentId, StringComparison.Ordinal))
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status404NotFound,
-                "enrollment_not_found",
-                "Запис на дисципліну не знайдено",
-                $"Запис '{enrollmentIdRaw}' не належить користувачу '{studentId}'.");
-        }
-
-        // Крок 1 канонічного порядку блокувань: student FOR UPDATE
-        await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
-
-        // Крок 2 канонічного порядку блокувань: discipline_group FOR UPDATE
-        await _groupRepo.GetGroupWithDisciplineForUpdateAsync(targetGroupId, conn, tx, cancellationToken);
-
-        // Крок 3 канонічного порядку блокувань: enrollment FOR UPDATE
-        var enrollment = await _enrollmentRepo.GetEnrollmentForUpdateAsync(enrollmentId, studentId, conn, tx, cancellationToken);
-        if (enrollment == null)
-        {
-            await tx.RollbackAsync(cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                StatusCodes.Status404NotFound,
-                "enrollment_not_found",
-                "Запис на дисципліну не знайдено",
-                $"Запис з ідентифікатором '{enrollmentIdRaw}' відсутній у базі даних.");
-        }
-
-        int newVersion = enrollment.Version;
-        if (enrollment.Status is "held" or "confirmed")
-        {
-            newVersion++;
-            var now = DateTimeOffset.UtcNow;
-            await _enrollmentRepo.CancelEnrollmentAsync(enrollmentId, newVersion, now, conn, tx, cancellationToken);
-            await _groupRepo.IncrementAvailableAsync(targetGroupId, conn, tx, cancellationToken);
-            await _enrollmentRepo.UpdateStudentStatsAsync(studentId, -1, -enrollment.Ects, conn, tx, cancellationToken);
-            await _decanateRepo.DeleteRosterEntryForEnrollmentAsync(enrollmentId, studentId, targetGroupId, conn, tx, cancellationToken);
-        }
-
-        await tx.CommitAsync(cancellationToken);
-
-        var resultDto = enrollment with
-        {
-            Status = "cancelled",
-            Version = newVersion
-        };
-
-        return ServiceResult<WebEnrollmentResponseDto>.Ok(resultDto);
+        return ServiceResult<WebEnrollmentResponseDto>.Ok(item);
     }
 
     public async Task<ServiceResult<WebDisciplineListResponseDto>> GetDisciplinesAsync(
         int limit,
-        string? afterId,
+        string? cursorRaw,
         bool includeTest,
         CancellationToken cancellationToken = default)
     {
-        var rawDisciplines = (await _groupRepo.GetDisciplinesAsync(limit, afterId, includeTest, cancellationToken)).ToList();
+        string? decodedAfterId = null;
+        if (!string.IsNullOrWhiteSpace(cursorRaw))
+        {
+            string decodedString;
+            try
+            {
+                string normalized = cursorRaw.Trim().Replace('-', '+').Replace('_', '/');
+                switch (normalized.Length % 4)
+                {
+                    case 2: normalized += "=="; break;
+                    case 3: normalized += "="; break;
+                }
+                decodedString = Encoding.UTF8.GetString(Convert.FromBase64String(normalized));
+            }
+            catch (FormatException)
+            {
+                return ServiceResult<WebDisciplineListResponseDto>.Failure(
+                    StatusCodes.Status400BadRequest,
+                    "invalid_cursor",
+                    "Некоректний курсор",
+                    "Переданий курсор не є валідним рядком Base64.");
+            }
+
+            const string prefix = "c10disc|";
+            if (!decodedString.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return ServiceResult<WebDisciplineListResponseDto>.Failure(
+                    StatusCodes.Status400BadRequest,
+                    "invalid_cursor",
+                    "Некоректний курсор",
+                    "Переданий курсор має некоректний префікс версії або недійсний формат.");
+            }
+
+            decodedAfterId = decodedString.Substring(prefix.Length).Trim();
+            if (string.IsNullOrWhiteSpace(decodedAfterId) || !await _groupRepo.DisciplineExistsAsync(decodedAfterId, cancellationToken))
+            {
+                return ServiceResult<WebDisciplineListResponseDto>.Failure(
+                    StatusCodes.Status400BadRequest,
+                    "invalid_cursor",
+                    "Некоректний курсор",
+                    $"Курсор посилається на невідомий або недійсний ідентифікатор дисципліни '{decodedAfterId}'.");
+            }
+        }
+
+        var rawDisciplines = (await _groupRepo.GetDisciplinesAsync(limit, decodedAfterId, includeTest, cancellationToken)).ToList();
 
         string? nextCursor = null;
         if (rawDisciplines.Count > limit)
         {
-            nextCursor = rawDisciplines[limit - 1].Id;
+            var lastItem = rawDisciplines[limit - 1];
+            string rawCursor = $"c10disc|{lastItem.Id}";
+            nextCursor = Convert.ToBase64String(Encoding.UTF8.GetBytes(rawCursor))
+                .TrimEnd('=')
+                .Replace('+', '-')
+                .Replace('/', '_');
             rawDisciplines.RemoveAt(rawDisciplines.Count - 1);
         }
 
-        var allGroups = await _groupRepo.GetAllDisciplineGroupsAsync(cancellationToken);
-        var groupsByDiscipline = new Dictionary<string, List<WebDisciplineGroupDto>>(StringComparer.Ordinal);
+        var discIds = rawDisciplines.Select(d => d.Id).ToList();
+        var relevantGroups = await _groupRepo.GetGroupsByDisciplineIdsAsync(discIds, cancellationToken);
+
         var nowUtc = DateTimeOffset.UtcNow;
+        var groupsByDiscipline = relevantGroups
+            .GroupBy(g => g.DisciplineId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
-        foreach (var grp in allGroups)
+        var disciplineDtos = new List<WebDisciplineDto>();
+        foreach (var d in rawDisciplines)
         {
-            bool windowActive = !grp.Closed && EnrollmentDomainRules.IsWithinEnrollmentWindow(nowUtc, grp.OpensAt, grp.ClosesAt);
-            var groupDto = new WebDisciplineGroupDto(
-                grp.Id,
-                grp.DisciplineId,
-                grp.GroupCode,
-                grp.Seats,
-                grp.Available,
-                grp.OpensAt,
-                grp.ClosesAt,
-                EnrollmentDomainRules.FormatInUniversityTimeZone(grp.OpensAt, grp.UniversityTz),
-                EnrollmentDomainRules.FormatInUniversityTimeZone(grp.ClosesAt, grp.UniversityTz),
-                grp.UniversityTz,
-                grp.Closed,
-                windowActive);
-
-            if (!groupsByDiscipline.TryGetValue(grp.DisciplineId, out var list))
+            var grpDtos = new List<WebDisciplineGroupDto>();
+            if (groupsByDiscipline.TryGetValue(d.Id, out var grpEntities))
             {
-                list = [];
-                groupsByDiscipline[grp.DisciplineId] = list;
+                foreach (var g in grpEntities)
+                {
+                    bool windowActive = !g.Closed && EnrollmentDomainRules.IsWithinEnrollmentWindow(nowUtc, g.OpensAt, g.ClosesAt);
+                    grpDtos.Add(new WebDisciplineGroupDto(
+                        g.Id,
+                        g.DisciplineId,
+                        g.GroupCode,
+                        g.Seats,
+                        g.Available,
+                        g.OpensAt,
+                        g.ClosesAt,
+                        EnrollmentDomainRules.FormatInUniversityTimeZone(g.OpensAt, g.UniversityTz),
+                        EnrollmentDomainRules.FormatInUniversityTimeZone(g.ClosesAt, g.UniversityTz),
+                        g.UniversityTz,
+                        g.Closed,
+                        windowActive));
+                }
             }
-            list.Add(groupDto);
+
+            disciplineDtos.Add(new WebDisciplineDto(
+                d.Id,
+                d.Code,
+                d.Title,
+                d.Ects,
+                grpDtos));
         }
 
-        var items = rawDisciplines.Select(d => new WebDisciplineDto(
-            d.Id,
-            d.Code,
-            d.Title,
-            d.Ects,
-            groupsByDiscipline.TryGetValue(d.Id, out var gList) ? gList : []
-        )).ToList();
-
-        return ServiceResult<WebDisciplineListResponseDto>.Ok(new WebDisciplineListResponseDto(items, nextCursor));
-    }
-
-    public async Task<IReadOnlyList<WebStudentDto>> GetStudentsAsync(CancellationToken cancellationToken = default)
-    {
-        var students = await _enrollmentRepo.GetStudentsAsync(cancellationToken);
-        return students.Select(s => new WebStudentDto(
-            s.Id,
-            s.Email,
-            s.FullName,
-            s.MaxDisciplines,
-            s.ActiveCount,
-            s.ActiveEcts,
-            EnrollmentDomainRules.MaxSemesterEcts
-        )).ToList();
+        return ServiceResult<WebDisciplineListResponseDto>.Ok(new WebDisciplineListResponseDto(disciplineDtos, nextCursor));
     }
 }

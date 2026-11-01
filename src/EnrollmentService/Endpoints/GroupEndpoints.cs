@@ -1,4 +1,3 @@
-using System.Text.Json;
 using EnrollmentService.Http;
 using EnrollmentService.Repositories;
 using EnrollmentService.Services;
@@ -14,7 +13,7 @@ public static class GroupEndpoints
         app.MapPost("/v1/groups/{id}/close", async (
             string id,
             HttpContext ctx,
-            IGroupRepository groupRepo,
+            GroupRepository groupRepo,
             ServiceOptions opts) =>
         {
             var group = await groupRepo.CloseGroupAsync(id, ctx.RequestAborted);
@@ -49,7 +48,7 @@ public static class GroupEndpoints
         app.MapGet("/v1/group-seats/{id}", async (
             string id,
             HttpContext ctx,
-            IGroupRepository groupRepo,
+            GroupRepository groupRepo,
             ServiceOptions opts) =>
         {
             var seats = await groupRepo.GetGroupSeatsByIdAsync(id, ctx.RequestAborted);
@@ -68,7 +67,7 @@ public static class GroupEndpoints
 
         app.MapGet("/v1/group-seats", async (
             HttpContext ctx,
-            IGroupRepository groupRepo) =>
+            GroupRepository groupRepo) =>
         {
             var list = await groupRepo.GetAllGroupSeatsAsync(ctx.RequestAborted);
             return Results.Ok(list);
@@ -77,7 +76,7 @@ public static class GroupEndpoints
         // Перегляд відомості деканату за request_id, group_id або student_id (С10 РПО п. 2, 6)
         app.MapGet("/v1/decanate-roster", async (
             HttpContext ctx,
-            IDecanateRepository decanateRepo,
+            DecanateRepository decanateRepo,
             ServiceOptions opts) =>
         {
             string? groupId = ctx.Request.Query["group_id"].FirstOrDefault();
@@ -101,47 +100,6 @@ public static class GroupEndpoints
 
             var items = await decanateRepo.GetRosterEntriesAsync(groupId, studentId, requestIdFilter, ctx.RequestAborted);
             return Results.Ok(new { items, count = items.Count });
-        });
-
-        // Розподіл студентів у групи другого вибору (second_choice_group_id) ПІСЛЯ закриття запису в групу {id} (С10 РПО п. 2, 6)
-        app.MapPost("/v1/groups/{id}/distribute-second-choice", async (
-            string id,
-            HttpContext ctx,
-            ISecondChoiceDistributor distributor,
-            ServiceOptions opts) =>
-        {
-            SecondChoiceDistributionRequestDto? dto = null;
-            if (ctx.Request.ContentLength is > 0 || ctx.Request.Headers.ContainsKey("Transfer-Encoding"))
-            {
-                try
-                {
-                    using var sr = new StreamReader(ctx.Request.Body);
-                    string bodyText = await sr.ReadToEndAsync(ctx.RequestAborted);
-                    if (!string.IsNullOrWhiteSpace(bodyText))
-                    {
-                        dto = JsonSerializer.Deserialize<SecondChoiceDistributionRequestDto>(
-                            bodyText,
-                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-                    }
-                }
-                catch (JsonException)
-                {
-                    return ProblemDetailsMapper.CreateProblemResult(
-                        ctx, opts,
-                        StatusCodes.Status400BadRequest,
-                        "Синтаксично некоректний JSON",
-                        "Тіло запиту не є коректним JSON-документом.",
-                        "malformed_json");
-                }
-            }
-
-            var result = await distributor.DistributeSecondChoiceAsync(id, dto, ctx.RequestAborted);
-            if (!result.IsSuccess)
-            {
-                return result.ToProblemResult(ctx, opts);
-            }
-
-            return Results.Ok(result.Value);
         });
 
         return app;

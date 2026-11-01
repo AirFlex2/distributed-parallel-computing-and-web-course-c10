@@ -1,6 +1,16 @@
 // Клієнтський модуль взаємодії з API сервісу запису на дисципліни (Тема С10: Web + РПО, ЛР1)
 // Написаний іншою мовою (JavaScript ES6+), ніж сервер (C# / ASP.NET Core 8.0) згідно з Д1.2 (Web).
 
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
 function getApiBase() {
     return document.getElementById('apiUrl').value.replace(/\/+$/, '');
 }
@@ -67,40 +77,109 @@ function parseWebEnrollmentDtoSafely(raw) {
     };
 }
 
-// Завантаження каталогу дисциплін та груп через балансувальник Nginx (GET /v1/disciplines)
+// Завантаження каталогу дисциплін та груп через балансувальник Nginx (GET /v1/disciplines) з повним обходом усіх сторінок (О1.5, О1.7)
 async function loadWebDisciplines() {
     try {
-        const res = await fetch(`${getApiBase()}/v1/disciplines?limit=20`, {
-            headers: getAuthHeaders()
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+        let cursor = null;
+        const allDisciplines = [];
+        const seenCursors = new Set();
+
+        while (true) {
+            const url = new URL(`${getApiBase()}/v1/disciplines`);
+            url.searchParams.set('limit', '20');
+            if (cursor) {
+                url.searchParams.set('after', cursor);
+            }
+
+            const res = await fetch(url.toString(), {
+                headers: getAuthHeaders()
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+
+            if (Array.isArray(data.items)) {
+                allDisciplines.push(...data.items);
+            }
+
+            if (!data.next_cursor || seenCursors.has(data.next_cursor)) {
+                break;
+            }
+            seenCursors.add(data.next_cursor);
+            cursor = data.next_cursor;
+        }
+
         const tbody = document.getElementById('webDisciplinesTableBody');
         tbody.innerHTML = '';
 
-        for (const d of (data.items || [])) {
+        for (const d of allDisciplines) {
             for (const g of (d.groups || [])) {
                 const tr = document.createElement('tr');
-                const statusBadge = g.closed
-                    ? '<span class="badge badge-err">Закрито</span>'
-                    : (g.window_active
-                        ? '<span class="badge badge-ok">Відкрито</span>'
-                        : '<span class="badge badge-warn">Поза вікном</span>');
 
-                tr.innerHTML = `
-                    <td><strong>${g.id}</strong></td>
-                    <td>${d.title} <span style="color:#64748b">(${d.code})</span></td>
-                    <td><strong>${Number(d.ects).toFixed(1)}</strong></td>
-                    <td><strong>${g.available}</strong> / ${g.seats}</td>
-                    <td>
-                        <div style="font-size:11px">${g.opens_at_local} &rarr; ${g.closes_at_local}</div>
-                        ${statusBadge}
-                    </td>
-                    <td>
-                        <button class="teal" style="padding:4px 8px;font-size:12px" onclick="createWebEnrollment('${g.id}')">Записатися</button>
-                        <button class="secondary" style="padding:4px 8px;font-size:12px" onclick="closeWebGroup('${g.id}')">Закрити</button>
-                    </td>
-                `;
+                const tdId = document.createElement('td');
+                const strongId = document.createElement('strong');
+                strongId.textContent = g.id;
+                tdId.appendChild(strongId);
+                tr.appendChild(tdId);
+
+                const tdTitle = document.createElement('td');
+                tdTitle.textContent = (d.title || '') + ' ';
+                const spanCode = document.createElement('span');
+                spanCode.style.color = '#64748b';
+                spanCode.textContent = `(${d.code || ''})`;
+                tdTitle.appendChild(spanCode);
+                tr.appendChild(tdTitle);
+
+                const tdEcts = document.createElement('td');
+                const strongEcts = document.createElement('strong');
+                strongEcts.textContent = Number(d.ects || 0).toFixed(1);
+                tdEcts.appendChild(strongEcts);
+                tr.appendChild(tdEcts);
+
+                const tdSeats = document.createElement('td');
+                const strongAvail = document.createElement('strong');
+                strongAvail.textContent = String(g.available);
+                tdSeats.appendChild(strongAvail);
+                tdSeats.appendChild(document.createTextNode(` / ${g.seats}`));
+                tr.appendChild(tdSeats);
+
+                const tdWindow = document.createElement('td');
+                const divWin = document.createElement('div');
+                divWin.style.fontSize = '11px';
+                divWin.textContent = `${g.opens_at_local} \u2192 ${g.closes_at_local}`;
+                const spanBadge = document.createElement('span');
+                if (g.closed) {
+                    spanBadge.className = 'badge badge-err';
+                    spanBadge.textContent = 'Закрито';
+                } else if (g.window_active) {
+                    spanBadge.className = 'badge badge-ok';
+                    spanBadge.textContent = 'Відкрито';
+                } else {
+                    spanBadge.className = 'badge badge-warn';
+                    spanBadge.textContent = 'Поза вікном';
+                }
+                tdWindow.appendChild(divWin);
+                tdWindow.appendChild(spanBadge);
+                tr.appendChild(tdWindow);
+
+                const tdActions = document.createElement('td');
+                const btnEnroll = document.createElement('button');
+                btnEnroll.className = 'teal';
+                btnEnroll.style.padding = '4px 8px';
+                btnEnroll.style.fontSize = '12px';
+                btnEnroll.style.marginRight = '4px';
+                btnEnroll.textContent = 'Записатися';
+                btnEnroll.addEventListener('click', () => createWebEnrollment(g.id));
+                tdActions.appendChild(btnEnroll);
+
+                const btnClose = document.createElement('button');
+                btnClose.className = 'secondary';
+                btnClose.style.padding = '4px 8px';
+                btnClose.style.fontSize = '12px';
+                btnClose.textContent = 'Закрити';
+                btnClose.addEventListener('click', () => closeWebGroup(g.id));
+                tdActions.appendChild(btnClose);
+
+                tr.appendChild(tdActions);
                 tbody.appendChild(tr);
             }
         }
@@ -110,7 +189,7 @@ async function loadWebDisciplines() {
 }
 
 // Головна операція (О1.4, О1.7): POST /v1/enrollments із відображенням 201 Created або Problem Details
-async function createWebEnrollment(overrideGroupId = null, evaluatedAt = null, overrideStudentId = null) {
+async function createWebEnrollment(overrideGroupId = null, overrideStudentId = null) {
     const groupId = overrideGroupId || document.getElementById('webGroupIdSelect').value;
     const headers = getAuthHeaders();
     if (overrideStudentId) {
@@ -118,9 +197,6 @@ async function createWebEnrollment(overrideGroupId = null, evaluatedAt = null, o
     }
 
     const payload = { group_id: groupId };
-    if (evaluatedAt) {
-        payload.evaluated_at = evaluatedAt;
-    }
 
     try {
         const res = await fetch(`${getApiBase()}/v1/enrollments`, {
@@ -183,6 +259,25 @@ async function cancelWebEnrollment(enrollmentId) {
     }
 }
 
+// Підтвердження запису студентом (Web О1.1: held -> confirmed): POST /v1/enrollments/{id}/confirm
+async function confirmWebEnrollment(enrollmentId) {
+    try {
+        const res = await fetch(`${getApiBase()}/v1/enrollments/${enrollmentId}/confirm`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok) {
+            appendWebOpLog(`[200 OK] Запис ${enrollmentId} успішно підтверджено (status="${body.status}").`);
+        } else {
+            appendWebOpLog(`[HTTP ${res.status}] Помилка підтвердження: ${body.detail || body.title}`);
+        }
+        await refreshAll();
+    } catch (err) {
+        appendWebOpLog(`Помилка підтвердження запису: ${err.message}`);
+    }
+}
+
 // Закриття групи працівником деканату: POST /v1/groups/{id}/close
 async function closeWebGroup(groupId) {
     try {
@@ -213,6 +308,7 @@ async function readAllWebEnrollmentPages() {
     let cursor = null;
     let pageNum = 0;
     const allItems = [];
+    const seenCursors = new Set();
     let latestMeta = null;
 
     appendWebCursorLog(`Старт посторінкового обходу GET /v1/enrollments для ${studentId} з limit=${limit}...`);
@@ -245,8 +341,13 @@ async function readAllWebEnrollmentPages() {
         if (!body.next_cursor) {
             break;
         }
+
+        if (seenCursors.has(body.next_cursor)) {
+            appendWebCursorLog(`[Увага] Виявлено повторний курсор (зациклення). Завершення обходу списку.`);
+            break;
+        }
+        seenCursors.add(body.next_cursor);
         cursor = body.next_cursor;
-        if (pageNum > 50) break;
     }
 
     if (latestMeta) {
@@ -256,23 +357,71 @@ async function readAllWebEnrollmentPages() {
 
     for (const item of allItems) {
         const tr = document.createElement('tr');
-        const stBadge = item.status === 'held' || item.status === 'confirmed'
-            ? `<span class="badge badge-ok">${item.status} (v${item.version})</span>`
-            : `<span class="badge badge-warn">${item.status} (v${item.version})</span>`;
 
-        tr.innerHTML = `
-            <td style="font-family:monospace;font-size:11px">${item.id}</td>
-            <td><strong>${item.group_id}</strong><div style="font-size:11px;color:#64748b">${item.discipline_title}</div></td>
-            <td>${item.ects.toFixed(1)}</td>
-            <td>${stBadge}</td>
-            <td style="font-size:11px">${item.created_at_local}</td>
-            <td><span class="badge badge-ok">${item.instance_id}</span></td>
-            <td>
-                ${(item.status === 'held' || item.status === 'confirmed')
-                    ? `<button class="danger" style="padding:3px 7px;font-size:11px" onclick="cancelWebEnrollment('${item.id}')">Скасувати</button>`
-                    : '—'}
-            </td>
-        `;
+        const tdId = document.createElement('td');
+        tdId.style.fontFamily = 'monospace';
+        tdId.style.fontSize = '11px';
+        tdId.textContent = item.id;
+        tr.appendChild(tdId);
+
+        const tdGroup = document.createElement('td');
+        const strongGroup = document.createElement('strong');
+        strongGroup.textContent = item.group_id;
+        const divTitle = document.createElement('div');
+        divTitle.style.fontSize = '11px';
+        divTitle.style.color = '#64748b';
+        divTitle.textContent = item.discipline_title;
+        tdGroup.appendChild(strongGroup);
+        tdGroup.appendChild(divTitle);
+        tr.appendChild(tdGroup);
+
+        const tdEcts = document.createElement('td');
+        tdEcts.textContent = item.ects.toFixed(1);
+        tr.appendChild(tdEcts);
+
+        const tdStatus = document.createElement('td');
+        const spanStatus = document.createElement('span');
+        spanStatus.className = (item.status === 'held' || item.status === 'confirmed') ? 'badge badge-ok' : 'badge badge-warn';
+        spanStatus.textContent = `${item.status} (v${item.version})`;
+        tdStatus.appendChild(spanStatus);
+        tr.appendChild(tdStatus);
+
+        const tdTime = document.createElement('td');
+        tdTime.style.fontSize = '11px';
+        tdTime.textContent = item.created_at_local;
+        tr.appendChild(tdTime);
+
+        const tdInst = document.createElement('td');
+        const spanInst = document.createElement('span');
+        spanInst.className = 'badge badge-ok';
+        spanInst.textContent = item.instance_id;
+        tdInst.appendChild(spanInst);
+        tr.appendChild(tdInst);
+
+        const tdActions = document.createElement('td');
+        if (item.status === 'held') {
+            const btnConfirm = document.createElement('button');
+            btnConfirm.className = 'teal';
+            btnConfirm.style.padding = '3px 7px';
+            btnConfirm.style.fontSize = '11px';
+            btnConfirm.style.marginRight = '4px';
+            btnConfirm.textContent = 'Підтвердити';
+            btnConfirm.addEventListener('click', () => confirmWebEnrollment(item.id));
+            tdActions.appendChild(btnConfirm);
+        }
+        if (item.status === 'held' || item.status === 'confirmed') {
+            const btnCancel = document.createElement('button');
+            btnCancel.className = 'danger';
+            btnCancel.style.padding = '3px 7px';
+            btnCancel.style.fontSize = '11px';
+            btnCancel.textContent = 'Скасувати';
+            btnCancel.addEventListener('click', () => cancelWebEnrollment(item.id));
+            tdActions.appendChild(btnCancel);
+        } else {
+            tdActions.textContent = '—';
+        }
+        tr.appendChild(tdActions);
+
         tbody.appendChild(tr);
     }
 
@@ -292,29 +441,16 @@ async function testCorruptedCursor() {
 }
 
 // Автотест граничних правил Д1.1 та Д1.5:
-// 1. Часове вікно [opens_at, closes_at): запит у момент opens_at -> 201, у момент closes_at -> 409
-//    (якщо ALLOW_TEST_OVERRIDES=false, сервер захищено від підміни часу та повертає 403 Forbidden)
-// 2. Перехід через межу доби (2026-09-01T21:00:00Z -> 2026-09-02T00:00:00+03:00 у Києві) та зміна часового зміщення (+02:00 / +03:00)
-// 3. Ліміт ЄКТС: сума 30.0 -> 201, сума 30.5 -> 409
+// 1. Часове вікно [opens_at, closes_at): запит поза вікном -> 409 Conflict
+// 2. Ліміт ЄКТС: сума 30.0 -> 201 Created, сума 30.5 -> 409 Conflict
 async function runWebBoundaryTests() {
     appendWebOpLog(`=== Старт автотесту граничних умов Д1.1 та Д1.5 ===`);
-    const rClose = await createWebEnrollment('DISC-WINDOW-TEST', '2026-09-15T15:00:00Z', 'student-2');
-    if (rClose && rClose.status === 403) {
-        appendWebOpLog(
-            `[Захист активний] ALLOW_TEST_OVERRIDES=false: поле evaluated_at заблоковано (403 Forbidden). ` +
-            `Перевіряємо вікно за реальним часом сервера (поза [2026-09-01, 2026-09-15) -> 409 Conflict)...`
-        );
-        await createWebEnrollment('DISC-WINDOW-TEST', null, 'student-2');
-    } else {
-        await createWebEnrollment('DISC-WINDOW-TEST', '2026-09-01T07:00:00Z', 'student-2');
-        await createWebEnrollment('DISC-WINDOW-TEST', '2026-09-01T08:59:59+02:00', 'student-3');
-        const dayBoundary = await createWebEnrollment('DISC-WINDOW-TEST', '2026-09-01T21:00:00Z', 'student-3');
-        if (dayBoundary && dayBoundary.status === 201 && dayBoundary.body?.id) {
-            await cancelWebEnrollment(dayBoundary.body.id);
-        }
-    }
-    await createWebEnrollment('DISC-ECTS-10-5-G1', null, 'student-ects-20');
-    await createWebEnrollment('DISC-ECTS-10-G1', null, 'student-ects-20');
+    appendWebOpLog(`1. Перевірка вікна запису: спроба запису в DISC-WINDOW-TEST поза вікном -> 409 Conflict...`);
+    await createWebEnrollment('DISC-WINDOW-TEST', 'student-2');
+    appendWebOpLog(`2. Перевірка ліміту ЄКТС: студент із 20.0 ЄКТС пробує 10.5 ЄКТС (20.0 + 10.5 = 30.5 > 30.0 -> 409 Conflict)...`);
+    await createWebEnrollment('DISC-ECTS-10-5-G1', 'student-ects-20');
+    appendWebOpLog(`3. Перевірка ліміту ЄКТС: студент із 20.0 ЄКТС записується на 10.0 ЄКТС (20.0 + 10.0 = 30.0 <= 30.0 -> 201 Created)...`);
+    await createWebEnrollment('DISC-ECTS-10-G1', 'student-ects-20');
 }
 
 // Автотест усіх кодів помилок Problem Details (400, 404, 409, 422) + захисту X-User-Id (О1.4, Д1.3)
@@ -357,7 +493,7 @@ async function runWebProblemDetailsTests() {
     await createWebEnrollment('DISC-DOES-NOT-EXIST-999');
 
     // 6. 409 Conflict (перевищення ліміту K дисциплін у student-limit-max)
-    await createWebEnrollment('DISC-DB-01', null, 'student-limit-max');
+    await createWebEnrollment('DISC-DB-01', 'student-limit-max');
 }
 
 // ============================================================================
@@ -374,18 +510,41 @@ async function loadGroups() {
 
         for (const g of groups) {
             const tr = document.createElement('tr');
-            const badgeClass = g.invariantHolds ? 'badge-ok' : 'badge-err';
-            const badgeText = g.invariantHolds
-                ? `Дотримано (${g.taken} <= ${g.seats})`
-                : `ПОРУШЕНО (${g.taken} > ${g.seats})`;
+            const invHolds = Boolean(g.invariant_holds ?? g.invariantHolds);
+            const badgeClass = invHolds ? 'badge-ok' : 'badge-err';
+            const taken = g.taken;
+            const seats = g.seats;
+            const badgeText = invHolds
+                ? `Дотримано (${taken} <= ${seats})`
+                : `ПОРУШЕНО (${taken} > ${seats})`;
 
-            tr.innerHTML = `
-                <td><strong>${g.groupId}</strong></td>
-                <td>${g.disciplineTitle}</td>
-                <td>${g.seats}</td>
-                <td><strong>${g.taken}</strong></td>
-                <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-            `;
+            const tdId = document.createElement('td');
+            const strongId = document.createElement('strong');
+            strongId.textContent = g.group_id || g.groupId || '';
+            tdId.appendChild(strongId);
+            tr.appendChild(tdId);
+
+            const tdTitle = document.createElement('td');
+            tdTitle.textContent = g.discipline_title || g.disciplineTitle || '';
+            tr.appendChild(tdTitle);
+
+            const tdSeats = document.createElement('td');
+            tdSeats.textContent = String(seats);
+            tr.appendChild(tdSeats);
+
+            const tdTaken = document.createElement('td');
+            const strongTaken = document.createElement('strong');
+            strongTaken.textContent = String(taken);
+            tdTaken.appendChild(strongTaken);
+            tr.appendChild(tdTaken);
+
+            const tdStatus = document.createElement('td');
+            const spanStatus = document.createElement('span');
+            spanStatus.className = `badge ${badgeClass}`;
+            spanStatus.textContent = badgeText;
+            tdStatus.appendChild(spanStatus);
+            tr.appendChild(tdStatus);
+
             tbody.appendChild(tr);
         }
     } catch (err) {
@@ -396,7 +555,7 @@ async function loadGroups() {
 async function loadMetrics() {
     try {
         const [res, healthRes] = await Promise.all([
-            fetch(`${getApiBase()}/metrics?format=json`),
+            fetch(`${getApiBase()}/metrics?format=json`, { headers: getAuthHeaders() }),
             fetch(`${getApiBase()}/health`)
         ]);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -405,7 +564,7 @@ async function loadMetrics() {
 
         const overridesBadge = document.getElementById('testOverridesBadge');
         if (overridesBadge) {
-            const enabled = Boolean(healthData.allow_test_overrides ?? data.service_state?.allow_test_overrides);
+            const enabled = Boolean(healthData.allow_test_overrides ?? data.configuration?.allow_test_overrides);
             overridesBadge.className = enabled ? 'badge badge-warn' : 'badge badge-ok';
             overridesBadge.textContent = enabled
                 ? 'ALLOW_TEST_OVERRIDES=true (Тестовий стенд)'
@@ -413,30 +572,30 @@ async function loadMetrics() {
         }
 
         const summary = document.getElementById('metricsSummary');
-        const modeBadge = data.service_state.unsafe_mode
+        const modeBadge = (data.configuration?.unsafe_mode ?? false)
             ? '<span class="badge badge-err">UNSAFE (Без блокувань)</span>'
             : '<span class="badge badge-ok">SAFE (Транзакційний)</span>';
 
         summary.innerHTML = `
             <div class="stat-box">
                 <div class="stat-label">У черзі / В обробці</div>
-                <div class="stat-val">${data.queue_length} / ${data.in_processing}</div>
+                <div class="stat-val">${escapeHtml(data.queue_length)} / ${escapeHtml(data.in_processing)}</div>
             </div>
             <div class="stat-box">
                 <div class="stat-label">Успішно (done) / Відмов (rejected)</div>
-                <div class="stat-val">${data.counters.total_done} / ${data.counters.total_rejected}</div>
+                <div class="stat-val">${escapeHtml(data.counters?.total_done)} / ${escapeHtml(data.counters?.total_rejected)}</div>
             </div>
             <div class="stat-box">
                 <div class="stat-label">Відмов черги (HTTP 429)</div>
-                <div class="stat-val">${data.counters.total_429_too_many_requests}</div>
+                <div class="stat-val">${escapeHtml(data.counters?.total_429_too_many_requests)}</div>
             </div>
             <div class="stat-box">
                 <div class="stat-label">Очікування в черзі p95</div>
-                <div class="stat-val">${data.intervals_ms.queue_wait_ms.p95_ms} мс</div>
+                <div class="stat-val">${escapeHtml(data.intervals_ms?.queue_wait_ms?.p95_ms ?? '—')} мс</div>
             </div>
             <div class="stat-box">
                 <div class="stat-label">Літтл: L_теор / L_інт / L_100мс</div>
-                <div class="stat-val" style="font-size: 14px;">${data.littles_law.l_theoretical_avg_queue_length} / ${data.littles_law.l_observed_avg_queue_length} / ${data.littles_law.l_observed_independent_sampled ?? '—'}</div>
+                <div class="stat-val" style="font-size: 14px;">${escapeHtml(data.littles_law?.l_theoretical_avg_queue_length)} / ${escapeHtml(data.littles_law?.l_observed_avg_queue_length)} / ${escapeHtml(data.littles_law?.l_observed_independent_sampled ?? '—')}</div>
             </div>
             <div class="stat-box">
                 <div class="stat-label">Режим захисту О1.4</div>
@@ -465,16 +624,16 @@ async function submitSingleEnrollment() {
     const resultBox = document.getElementById('singleRequestResult');
 
     try {
-        resultBox.innerHTML = 'Надсилання запиту...';
+        resultBox.textContent = 'Надсилання запиту...';
         const res = await fetch(`${getApiBase()}/v1/enrollment-requests`, {
             method: 'POST',
             headers: getAuthHeaders(),
-            body: JSON.stringify({ studentId, groupId })
+            body: JSON.stringify({ student_id: studentId, group_id: groupId })
         });
 
-        const body = await res.json();
+        const body = await res.json().catch(() => ({}));
         if (res.status !== 202) {
-            resultBox.innerHTML = `<span class="badge badge-err">Помилка HTTP ${res.status}</span> ${body.detail || body.title}`;
+            resultBox.innerHTML = `<span class="badge badge-err">Помилка HTTP ${escapeHtml(res.status)}</span> ${escapeHtml(body.detail || body.title || '')}`;
             await refreshAll();
             return;
         }
@@ -489,13 +648,18 @@ async function submitSingleEnrollment() {
             if (!pollRes.ok) return;
             const statusData = await pollRes.json();
 
+            const reason = statusData.rejection_reason || statusData.rejectionReason;
+            const qWait = statusData.queue_wait_ms ?? statusData.queueWaitMs ?? '—';
+            const proc = statusData.processing_time_ms ?? statusData.processingTimeMs ?? '—';
+            const deliv = statusData.delivery_wait_ms ?? statusData.deliveryWaitMs ?? '—';
+
             resultBox.innerHTML = `
-                <div><strong>ID заявки:</strong> ${statusData.id}</div>
-                <div><strong>Статус:</strong> <span class="badge badge-warn">${statusData.status}</span></div>
-                ${statusData.rejectionReason ? `<div><strong>Причина:</strong> ${statusData.rejectionReason}</div>` : ''}
-                <div><strong>Очікування в черзі:</strong> ${statusData.queueWaitMs ?? '—'} мс |
-                     <strong>Обробка:</strong> ${statusData.processingTimeMs ?? '—'} мс |
-                     <strong>Очікування видачі (GET):</strong> ${statusData.deliveryWaitMs ?? '—'} мс</div>
+                <div><strong>ID заявки:</strong> ${escapeHtml(statusData.id)}</div>
+                <div><strong>Статус:</strong> <span class="badge badge-warn">${escapeHtml(statusData.status)}</span></div>
+                ${reason ? `<div><strong>Причина:</strong> ${escapeHtml(reason)}</div>` : ''}
+                <div><strong>Очікування в черзі:</strong> ${escapeHtml(qWait)} мс |
+                     <strong>Обробка:</strong> ${escapeHtml(proc)} мс |
+                     <strong>Очікування видачі (GET):</strong> ${escapeHtml(deliv)} мс</div>
             `;
 
             if (['done', 'rejected', 'failed'].includes(statusData.status)) {
@@ -505,7 +669,7 @@ async function submitSingleEnrollment() {
             }
         }, 250);
     } catch (err) {
-        resultBox.innerHTML = `<span class="badge badge-err">Помилка мережі: ${err.message}</span>`;
+        resultBox.innerHTML = `<span class="badge badge-err">Помилка мережі: ${escapeHtml(err.message)}</span>`;
     }
 }
 
@@ -517,12 +681,12 @@ async function runStressBatch() {
 
     const requests = [];
     for (let i = 1; i <= count; i++) {
-        const studentId = `STRESS-STD-${Date.now()}-${i}`;
+        const studentId = 'student-safe-' + String(((i - 1) % 20) + 1).padStart(2, '0');
         requests.push(
             fetch(`${getApiBase()}/v1/enrollment-requests`, {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({ studentId, groupId })
+                body: JSON.stringify({ student_id: studentId, group_id: groupId })
             }).then(async r => ({ status: r.status, retryAfter: r.headers.get('Retry-After'), body: await r.json().catch(() => ({})) }))
         );
     }
@@ -595,10 +759,11 @@ async function runLittlesLawExperiment() {
 
         for (let b = 0; b < requestsPerSecond; b++) {
             reqCounter++;
+            const studentId = `student-safe-${String(((reqCounter - 1) % 20) + 1).padStart(2, '0')}`;
             fetch(`${getApiBase()}/v1/enrollment-requests`, {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({ studentId: `LITTLE-STD-${reqCounter}`, groupId })
+                body: JSON.stringify({ student_id: studentId, group_id: groupId })
             })
                 .then(r => r.json())
                 .then(d => { if (d && d.id) createdIds.push(d.id); })
@@ -627,7 +792,7 @@ async function runLittlesLawExperiment() {
         }
     }
 
-    const metricsRes = await fetch(`${getApiBase()}/metrics?format=json`);
+    const metricsRes = await fetch(`${getApiBase()}/metrics?format=json`, { headers: getAuthHeaders() });
     const metricsData = await metricsRes.json();
     const ll = metricsData.littles_law;
 
@@ -684,6 +849,20 @@ async function resetEnvironment(unsafeMode) {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+    // Прив'язка обробників подій до кнопок та селектів без inline обробників (О1.7, Д1.2)
+    document.getElementById('btnRefreshAll')?.addEventListener('click', () => refreshAll());
+    document.getElementById('btnCreateWebEnrollment')?.addEventListener('click', () => createWebEnrollment());
+    document.getElementById('btnRunWebBoundaryTests')?.addEventListener('click', () => runWebBoundaryTests());
+    document.getElementById('btnRunWebProblemDetailsTests')?.addEventListener('click', () => runWebProblemDetailsTests());
+    document.getElementById('btnReadAllWebEnrollmentPages')?.addEventListener('click', () => readAllWebEnrollmentPages());
+    document.getElementById('btnTestCorruptedCursor')?.addEventListener('click', () => testCorruptedCursor());
+    document.getElementById('btnResetSafe')?.addEventListener('click', () => resetEnvironment(false));
+    document.getElementById('btnResetUnsafe')?.addEventListener('click', () => resetEnvironment(true));
+    document.getElementById('btnSubmitSingleEnrollment')?.addEventListener('click', () => submitSingleEnrollment());
+    document.getElementById('btnRunStressBatch')?.addEventListener('click', () => runStressBatch());
+    document.getElementById('btnRunLittlesLaw')?.addEventListener('click', () => runLittlesLawExperiment());
+    document.getElementById('webUserSelect')?.addEventListener('change', () => refreshAll());
+
     refreshAll();
     setInterval(() => {
         loadGroups();

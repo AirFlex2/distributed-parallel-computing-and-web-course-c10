@@ -159,7 +159,7 @@
             <label for="apiUrl">Вхідна точка (Nginx):</label>
             <input type="text" id="apiUrl" value="http://localhost:8080" style="width: 175px;">
             <label for="webUserSelect">Студент (X-User-Id):</label>
-            <select id="webUserSelect" onchange="refreshAll()">
+            <select id="webUserSelect">
                 <option value="student-1">student-1 (Зінківський Т. Є.)</option>
                 <option value="student-2">student-2 (Коваленко О. І.)</option>
                 <option value="student-3">student-3 (Шевченко М. В.)</option>
@@ -168,7 +168,7 @@
             </select>
             <label for="authToken">Bearer:</label>
             <input type="text" id="authToken" value="secret-c10-token-2026" style="width: 165px;">
-            <button onclick="refreshAll()">Оновити все</button>
+            <button id="btnRefreshAll">Оновити все</button>
         </div>
     </header>
 
@@ -221,9 +221,9 @@
                 <input type="text" id="traceparentInput" value="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01">
             </div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
-                <button class="teal" onclick="createWebEnrollment()">Записатися: POST /v1/enrollments (201 Created)</button>
-                <button class="secondary" onclick="runWebBoundaryTests()">Автотест Д1.1/Д1.5 (Вікно [opens_at, closes_at) + ЄКТС 30.0 vs 30.5)</button>
-                <button class="danger" onclick="runWebProblemDetailsTests()">Автотест Problem Details (400 / 404 / 409 / 422)</button>
+                <button class="teal" id="btnCreateWebEnrollment">Записатися: POST /v1/enrollments (201 Created)</button>
+                <button class="secondary" id="btnRunWebBoundaryTests">Автотест Д1.1/Д1.5 (Вікно [opens_at, closes_at) + ЄКТС 30.0 vs 30.5)</button>
+                <button class="danger" id="btnRunWebProblemDetailsTests">Автотест Problem Details (400 / 404 / 409 / 422)</button>
             </div>
             <div id="webMainOpResult" class="log-box" style="margin-top: 12px; height: 175px;">Очікування виконання головної операції POST /v1/enrollments...</div>
         </div>
@@ -236,8 +236,8 @@
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;">
                 <label for="webCursorLimit">Розмір сторінки (limit 1..50):</label>
                 <input type="number" id="webCursorLimit" value="2" min="1" max="50" style="width: 70px;">
-                <button class="teal" onclick="readAllWebEnrollmentPages()">Прочитати ВСІ сторінки за курсором next_cursor</button>
-                <button class="secondary" onclick="testCorruptedCursor()">Перевірити пошкоджений курсор (400)</button>
+                <button class="teal" id="btnReadAllWebEnrollmentPages">Прочитати ВСІ сторінки за курсором next_cursor</button>
+                <button class="secondary" id="btnTestCorruptedCursor">Перевірити пошкоджений курсор (400)</button>
             </div>
             <table>
                 <thead>
@@ -281,8 +281,8 @@
                 <tbody id="groupsTableBody"></tbody>
             </table>
             <div style="margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap;">
-                <button class="secondary" onclick="resetEnvironment(false)">Скинути дані (Безпечний режим UNSAFE=false)</button>
-                <button class="danger" onclick="resetEnvironment(true)">Скинути дані та увімкнути UNSAFE_MODE=true</button>
+                <button class="secondary" id="btnResetSafe">Скинути дані (Безпечний режим UNSAFE=false)</button>
+                <button class="danger" id="btnResetUnsafe">Скинути дані та увімкнути UNSAFE_MODE=true</button>
             </div>
         </div>
 
@@ -291,7 +291,7 @@
             <h2>Б2. Подання заявки у чергу (POST /v1/enrollment-requests — О1.1, О1.5 РПО)</h2>
             <div class="form-row">
                 <label for="studentIdInput">Ідентифікатор студента (student_id):</label>
-                <input type="text" id="studentIdInput" value="STD-2026-001">
+                <input type="text" id="studentIdInput" value="student-1">
             </div>
             <div class="form-row">
                 <label for="groupIdSelect">Навчальна група (group_id):</label>
@@ -300,10 +300,9 @@
                     <option value="DISC-AI-02">DISC-AI-02 (Методи штучного інтелекту — 25 місць)</option>
                     <option value="DISC-SEC-03">DISC-SEC-03 (Кібербезпека — 15 місць)</option>
                     <option value="DISC-TEST-SAFE">DISC-TEST-SAFE (Тестова група — 5 місць)</option>
-                    <option value="DISC-TEST-UNSAFE">DISC-TEST-UNSAFE (Тестова група — 5 місць)</option>
                 </select>
             </div>
-            <button onclick="submitSingleEnrollment()">Надіслати заявку в чергу (202 Accepted)</button>
+            <button id="btnSubmitSingleEnrollment">Надіслати заявку в чергу (202 Accepted)</button>
             <div id="singleRequestResult" style="margin-top: 14px; font-size: 13px;"></div>
         </div>
     </div>
@@ -315,8 +314,7 @@
             <div class="form-row">
                 <label for="stressGroup">Цільова група для пакетного навантаження:</label>
                 <select id="stressGroup">
-                    <option value="DISC-TEST-SAFE">DISC-TEST-SAFE (5 місць — перевірка інваріанта О1.4)</option>
-                    <option value="DISC-TEST-UNSAFE">DISC-TEST-UNSAFE (5 місць — демонстрація гонитви О1.4)</option>
+                    <option value="DISC-TEST-SAFE">DISC-TEST-SAFE (5 місць — перевірка інваріанта О1.4 у SAFE / UNSAFE)</option>
                     <option value="DISC-DPC-01">DISC-DPC-01 (30 місць — перевірка черги О1.2 та закону Літтла Д1.2)</option>
                 </select>
             </div>
@@ -325,8 +323,8 @@
                 <input type="number" id="stressCount" value="140" min="1" max="500">
             </div>
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
-                <button onclick="runStressBatch()">Запустити залп одночасних запитів (О1.2 / О1.4)</button>
-                <button class="secondary" onclick="runLittlesLawExperiment()">Дослід закону Літтла (Д1.2 — 60 с)</button>
+                <button id="btnRunStressBatch">Запустити залп одночасних запитів (О1.2 / О1.4)</button>
+                <button class="secondary" id="btnRunLittlesLaw">Дослід закону Літтла (Д1.2 — 60 с)</button>
             </div>
             <div style="margin-top: 12px;">
                 <div class="stat-label">Журнал виконання дослідів та вимірів /health:</div>

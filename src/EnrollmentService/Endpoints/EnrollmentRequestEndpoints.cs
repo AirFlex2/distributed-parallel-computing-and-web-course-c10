@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using EnrollmentService;
 using EnrollmentService.Http;
 using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
@@ -10,20 +11,22 @@ namespace EnrollmentService.Endpoints;
 
 public static class EnrollmentRequestEndpoints
 {
-    private static readonly SemaphoreSlim AdmissionSemaphore = new(1, 1);
-
     public static IEndpointRouteBuilder MapEnrollmentRequestEndpoints(this IEndpointRouteBuilder app)
     {
+        // ПУНКТ О1.1 (РПО): Асинхронний прийом заявок на запис у дисципліну з відповіддю HTTP 202 Accepted
         app.MapPost("/v1/enrollment-requests", async (
             HttpContext httpContext,
-            CreateEnrollmentRequestDto dto,
             IBoundedRequestQueue queue,
             EnrollmentWorkerPool workerPool,
             MetricsCollector metrics,
-            IEnrollmentRequestRepository requestRepo,
+            EnrollmentRequestRepository requestRepo,
+            GroupRepository groupRepo,
+            EnrollmentRepository enrollmentRepo,
             IDbConnectionFactory connectionFactory,
             ServiceOptions opts) =>
         {
+            long arrivalTimestamp = Stopwatch.GetTimestamp();
+
             if (workerPool.IsShuttingDown)
             {
                 return ProblemDetailsMapper.CreateProblemResult(
@@ -34,49 +37,66 @@ public static class EnrollmentRequestEndpoints
                     "service_shutting_down");
             }
 
-            if (string.IsNullOrWhiteSpace(dto.StudentId) || string.IsNullOrWhiteSpace(dto.GroupId))
+            var (dto, problemResult) = await HttpPayloadHelper.ReadAndValidateAsync<CreateEnrollmentRequestDto>(httpContext, opts);
+            if (problemResult != null)
             {
-                return ProblemDetailsMapper.CreateProblemResult(
-                    httpContext, opts,
-                    StatusCodes.Status400BadRequest,
-                    "Некоректні параметри запиту",
-                    "Поля student_id та group_id є обов'язковими.",
-                    "missing_required_fields");
+                return problemResult;
             }
 
-            string studentId = dto.StudentId.Trim();
-            string groupId = dto.GroupId.Trim();
-            string? secondChoiceGroupId = string.IsNullOrWhiteSpace(dto.SecondChoiceGroupId)
-                ? null
-                : dto.SecondChoiceGroupId.Trim();
-
-            Guid requestId = dto.RequestId
-                ?? (httpContext.Request.Headers.TryGetValue("Idempotency-Key", out var ik) && Guid.TryParse(ik, out var parsedIk)
-                    ? parsedIk
-                    : Guid.NewGuid());
-
-            await AdmissionSemaphore.WaitAsync();
-            try
+            string? idempotencyKey = null;
+            if (httpContext.Request.Headers.TryGetValue("Idempotency-Key", out var ikHeader) && !string.IsNullOrWhiteSpace(ikHeader))
             {
-                // 1. Перевірка на повторний запит із тим самим ID
-                var existing = await requestRepo.GetAcceptedByIdAsync(requestId);
+                idempotencyKey = ikHeader.ToString().Trim();
+                if (idempotencyKey.Length > 128)
+                {
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        httpContext, opts,
+                        StatusCodes.Status400BadRequest,
+                        "Некоректний заголовок Idempotency-Key",
+                        "Довжина заголовка Idempotency-Key перевищує допустимий ліміт 128 символів.",
+                        "invalid_idempotency_key");
+                }
+            }
+            else if (dto!.RequestId.HasValue)
+            {
+                idempotencyKey = dto.RequestId.Value.ToString("D");
+            }
+
+            string studentId = dto!.StudentId!.Trim();
+            string groupId = dto!.GroupId!.Trim();
+            string payloadFingerprint = $"{studentId}:{groupId}";
+
+            // Перевірка ідемпотентності до резервування слота черги
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                await using var conn = await connectionFactory.OpenConnectionAsync(httpContext.RequestAborted);
+                var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, conn, httpContext.RequestAborted);
                 if (existing != null)
                 {
-                    if (!string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
+                    if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                        !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
                         !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
                     {
                         return ProblemDetailsMapper.CreateProblemResult(
                             httpContext, opts,
                             StatusCodes.Status409Conflict,
                             "Конфлікт даних ідемпотентного запиту",
-                            $"Заявка з ідентифікатором '{requestId}' вже існує з іншими параметрами student_id або group_id.",
+                            $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id або group_id.",
                             "idempotency_conflict");
                     }
 
-                    return Results.Accepted($"/v1/enrollment-requests/{existing.Id}", existing);
+                    return Results.Accepted($"/v1/enrollment-requests/{existing.Id}", new EnrollmentAcceptedResponseDto(
+                        existing.Id,
+                        existing.StudentId,
+                        existing.GroupId,
+                        existing.Status,
+                        existing.CreatedAt));
                 }
+            }
 
-                // 2. Перевірка стану завершення сервісу (Д1.4) та місткості обмеженої черги (О1.2)
+            // Швидка перевірка переповнення черги БЕЗ навантаження бази даних (О1.2)
+            if (!queue.TryReserveSlot())
+            {
                 if (workerPool.IsShuttingDown)
                 {
                     return ProblemDetailsMapper.CreateProblemResult(
@@ -87,16 +107,47 @@ public static class EnrollmentRequestEndpoints
                         "service_shutting_down");
                 }
 
-                if (queue.Count >= queue.Capacity)
+                metrics.RecordRejected429();
+                httpContext.Response.Headers["Retry-After"] = "1";
+                return ProblemDetailsMapper.CreateProblemResult(
+                    httpContext, opts,
+                    StatusCodes.Status429TooManyRequests,
+                    "Черга запитів переповнена (Backpressure)",
+                    $"Перевищено місткість обмеженої черги QUEUE_CAPACITY ({opts.QueueCapacity}). Спробуйте повторити запит через 1 секунду.",
+                    "queue_overflow");
+            }
+
+            bool slotConsumedByQueue = false;
+
+            try
+            {
+                var group = await groupRepo.GetGroupByIdAsync(groupId, httpContext.RequestAborted);
+                if (group == null)
                 {
-                    metrics.RecordRejected429();
-                    httpContext.Response.Headers["Retry-After"] = "1";
                     return ProblemDetailsMapper.CreateProblemResult(
                         httpContext, opts,
-                        StatusCodes.Status429TooManyRequests,
-                        "Черга запитів переповнена (Backpressure)",
-                        $"Перевищено місткість обмеженої черги QUEUE_CAPACITY ({opts.QueueCapacity}). Спробуйте повторити запит через 1 секунду.",
-                        "queue_overflow");
+                        StatusCodes.Status404NotFound,
+                        "Групу не знайдено",
+                        $"Навчальну групу '{groupId}' не знайдено в базі даних.",
+                        "group_not_found");
+                }
+
+                var student = await enrollmentRepo.GetStudentByIdAsync(studentId, httpContext.RequestAborted);
+                if (student == null)
+                {
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        httpContext, opts,
+                        StatusCodes.Status404NotFound,
+                        "Студента не знайдено",
+                        $"Студента '{studentId}' не знайдено в системі деканату.",
+                        "student_not_found");
+                }
+
+                Guid requestId = Guid.NewGuid();
+                // Якщо dto.RequestId передано без заголовка Idempotency-Key, зберігаємо його як ID заявки
+                if (dto.RequestId.HasValue && !httpContext.Request.Headers.ContainsKey("Idempotency-Key"))
+                {
+                    requestId = dto.RequestId.Value;
                 }
 
                 var createdAtUtc = DateTimeOffset.UtcNow;
@@ -105,102 +156,142 @@ public static class EnrollmentRequestEndpoints
                     Id = requestId,
                     StudentId = studentId,
                     GroupId = groupId,
-                    SecondChoiceGroupId = secondChoiceGroupId,
                     CreatedAtUtc = createdAtUtc,
-                    EnqueueTimestamp = Stopwatch.GetTimestamp()
+                    IdempotencyKey = idempotencyKey,
+                    RequestPayloadHash = payloadFingerprint,
+                    EnqueueTimestamp = arrivalTimestamp
                 };
 
-                // 3. О1.1: Спочатку зберігаємо заявку в PostgreSQL зі статусом 'queued' ДО додавання в чергу
-                await using var conn = await connectionFactory.OpenConnectionAsync();
-                await requestRepo.InsertQueuedRequestAsync(item, conn);
+                await using var conn = await connectionFactory.OpenConnectionAsync(httpContext.RequestAborted);
 
-                // 4. О1.2 / Д1.4: Додаємо заявку в чергу; якщо не вдалося — видаляємо запис із БД і повертаємо 503 або 429
-                if (workerPool.IsShuttingDown || !metrics.TryEnqueueAndRecordAccepted(queue, item))
+                bool inserted = await requestRepo.TryInsertQueuedRequestAsync(item, conn, httpContext.RequestAborted);
+                if (!inserted)
                 {
-                    await requestRepo.DeleteRequestAsync(item.Id, conn);
-
-                    if (workerPool.IsShuttingDown)
+                    ExistingRequestRecord? existing = null;
+                    if (!string.IsNullOrWhiteSpace(idempotencyKey))
                     {
-                        return ProblemDetailsMapper.CreateProblemResult(
-                            httpContext, opts,
-                            StatusCodes.Status503ServiceUnavailable,
-                            "Сервіс завершує роботу",
-                            "Отримано сигнал SIGTERM (Д1.4). Нові запити не приймаються, триває завершення поточних задач.",
-                            "service_shutting_down");
+                        existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, conn, httpContext.RequestAborted);
+                    }
+                    if (existing == null)
+                    {
+                        existing = await requestRepo.GetRecordByIdAsync(requestId, conn, httpContext.RequestAborted);
                     }
 
-                    metrics.RecordRejected429();
-                    httpContext.Response.Headers["Retry-After"] = "1";
+                    if (existing != null)
+                    {
+                        if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                            !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
+                            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+                        {
+                            return ProblemDetailsMapper.CreateProblemResult(
+                                httpContext, opts,
+                                StatusCodes.Status409Conflict,
+                                "Конфлікт даних ідемпотентного запиту",
+                                $"Заявка з цим ідентифікатором або ідемпотентним ключем уже існує з іншими параметрами.",
+                                "idempotency_conflict");
+                        }
+
+                        return Results.Accepted($"/v1/enrollment-requests/{existing.Id}", new EnrollmentAcceptedResponseDto(
+                            existing.Id,
+                            existing.StudentId,
+                            existing.GroupId,
+                            existing.Status,
+                            existing.CreatedAt));
+                    }
+
                     return ProblemDetailsMapper.CreateProblemResult(
                         httpContext, opts,
-                        StatusCodes.Status429TooManyRequests,
-                        "Черга запитів переповнена (Backpressure)",
-                        $"Перевищено місткість обмеженої черги QUEUE_CAPACITY ({opts.QueueCapacity}). Спробуйте повторити запит через 1 секунду.",
-                        "queue_overflow");
+                        StatusCodes.Status500InternalServerError,
+                        "Помилка створення заявки",
+                        "Не вдалося зафіксувати унікальну заявку в базі даних.",
+                        "request_insert_failed");
                 }
+
+                if (workerPool.IsShuttingDown)
+                {
+                    await requestRepo.DeleteRequestAsync(item.Id, conn, httpContext.RequestAborted);
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        httpContext, opts,
+                        StatusCodes.Status503ServiceUnavailable,
+                        "Сервіс завершує роботу",
+                        "Отримано сигнал SIGTERM (Д1.4). Нові запити не приймаються, триває завершення поточних задач.",
+                        "service_shutting_down");
+                }
+
+                bool enqueued = metrics.TryEnqueueReservedAndRecordAccepted(queue, item);
+                if (!enqueued)
+                {
+                    await requestRepo.DeleteRequestAsync(item.Id, conn, httpContext.RequestAborted);
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        httpContext, opts,
+                        StatusCodes.Status503ServiceUnavailable,
+                        "Сервіс завершує роботу",
+                        "Черга закрита для прийому нових запитів.",
+                        "queue_closed");
+                }
+
+                slotConsumedByQueue = true;
 
                 var response = new EnrollmentAcceptedResponseDto(
                     item.Id,
                     item.StudentId,
                     item.GroupId,
                     "queued",
-                    item.CreatedAtUtc,
-                    item.SecondChoiceGroupId);
+                    item.CreatedAtUtc);
 
                 return Results.Accepted($"/v1/enrollment-requests/{item.Id}", response);
             }
             finally
             {
-                AdmissionSemaphore.Release();
+                if (!slotConsumedByQueue)
+                {
+                    queue.ReleaseSlot();
+                }
             }
         });
 
-        app.MapGet("/v1/enrollment-requests/{id:guid}", async (
-            Guid id,
+        app.MapGet("/v1/enrollment-requests/{id}", async (
+            string id,
             HttpContext ctx,
             MetricsCollector metrics,
-            IEnrollmentRequestRepository requestRepo,
+            EnrollmentRequestRepository requestRepo,
             ServiceOptions opts) =>
         {
-            var status = await requestRepo.MarkFirstReadAndGetStatusAsync(id, DateTimeOffset.UtcNow, ctx.RequestAborted);
-            if (status != null)
+            if (!Guid.TryParse(id, out var parsedId))
             {
-                metrics.RecordFirstReadIfCompleted(id);
-                var timings = metrics.GetItemTimings(id);
-
-                double? qWait = timings.QueueWaitMs ?? (status.StartedAt.HasValue ? Math.Round((status.StartedAt.Value - status.CreatedAt).TotalMilliseconds, 3) : null);
-                double? proc = timings.ProcessingMs ?? (status.FinishedAt.HasValue && status.StartedAt.HasValue ? Math.Round((status.FinishedAt.Value - status.StartedAt.Value).TotalMilliseconds, 3) : null);
-                double? deliv = timings.DeliveryWaitMs ?? (status.FirstReadAt.HasValue && status.FinishedAt.HasValue ? Math.Round(Math.Max(0, (status.FirstReadAt.Value - status.FinishedAt.Value).TotalMilliseconds), 3) : null);
-
-                return Results.Ok(status with
-                {
-                    QueueWaitMs = qWait,
-                    ProcessingTimeMs = proc,
-                    DeliveryWaitMs = deliv
-                });
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний формат ідентифікатора заявки",
+                    $"Значення '{id}' не є валідним GUID. Очікується формат UUID.",
+                    "invalid_request_id_format");
             }
 
-            var activeStatus = await requestRepo.GetStatusByIdAsync(id, ctx.RequestAborted);
-            if (activeStatus == null)
+            var status = await requestRepo.MarkFirstReadAndGetStatusAsync(parsedId, DateTimeOffset.UtcNow, ctx.RequestAborted)
+                ?? await requestRepo.GetStatusByIdAsync(parsedId, ctx.RequestAborted);
+
+            if (status == null)
             {
                 return ProblemDetailsMapper.CreateProblemResult(
                     ctx, opts,
                     StatusCodes.Status404NotFound,
                     "Заявку не знайдено",
-                    $"Заявка з ідентифікатором '{id}' відсутня в базі даних.",
+                    $"Заявка з ідентифікатором '{parsedId}' відсутня в базі даних.",
                     "request_not_found");
             }
 
-            var activeTimings = metrics.GetItemTimings(id);
-            double? actQWait = activeTimings.QueueWaitMs ?? (activeStatus.StartedAt.HasValue ? Math.Round((activeStatus.StartedAt.Value - activeStatus.CreatedAt).TotalMilliseconds, 3) : null);
-            double? actProc = activeTimings.ProcessingMs ?? (activeStatus.FinishedAt.HasValue && activeStatus.StartedAt.HasValue ? Math.Round((activeStatus.FinishedAt.Value - activeStatus.StartedAt.Value).TotalMilliseconds, 3) : null);
-            double? actDeliv = activeTimings.DeliveryWaitMs ?? (activeStatus.FirstReadAt.HasValue && activeStatus.FinishedAt.HasValue ? Math.Round(Math.Max(0, (activeStatus.FirstReadAt.Value - activeStatus.FinishedAt.Value).TotalMilliseconds), 3) : null);
-
-            return Results.Ok(activeStatus with
+            bool isTerminal = status.Status is "done" or "rejected" or "failed";
+            if (isTerminal)
             {
-                QueueWaitMs = actQWait,
-                ProcessingTimeMs = actProc,
-                DeliveryWaitMs = actDeliv
+                metrics.RecordFirstReadIfCompleted(parsedId);
+            }
+            var (qWait, proc, deliv) = metrics.GetItemTimings(parsedId);
+
+            return Results.Ok(status with
+            {
+                QueueWaitMs = qWait,
+                ProcessingTimeMs = proc,
+                DeliveryWaitMs = deliv
             });
         });
 

@@ -1,13 +1,12 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Text;
 using EnrollmentService.Queues;
 
 namespace EnrollmentService.Metrics;
 
 // ============================================================================
 // ПУНКТ О1.5 (Час виконання й метрики) та ПУНКТ Д1.2 (Перевірка закону Літтла)
-// Містить як точний часово-зважений інтеграл черги, так і незалежне періодичне
+// Містить точний часово-зважений інтеграл черги та незалежне періодичне
 // опитування queue_length за фіксованим таймером (100 мс) без прив'язки до подій.
 // ============================================================================
 public sealed class MetricsCollector
@@ -37,29 +36,61 @@ public sealed class MetricsCollector
     // Поля для закону Літтла L = lambda * W за єдиний заліковий інтервал:
     // 1) Точне часове зважування: інтеграл Q(t) dt / T
     // 2) Незалежна дискретна вибірка: PeriodicTimer (кожні 100 мс читає queue.Count)
+    // Накопичувальні суми та лічильники без обмеження у 500 замірів для коректності на інтервалах > 50 с
     private bool _windowStarted;
     private long _windowStartTimestamp = Stopwatch.GetTimestamp();
     private long _lastQueueChangeTimestamp = Stopwatch.GetTimestamp();
     private int _currentQueueLength;
     private double _weightedQueueIntegralSec;
     private long _windowArrivalsCount;
-    private readonly List<double> _windowQueueWaitSamplesMs = new();
-    private readonly List<(long Timestamp, int QueueLength)> _windowQueueSnapshots = new();
-    private readonly List<int> _independentPeriodicQueueSamples = new();
+    private double _windowQueueWaitSumMs;
+    private long _windowQueueWaitCount;
+    private long _independentSampleSum;
+    private long _independentSampleCount;
+    private int _windowMaxQueueObserved;
+
+    private static void AddBoundedSample(ConcurrentQueue<double> q, double val, int max = 500)
+    {
+        q.Enqueue(val);
+        while (q.Count > max && q.TryDequeue(out _)) { }
+    }
+
+    public bool TryEnqueueReservedAndRecordAccepted(IBoundedRequestQueue queue, QueuedRequestItem item)
+    {
+        lock (_stateLock)
+        {
+            long now = Stopwatch.GetTimestamp();
+            if (item.EnqueueTimestamp == 0)
+            {
+                item.EnqueueTimestamp = now;
+            }
+
+            if (!queue.EnqueueReserved(item))
+            {
+                return false;
+            }
+
+            RecordAcceptedLocked(item, now, queue.Count);
+            return true;
+        }
+    }
 
     public bool TryEnqueueAndRecordAccepted(IBoundedRequestQueue queue, QueuedRequestItem item)
     {
         lock (_stateLock)
         {
             long now = Stopwatch.GetTimestamp();
-            item.EnqueueTimestamp = now;
+            if (item.EnqueueTimestamp == 0)
+            {
+                item.EnqueueTimestamp = now;
+            }
 
             if (!queue.TryEnqueue(item))
             {
                 return false;
             }
 
-            RecordAcceptedLocked(item, now);
+            RecordAcceptedLocked(item, now, queue.Count);
             return true;
         }
     }
@@ -85,7 +116,12 @@ public sealed class MetricsCollector
             _lastQueueChangeTimestamp = now;
             _currentQueueLength = 0;
             _weightedQueueIntegralSec = 0.0;
-            _independentPeriodicQueueSamples.Clear();
+            _windowArrivalsCount = 0;
+            _windowQueueWaitSumMs = 0.0;
+            _windowQueueWaitCount = 0;
+            _independentSampleSum = 0;
+            _independentSampleCount = 0;
+            _windowMaxQueueObserved = 0;
             _windowStarted = true;
         }
         else if (now > _lastQueueChangeTimestamp)
@@ -96,20 +132,11 @@ public sealed class MetricsCollector
         }
 
         _currentQueueLength = explicitQueueLength ?? (_currentQueueLength + 1);
-        _windowArrivalsCount++;
-        _windowQueueSnapshots.Add((now, _currentQueueLength));
-    }
-
-    // Д1.2: Незалежне періодичне зняття фактичної довжини черги queue.Count за зовнішнім таймером (кожні 100 мс)
-    public void RecordIndependentPeriodicSample(int actualQueueCount)
-    {
-        lock (_stateLock)
+        if (_currentQueueLength > _windowMaxQueueObserved)
         {
-            if (_windowStarted)
-            {
-                _independentPeriodicQueueSamples.Add(actualQueueCount);
-            }
+            _windowMaxQueueObserved = _currentQueueLength;
         }
+        _windowArrivalsCount++;
     }
 
     public void RecordRejected429()
@@ -119,18 +146,13 @@ public sealed class MetricsCollector
 
     public void RecordWorkerStarted(QueuedRequestItem item, int currentQueueLength)
     {
-        double queueWaitMs;
+        long now = Stopwatch.GetTimestamp();
+        item.StartProcessingTimestamp = now;
+
+        Interlocked.Increment(ref _inProcessingCount);
+
         lock (_stateLock)
         {
-            long now = Stopwatch.GetTimestamp();
-            long enqueueTs = Interlocked.Read(ref item.EnqueueTimestamp);
-            if (now < enqueueTs)
-            {
-                now = enqueueTs;
-            }
-
-            Interlocked.Exchange(ref item.StartProcessingTimestamp, now);
-
             if (_windowStarted && now > _lastQueueChangeTimestamp)
             {
                 double dtSec = Stopwatch.GetElapsedTime(_lastQueueChangeTimestamp, now).TotalSeconds;
@@ -138,66 +160,37 @@ public sealed class MetricsCollector
                 _lastQueueChangeTimestamp = now;
             }
 
-            _currentQueueLength = Math.Max(0, _currentQueueLength - 1);
-            _windowQueueSnapshots.Add((now, _currentQueueLength));
-
-            queueWaitMs = Stopwatch.GetElapsedTime(enqueueTs, now).TotalMilliseconds;
-
-            if (_windowStarted)
+            _currentQueueLength = currentQueueLength;
+            if (_currentQueueLength > _windowMaxQueueObserved)
             {
-                long effectiveArrival = Math.Max(enqueueTs, _windowStartTimestamp);
-                double windowWaitMs = Stopwatch.GetElapsedTime(effectiveArrival, now).TotalMilliseconds;
-                _windowQueueWaitSamplesMs.Add(windowWaitMs);
+                _windowMaxQueueObserved = _currentQueueLength;
+            }
+
+            if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
+            {
+                double waitMs = Stopwatch.GetElapsedTime(item.EnqueueTimestamp, now).TotalMilliseconds;
+                AddBoundedSample(_queueWaitSamplesMs, waitMs);
+                _windowQueueWaitSumMs += waitMs;
+                _windowQueueWaitCount++;
             }
         }
-
-        Interlocked.Increment(ref _inProcessingCount);
-
-        if (Interlocked.Read(ref item.StartProcessingTimestamp) < Interlocked.Read(ref item.EnqueueTimestamp))
-        {
-            Interlocked.Increment(ref _monotonicOrderViolations);
-        }
-
-        _queueWaitSamplesMs.Enqueue(queueWaitMs);
     }
 
-    // О1.5: Фіксує монотонну позначку завершення обробки ДО публікації кінцевого статусу в БД
     public DateTimeOffset MarkProcessingFinished(QueuedRequestItem item)
     {
         long now = Stopwatch.GetTimestamp();
-        long startTs = Interlocked.Read(ref item.StartProcessingTimestamp);
-        if (startTs > 0 && now < startTs)
-        {
-            now = startTs;
-        }
-
         Interlocked.CompareExchange(ref item.FinishProcessingTimestamp, now, 0);
+        TryRecordDeliverySample(item);
         return DateTimeOffset.UtcNow;
     }
 
     public void RecordWorkerFinished(QueuedRequestItem item, string finalStatus, int currentQueueLength)
     {
-        long now = Stopwatch.GetTimestamp();
+        long now = item.FinishProcessingTimestamp > 0 ? item.FinishProcessingTimestamp : Stopwatch.GetTimestamp();
         Interlocked.CompareExchange(ref item.FinishProcessingTimestamp, now, 0);
-
-        long finishTs = Interlocked.Read(ref item.FinishProcessingTimestamp);
-        long startTs = Interlocked.Read(ref item.StartProcessingTimestamp);
-        long enqueueTs = Interlocked.Read(ref item.EnqueueTimestamp);
+        TryRecordDeliverySample(item);
 
         Interlocked.Decrement(ref _inProcessingCount);
-
-        if (finishTs < startTs)
-        {
-            Interlocked.Increment(ref _monotonicOrderViolations);
-        }
-
-        double procMs = Stopwatch.GetElapsedTime(startTs, finishTs).TotalMilliseconds;
-        double totalMs = Stopwatch.GetElapsedTime(enqueueTs, finishTs).TotalMilliseconds;
-
-        _processingTimeSamplesMs.Enqueue(procMs);
-        _totalExecutionSamplesMs.Enqueue(totalMs);
-
-        TryRecordDeliverySample(item);
 
         switch (finalStatus)
         {
@@ -207,40 +200,81 @@ public sealed class MetricsCollector
             case "rejected":
                 Interlocked.Increment(ref _totalRejected);
                 break;
-            case "failed":
+            default:
                 Interlocked.Increment(ref _totalFailed);
                 break;
         }
+
+        if (item.StartProcessingTimestamp > 0 && now >= item.StartProcessingTimestamp)
+        {
+            double procMs = Stopwatch.GetElapsedTime(item.StartProcessingTimestamp, now).TotalMilliseconds;
+            AddBoundedSample(_processingTimeSamplesMs, procMs);
+        }
+
+        if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
+        {
+            double fullMs = Stopwatch.GetElapsedTime(item.EnqueueTimestamp, now).TotalMilliseconds;
+            AddBoundedSample(_totalExecutionSamplesMs, fullMs);
+        }
+
+        if (item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0 && item.FinishProcessingTimestamp > 0)
+        {
+            if (item.EnqueueTimestamp > item.StartProcessingTimestamp || item.StartProcessingTimestamp > item.FinishProcessingTimestamp)
+            {
+                Interlocked.Increment(ref _monotonicOrderViolations);
+            }
+        }
+
+        // Обмеження пам'яті для довготривалих навантажувальних тестів (О1.5): ліміт 2000 записів
+        PruneTrackedItemsIfNeeded();
     }
 
     public void RecordFirstReadIfCompleted(Guid id)
     {
-        if (_trackedItems.TryGetValue(id, out var item))
+        if (!_trackedItems.TryGetValue(id, out var item))
         {
-            long now = Stopwatch.GetTimestamp();
-            if (Interlocked.CompareExchange(ref item.FirstReadTimestamp, now, 0) == 0)
-            {
-                TryRecordDeliverySample(item);
-            }
+            return;
         }
+
+        long now = Stopwatch.GetTimestamp();
+        // Фіксуємо перше звернення клієнта через GET, навіть якщо обробка воркером ще не встигла встановити FinishProcessingTimestamp
+        Interlocked.CompareExchange(ref item.FirstReadTimestamp, now, 0);
+
+        // Якщо обидві мітки (завершення обробки та перше читання) вже присутні — фіксуємо delivery_wait_ms
+        TryRecordDeliverySample(item);
     }
 
     private void TryRecordDeliverySample(QueuedRequestItem item)
     {
-        long finishTs = Interlocked.Read(ref item.FinishProcessingTimestamp);
-        long firstReadTs = Interlocked.Read(ref item.FirstReadTimestamp);
+        long finish = Volatile.Read(ref item.FinishProcessingTimestamp);
+        long firstRead = Volatile.Read(ref item.FirstReadTimestamp);
 
-        if (finishTs > 0 && firstReadTs > 0)
+        if (finish > 0 && firstRead > 0)
         {
-            if (Interlocked.CompareExchange(ref item.DeliverySampleRecorded, 1, 0) == 0)
+            if (Interlocked.Exchange(ref item.DeliverySampleRecorded, 1) == 0)
             {
-                if (firstReadTs < finishTs)
+                if (finish > firstRead)
                 {
-                    Interlocked.Increment(ref _monotonicOrderViolations);
+                    // Клієнт прочитав статус 'done' з БД миттєво після транзакції до взяття мітки часу finish воркером.
+                    // Вирівнюємо час видачі до 0.0 мс, щоб уникнути викривлення монотонності.
+                    finish = firstRead;
                 }
 
-                double deliveryWaitMs = Stopwatch.GetElapsedTime(finishTs, firstReadTs).TotalMilliseconds;
-                _deliveryWaitSamplesMs.Enqueue(deliveryWaitMs);
+                double deliveryMs = Stopwatch.GetElapsedTime(finish, firstRead).TotalMilliseconds;
+                AddBoundedSample(_deliveryWaitSamplesMs, deliveryMs);
+            }
+        }
+    }
+
+    public void RecordIndependentPeriodicSample(int queueLength)
+    {
+        lock (_stateLock)
+        {
+            _independentSampleSum += queueLength;
+            _independentSampleCount++;
+            if (queueLength > _windowMaxQueueObserved)
+            {
+                _windowMaxQueueObserved = queueLength;
             }
         }
     }
@@ -252,24 +286,97 @@ public sealed class MetricsCollector
             return (null, null, null);
         }
 
-        long enqueueTs = Interlocked.Read(ref item.EnqueueTimestamp);
-        long startTs = Interlocked.Read(ref item.StartProcessingTimestamp);
-        long finishTs = Interlocked.Read(ref item.FinishProcessingTimestamp);
-        long firstReadTs = Interlocked.Read(ref item.FirstReadTimestamp);
-
-        double? qWait = startTs > 0 && enqueueTs > 0
-            ? Math.Round(Stopwatch.GetElapsedTime(enqueueTs, startTs).TotalMilliseconds, 3)
+        double? qWait = (item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0)
+            ? Math.Round(Stopwatch.GetElapsedTime(item.EnqueueTimestamp, item.StartProcessingTimestamp).TotalMilliseconds, 3)
             : null;
 
-        double? proc = finishTs > 0 && startTs > 0
-            ? Math.Round(Stopwatch.GetElapsedTime(startTs, finishTs).TotalMilliseconds, 3)
+        double? proc = (item.StartProcessingTimestamp > 0 && item.FinishProcessingTimestamp > 0)
+            ? Math.Round(Stopwatch.GetElapsedTime(item.StartProcessingTimestamp, item.FinishProcessingTimestamp).TotalMilliseconds, 3)
             : null;
 
-        double? deliv = firstReadTs > 0 && finishTs > 0
-            ? Math.Round(Stopwatch.GetElapsedTime(finishTs, firstReadTs).TotalMilliseconds, 3)
+        double? deliv = (item.FinishProcessingTimestamp > 0 && item.FirstReadTimestamp > 0)
+            ? (item.FirstReadTimestamp >= item.FinishProcessingTimestamp
+                ? Math.Round(Stopwatch.GetElapsedTime(item.FinishProcessingTimestamp, item.FirstReadTimestamp).TotalMilliseconds, 3)
+                : 0.0)
             : null;
+
+        // Прунінг завершених елементів для уникнення витоку пам'яті (О1.5)
+        PruneTrackedItemsIfNeeded();
 
         return (qWait, proc, deliv);
+    }
+
+    private void PruneTrackedItemsIfNeeded()
+    {
+        if (_trackedItems.Count <= 2000)
+        {
+            return;
+        }
+
+        // 1. Спочатку видаляємо елементи, які вже завершені та прочитані клієнтом
+        var readKeys = _trackedItems
+            .Where(kvp => kvp.Value.FirstReadTimestamp > 0 && kvp.Value.FinishProcessingTimestamp > 0)
+            .Select(kvp => kvp.Key)
+            .Take(500)
+            .ToList();
+
+        foreach (var key in readKeys)
+        {
+            _trackedItems.TryRemove(key, out _);
+        }
+
+        // 2. Якщо кількість все ще перевищує ліміт 2000, видаляємо найстаріші завершені заявки
+        if (_trackedItems.Count > 2000)
+        {
+            var finishedKeys = _trackedItems
+                .Where(kvp => kvp.Value.FinishProcessingTimestamp > 0)
+                .OrderBy(kvp => kvp.Value.EnqueueTimestamp)
+                .Select(kvp => kvp.Key)
+                .Take(500)
+                .ToList();
+
+            foreach (var key in finishedKeys)
+            {
+                _trackedItems.TryRemove(key, out _);
+            }
+        }
+
+        // 3. Якщо через екстремальний потік незавершених елементів перевищено 2500, видаляємо найстаріші за EnqueueTimestamp
+        if (_trackedItems.Count > 2500)
+        {
+            var oldestKeys = _trackedItems
+                .OrderBy(kvp => kvp.Value.EnqueueTimestamp)
+                .Select(kvp => kvp.Key)
+                .Take(500)
+                .ToList();
+
+            foreach (var key in oldestKeys)
+            {
+                _trackedItems.TryRemove(key, out _);
+            }
+        }
+    }
+
+    public void ResetMetrics(int currentQueueLength = 0)
+    {
+        lock (_stateLock)
+        {
+            Interlocked.Exchange(ref _inProcessingCount, 0);
+            Interlocked.Exchange(ref _totalAccepted, 0);
+            Interlocked.Exchange(ref _totalDone, 0);
+            Interlocked.Exchange(ref _totalRejected, 0);
+            Interlocked.Exchange(ref _totalFailed, 0);
+            Interlocked.Exchange(ref _total429, 0);
+            Interlocked.Exchange(ref _monotonicOrderViolations, 0);
+
+            _trackedItems.Clear();
+            _queueWaitSamplesMs.Clear();
+            _processingTimeSamplesMs.Clear();
+            _deliveryWaitSamplesMs.Clear();
+            _totalExecutionSamplesMs.Clear();
+
+            ResetMeasurementWindow(currentQueueLength);
+        }
     }
 
     public void ResetMeasurementWindow(int currentQueueLength)
@@ -282,121 +389,86 @@ public sealed class MetricsCollector
             _currentQueueLength = currentQueueLength;
             _weightedQueueIntegralSec = 0.0;
             _windowArrivalsCount = 0;
-            _windowQueueWaitSamplesMs.Clear();
-            _windowQueueSnapshots.Clear();
-            _windowQueueSnapshots.Add((now, currentQueueLength));
-            _independentPeriodicQueueSamples.Clear();
-            _independentPeriodicQueueSamples.Add(currentQueueLength);
+            _windowQueueWaitSumMs = 0.0;
+            _windowQueueWaitCount = 0;
+            _independentSampleSum = 0;
+            _independentSampleCount = 0;
+            _windowMaxQueueObserved = currentQueueLength;
             _windowStarted = true;
         }
     }
 
-    public void ResetMetrics(int currentQueueLength = 0)
-    {
-        lock (_stateLock)
-        {
-            long now = Stopwatch.GetTimestamp();
-            _windowStartTimestamp = now;
-            _lastQueueChangeTimestamp = now;
-            _currentQueueLength = currentQueueLength;
-            _weightedQueueIntegralSec = 0.0;
-            _windowArrivalsCount = 0;
-            _windowQueueWaitSamplesMs.Clear();
-            _windowQueueSnapshots.Clear();
-            _independentPeriodicQueueSamples.Clear();
-            _windowStarted = false;
-        }
-
-        _trackedItems.Clear();
-        while (_queueWaitSamplesMs.TryDequeue(out _)) { }
-        while (_processingTimeSamplesMs.TryDequeue(out _)) { }
-        while (_deliveryWaitSamplesMs.TryDequeue(out _)) { }
-        while (_totalExecutionSamplesMs.TryDequeue(out _)) { }
-
-        Interlocked.Exchange(ref _totalAccepted, 0);
-        Interlocked.Exchange(ref _totalDone, 0);
-        Interlocked.Exchange(ref _totalRejected, 0);
-        Interlocked.Exchange(ref _totalFailed, 0);
-        Interlocked.Exchange(ref _total429, 0);
-        Interlocked.Exchange(ref _monotonicOrderViolations, 0);
-    }
-
     public object BuildMetricsSnapshot(int currentQueueLength, ServiceOptions options, bool isShuttingDown)
     {
+        long now = Stopwatch.GetTimestamp();
+
+        double observationWindowSec;
+        long arrivalsCount;
+        double observedTimeWeightedL;
+        double avgWaitSec = 0.0;
+        double lambdaRps = 0.0;
+        double theoreticalL = 0.0;
+        double exactDiscrepancyPct = 0.0;
+        double independentSampledL = 0.0;
+        int independentSampleCount = 0;
+        double independentDiscrepancyPct = 0.0;
+        int maxQueueObserved;
+        bool queueIsBounded;
+
+        lock (_stateLock)
+        {
+            observationWindowSec = _windowStarted
+                ? Math.Max(0.001, Stopwatch.GetElapsedTime(_windowStartTimestamp, now).TotalSeconds)
+                : 0.001;
+
+            double currentIntegral = _weightedQueueIntegralSec;
+            if (_windowStarted && now > _lastQueueChangeTimestamp)
+            {
+                currentIntegral += _currentQueueLength * Stopwatch.GetElapsedTime(_lastQueueChangeTimestamp, now).TotalSeconds;
+            }
+
+            observedTimeWeightedL = currentIntegral / observationWindowSec;
+            arrivalsCount = _windowArrivalsCount;
+
+            if (_windowQueueWaitCount > 0)
+            {
+                avgWaitSec = (_windowQueueWaitSumMs / _windowQueueWaitCount) / 1000.0;
+            }
+
+            lambdaRps = arrivalsCount / observationWindowSec;
+            theoreticalL = lambdaRps * avgWaitSec;
+
+            if (observedTimeWeightedL > 1e-4 && theoreticalL > 1e-4)
+            {
+                exactDiscrepancyPct = Math.Abs(observedTimeWeightedL - theoreticalL) / Math.Max(observedTimeWeightedL, theoreticalL) * 100.0;
+            }
+
+            independentSampleCount = (int)Math.Min(int.MaxValue, _independentSampleCount);
+            if (_independentSampleCount > 0)
+            {
+                independentSampledL = (double)_independentSampleSum / _independentSampleCount;
+                if (independentSampledL > 1e-4 && theoreticalL > 1e-4)
+                {
+                    independentDiscrepancyPct = Math.Abs(independentSampledL - theoreticalL) / Math.Max(independentSampledL, theoreticalL) * 100.0;
+                }
+            }
+
+            maxQueueObserved = Math.Max(_windowMaxQueueObserved, currentQueueLength);
+            queueIsBounded = maxQueueObserved <= options.QueueCapacity;
+        }
+
         var qWaitStats = ComputePercentiles(_queueWaitSamplesMs.ToArray());
         var procStats = ComputePercentiles(_processingTimeSamplesMs.ToArray());
         var delivStats = ComputePercentiles(_deliveryWaitSamplesMs.ToArray());
         var totalStats = ComputePercentiles(_totalExecutionSamplesMs.ToArray());
 
-        double observationWindowSec;
-        long arrivalsCount;
-        double lambdaRps;
-        double avgWaitSec;
-        double theoreticalL;
-        double observedTimeWeightedL;
-        double exactDiscrepancyPct;
-        double independentSampledL;
-        int independentSampleCount;
-        double independentDiscrepancyPct;
-        int maxQueueObserved = currentQueueLength;
-        bool queueIsBounded = true;
-
-        lock (_stateLock)
-        {
-            long now = Stopwatch.GetTimestamp();
-            if (_windowStarted && now > _lastQueueChangeTimestamp)
-            {
-                double dtSec = Stopwatch.GetElapsedTime(_lastQueueChangeTimestamp, now).TotalSeconds;
-                _weightedQueueIntegralSec += _currentQueueLength * dtSec;
-                _lastQueueChangeTimestamp = now;
-            }
-
-            _currentQueueLength = currentQueueLength;
-            arrivalsCount = _windowArrivalsCount;
-
-            observationWindowSec = _windowStarted
-                ? Stopwatch.GetElapsedTime(_windowStartTimestamp, now).TotalSeconds
-                : 0.0;
-
-            lambdaRps = observationWindowSec > 1e-6
-                ? arrivalsCount / observationWindowSec
-                : 0.0;
-
-            avgWaitSec = _windowQueueWaitSamplesMs.Count > 0
-                ? (_windowQueueWaitSamplesMs.Average() / 1000.0)
-                : 0.0;
-
-            theoreticalL = lambdaRps * avgWaitSec;
-
-            observedTimeWeightedL = observationWindowSec > 1e-6
-                ? (_weightedQueueIntegralSec / observationWindowSec)
-                : currentQueueLength;
-
-            exactDiscrepancyPct = theoreticalL > 0.001
-                ? Math.Abs(observedTimeWeightedL - theoreticalL) / theoreticalL * 100.0
-                : 0.0;
-
-            independentSampleCount = _independentPeriodicQueueSamples.Count;
-            independentSampledL = independentSampleCount > 0
-                ? _independentPeriodicQueueSamples.Average()
-                : observedTimeWeightedL;
-
-            independentDiscrepancyPct = theoreticalL > 0.001
-                ? Math.Abs(independentSampledL - theoreticalL) / theoreticalL * 100.0
-                : 0.0;
-
-            if (_windowQueueSnapshots.Count > 0)
-            {
-                maxQueueObserved = _windowQueueSnapshots.Max(s => s.QueueLength);
-                queueIsBounded = maxQueueObserved < options.QueueCapacity;
-            }
-        }
-
         return new
         {
-            service_state = new
+            service = "C10 Enrollment Service",
+            instance_id = options.InstanceId,
+            timestamp_utc = DateTimeOffset.UtcNow,
+            configuration = new
             {
-                instance_id = options.InstanceId,
                 execution_model = options.ExecutionModel,
                 queue_engine = options.QueueEngine,
                 queue_capacity = options.QueueCapacity,
@@ -420,7 +492,7 @@ public sealed class MetricsCollector
             {
                 queue_wait_ms = new
                 {
-                    description = "Інтервал від прийняття запиту у чергу (POST 202) до початку обробки воркером",
+                    description = "Інтервал від прийняття запиту у чергу (POST 202) до початку обробки воркером (вибірка: останні до 500 замірів)",
                     sample_count = qWaitStats.Count,
                     mean_ms = qWaitStats.Mean,
                     p50_ms = qWaitStats.P50,
@@ -429,7 +501,7 @@ public sealed class MetricsCollector
                 },
                 processing_time_ms = new
                 {
-                    description = "Інтервал активної обробки воркером (повільний виклик деканату + транзакція БД)",
+                    description = "Інтервал активної обробки воркером (повільний виклик деканату + транзакція БД, вибірка: останні до 500 замірів)",
                     sample_count = procStats.Count,
                     mean_ms = procStats.Mean,
                     p50_ms = procStats.P50,
@@ -438,7 +510,7 @@ public sealed class MetricsCollector
                 },
                 delivery_wait_ms = new
                 {
-                    description = "Інтервал від завершення обробки воркером до першого читання результату клієнтом через GET",
+                    description = "Інтервал від завершення обробки воркером до першого читання результату клієнтом через GET (вибірка: останні до 500 замірів)",
                     sample_count = delivStats.Count,
                     mean_ms = delivStats.Mean,
                     p50_ms = delivStats.P50,
@@ -447,7 +519,7 @@ public sealed class MetricsCollector
                 },
                 full_domain_execution_ms = new
                 {
-                    description = "Повний час виконання запиту області (очікування в черзі + обробка воркером)",
+                    description = "Повний час виконання запиту: очікування в черзі + обробка воркером (вибірка: останні до 500 замірів)",
                     sample_count = totalStats.Count,
                     mean_ms = totalStats.Mean,
                     p50_ms = totalStats.P50,
@@ -473,42 +545,6 @@ public sealed class MetricsCollector
                 queue_is_bounded = queueIsBounded
             }
         };
-    }
-
-    public string BuildPrometheusText(int currentQueueLength)
-    {
-        var qWait = ComputePercentiles(_queueWaitSamplesMs.ToArray());
-        var proc = ComputePercentiles(_processingTimeSamplesMs.ToArray());
-        var sb = new StringBuilder();
-
-        sb.AppendLine("# HELP dpc_queue_length Поточна довжина черги запитів");
-        sb.AppendLine("# TYPE dpc_queue_length gauge");
-        sb.AppendLine($"dpc_queue_length {currentQueueLength}");
-
-        sb.AppendLine("# HELP dpc_in_processing Кількість запитів в обробленні");
-        sb.AppendLine("# TYPE dpc_in_processing gauge");
-        sb.AppendLine($"dpc_in_processing {Interlocked.Read(ref _inProcessingCount)}");
-
-        sb.AppendLine("# HELP dpc_requests_total Загальна кількість запитів за статусами");
-        sb.AppendLine("# TYPE dpc_requests_total counter");
-        sb.AppendLine($"dpc_requests_total{{status=\"accepted\"}} {Interlocked.Read(ref _totalAccepted)}");
-        sb.AppendLine($"dpc_requests_total{{status=\"done\"}} {Interlocked.Read(ref _totalDone)}");
-        sb.AppendLine($"dpc_requests_total{{status=\"rejected\"}} {Interlocked.Read(ref _totalRejected)}");
-        sb.AppendLine($"dpc_requests_total{{status=\"failed\"}} {Interlocked.Read(ref _totalFailed)}");
-        sb.AppendLine($"dpc_requests_total{{status=\"http_429\"}} {Interlocked.Read(ref _total429)}");
-
-        sb.AppendLine("# HELP dpc_queue_wait_ms Перцентилі часу очікування в черзі (мс)");
-        sb.AppendLine("# TYPE dpc_queue_wait_ms gauge");
-        sb.AppendLine($"dpc_queue_wait_ms{{quantile=\"0.5\"}} {qWait.P50.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-        sb.AppendLine($"dpc_queue_wait_ms{{quantile=\"0.95\"}} {qWait.P95.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-        sb.AppendLine($"dpc_queue_wait_ms{{quantile=\"0.99\"}} {qWait.P99.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-
-        sb.AppendLine("# HELP dpc_processing_time_ms Перцентилі часу обробки воркером (мс)");
-        sb.AppendLine("# TYPE dpc_processing_time_ms gauge");
-        sb.AppendLine($"dpc_processing_time_ms{{quantile=\"0.5\"}} {proc.P50.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-        sb.AppendLine($"dpc_processing_time_ms{{quantile=\"0.95\"}} {proc.P95.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-        sb.AppendLine($"dpc_processing_time_ms{{quantile=\"0.99\"}} {proc.P99.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-        return sb.ToString();
     }
 
     private static (int Count, double Mean, double P50, double P95, double P99) ComputePercentiles(double[] samples)

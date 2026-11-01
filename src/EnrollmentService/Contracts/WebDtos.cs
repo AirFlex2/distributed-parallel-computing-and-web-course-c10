@@ -12,26 +12,8 @@ public sealed class CreateWebEnrollmentDto
     [JsonPropertyName("group_id")]
     public string? GroupId { get; set; }
 
-    [JsonPropertyName("groupId")]
-    public string? GroupIdCamel
-    {
-        get => GroupId;
-        set { if (GroupId == null) GroupId = value; }
-    }
-
     [JsonPropertyName("student_id")]
     public string? StudentId { get; set; }
-
-    [JsonPropertyName("studentId")]
-    public string? StudentIdCamel
-    {
-        get => StudentId;
-        set { if (StudentId == null) StudentId = value; }
-    }
-
-    // Допоміжне поле для детермінованого тестування межі вікна запису [opens_at, closes_at) (Д1.1, Д1.5)
-    [JsonPropertyName("evaluated_at")]
-    public string? EvaluatedAt { get; set; }
 }
 
 public sealed record WebEnrollmentResponseDto(
@@ -60,8 +42,7 @@ public sealed record WebEnrollmentListResponseDto(
     [property: JsonPropertyName("active_count")] int ActiveCount,
     [property: JsonPropertyName("max_disciplines")] int MaxDisciplines,
     [property: JsonPropertyName("active_ects")] decimal ActiveEcts,
-    [property: JsonPropertyName("max_ects")] decimal MaxEcts,
-    [property: JsonPropertyName("extra_server_field")] string ExtraServerField = "forward_compatible_o1_7"
+    [property: JsonPropertyName("max_ects")] decimal MaxEcts
 );
 
 public sealed record WebDisciplineGroupDto(

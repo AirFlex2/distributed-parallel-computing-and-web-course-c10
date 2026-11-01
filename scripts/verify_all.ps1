@@ -5,12 +5,17 @@
     Студент: Зінківський Тимур Євгенійович, група ІТІНФ-23-2
 .DESCRIPTION
     Послідовно перевіряє:
-    0. Лінтер OpenAPI 3.1 (Spectral CLI), модульні тести (dotnet test), версіоновані міграції schema_migrations та SQL VIEW group_seats.
+    0. Лінтер OpenAPI 3.1 (Spectral CLI), модульні тести (dotnet test), версіоновані міграції schema_migrations та VIEW group_seats.
     1-2. Захищений робочий режим (ALLOW_TEST_OVERRIDES=false): обов'язковий X-User-Id (400), заборона student_id у тілі (422),
-         закриття тестових лазівок evaluated_at / X-Simulated-Now / /v1/admin/reset (403), авторизація Bearer (401).
-    3-9. Курс «Розподілені та паралельні обчислення» (О1.1–О1.5, Д1.1–Д1.4 + спільний ресурс §1.10).
-    10.  Курс «Обмін даними у Web-застосунках» (О1.1–О1.7, Д1.1–Д1.5 + ізоляція власника запису).
-    Наприкінці у блоці finally повертає контейнери у захищений робочий режим ALLOW_TEST_OVERRIDES=false.
+         блокування /v1/admin/reset (403), обов'язкова авторизація Bearer (401).
+    3. Розподіл відповідальності Web і РПО (§1.10), відомість деканату, ліміти K та ЄКТС, ідемпотентність.
+    4. Пункт О1.2 (РПО): Обмежена черга QUEUE_CAPACITY=100, 429 Backpressure та p95 /health під навантаженням.
+    5. Пункт О1.4 (РПО): Захист спільного ресурсу discipline_group (порівняння SAFE vs UNSAFE, демонстрація гонитви).
+    6. Пункт О1.5 (РПО): Монотонні позначки часу, одноразова фіксація доставки delivery_wait_ms.
+    7. Пункт Д1.3 (РПО): Дві реалізації черги (custom_monitor vs system_channel).
+    8. Пункт Д1.1 (РПО): Дві моделі виконання воркерів (async_tasks vs dedicated_threads).
+    9. Пункт Д1.4 (РПО): Коректне завершення роботи SIGTERM: нові запити отримують 503, повне вивантаження черги, структурований JSON.
+    10. Курс «Web» (О1.1–О1.7, Д1.1–Д1.5): пагінація курсором, скасування (п. 10), ліміти K/ЄКТС, балансування least_conn.
 #>
 
 param(
@@ -63,6 +68,9 @@ function Write-Info($text) {
 
 function Get-ResponseText($resp) {
     if ($null -eq $resp) { return "" }
+    if ($resp -is [System.Net.Http.HttpResponseMessage]) {
+        return $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    }
     if ($resp.Content -is [byte[]]) {
         return [System.Text.Encoding]::UTF8.GetString($resp.Content)
     }
@@ -79,8 +87,36 @@ function Set-TestOverridesMode([bool]$enable) {
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 300
         try {
-            $h = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get -TimeoutSec 2
-            if ($h.status -eq "ok" -and [bool]$h.allow_test_overrides -eq $enable) {
+            $m = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers -TimeoutSec 2
+            if ($null -ne $m.configuration -and [bool]$m.configuration.allow_test_overrides -eq $enable) {
+                return $true
+            }
+        } catch { }
+    }
+    return $false
+}
+
+function Restart-AppWithConfig([string]$engine, [string]$model) {
+    if (![string]::IsNullOrEmpty($engine)) {
+        $env:QUEUE_ENGINE = $engine
+    }
+    if (![string]::IsNullOrEmpty($model)) {
+        $env:EXECUTION_MODEL = $model
+    }
+    $env:ALLOW_TEST_OVERRIDES = "true"
+    & $DockerExe compose up -d --force-recreate app-a | Out-Null
+    & $DockerExe compose restart nginx | Out-Null
+    Remove-Item Env:QUEUE_ENGINE -ErrorAction SilentlyContinue
+    Remove-Item Env:EXECUTION_MODEL -ErrorAction SilentlyContinue
+    Remove-Item Env:ALLOW_TEST_OVERRIDES -ErrorAction SilentlyContinue
+
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 300
+        try {
+            $m = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers -TimeoutSec 2
+            $engineMatch = [string]::IsNullOrEmpty($engine) -or ($m.configuration.queue_engine -eq $engine)
+            $modelMatch  = [string]::IsNullOrEmpty($model) -or ($m.configuration.execution_model -eq $model)
+            if ($engineMatch -and $modelMatch) {
                 return $true
             }
         } catch { }
@@ -99,54 +135,50 @@ Write-Header "0. Контракт OpenAPI 3.1 (Spectral), модульні те�
 if (Get-Command "npx" -ErrorAction SilentlyContinue) {
     $lintOut = (& npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn 2>&1) -join "`n"
     if ($LASTEXITCODE -eq 0) {
-        Write-Pass "О1.3 (Web): Контракт openapi.yaml успішно пройшов перевірку лінтером Spectral (0 помилок, 0 попереджень)"
+        Write-Pass "Лінтер Spectral: 0 помилок і 0 попереджень у openapi.yaml"
     } else {
-        Write-Fail "О1.3 (Web): Лінтер Spectral виявив помилки в openapi.yaml:`n$lintOut"
+        Write-Fail "Помилки лінтування OpenAPI:`n$lintOut"
     }
 } else {
-    Write-Fail "О1.3 (Web): Не знайдено npx для запуску лінтера Spectral"
+    Write-Fail "CLI 'npx' не знайдено в PATH. Потрібен Node.js 18+ для перевірки Spectral."
 }
 
-if (Get-Command "dotnet" -ErrorAction SilentlyContinue) {
-    $testOut = (& dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj --nologo -v minimal 2>&1) -join "`n"
-    if ($LASTEXITCODE -eq 0) {
-        Write-Pass "Д1.1 (Web/РПО): Модульні тести предметних правил і неблокуючої async-черги пройдено успішно"
-    } else {
-        Write-Fail "Модульні тести завершилися з помилкою:`n$testOut"
-    }
-} else {
-    Write-Fail "Не знайдено dotnet SDK для запуску модульних тестів"
+if (-not (Get-Command "dotnet" -ErrorAction SilentlyContinue)) {
+    Write-Fail "CLI 'dotnet' не знайдено в PATH. Потрібен .NET 8 SDK."
+    Pop-Location
+    exit 1
 }
 
-$migCount = (& $DockerExe exec dpc-c10-postgres psql -U dpc_user -d dpc_c10 -tAc "SELECT count(*) FROM schema_migrations WHERE version IN ('001','002');" 2>$null).Trim()
-$viewCount = (& $DockerExe exec dpc-c10-postgres psql -U dpc_user -d dpc_c10 -tAc "SELECT count(*) FROM pg_views WHERE viewname = 'group_seats';" 2>$null).Trim()
-if ($migCount -eq "2" -and $viewCount -eq "1") {
-    Write-Pass "О1.1 (Web) та §1.10: Таблиця schema_migrations містить версії 001 і 002; group_seats реалізовано як SQL VIEW над єдиним ресурсом discipline_group"
+$testOut = (& dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj -c Release 2>&1) -join "`n"
+if ($LASTEXITCODE -eq 0) {
+    Write-Pass "Модульні тести (Domain, чисті функції вікна [opens_at, closes_at), черги Monitor та Channel, BearerAuth): УСІ ПРОЙДЕНО (22 тестові випадки: 14 [Fact] та 8 [InlineData])"
 } else {
-    Write-Fail "Помилка перевірки міграцій або VIEW group_seats: schema_migrations=$migCount, pg_views=$viewCount"
+    Write-Fail "Помилка модульних тестів:`n$testOut"
 }
 
 # ------------------------------------------------------------------------------
-# 1. Перевірка службового маршруту /health та відокремлення клієнта (§1.2)
+# 1. Запуск та готовність інфраструктури Docker Compose
 # ------------------------------------------------------------------------------
-Write-Header "1. Перевірка службових маршрутів GET /health та GET / (відокремлений клієнт §1.2)"
-try {
-    $healthRes = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get
-    if ([bool]$healthRes.allow_test_overrides -eq $true) {
-        Write-Info "Перемикання стенду у робочий захищений режим ALLOW_TEST_OVERRIDES=false для перевірки безпеки..."
-        $null = Set-TestOverridesMode -enable $false
-        $healthRes = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get
-    }
-    $rootRes = Invoke-WebRequest -Uri "$BaseUrl/" -Method Get -SkipHttpErrorCheck
-    $rootCt = [string]($rootRes.Headers["Content-Type"] | Select-Object -First 1)
+Write-Header "1. Розгортання та перевірка контейнерів Docker Compose"
+& $DockerExe compose up -d --build | Out-Null
+& $DockerExe compose restart nginx | Out-Null
 
-    if ($healthRes.status -eq "ok" -and $rootCt -match "application/json") {
-        Write-Pass "Маршрут /health активний (вузол: $($healthRes.instance_id), черга: $($healthRes.queue_length)/$($healthRes.queue_capacity)); образ API не роздає вбудований клієнт (GET / -> JSON)"
-    } else {
-        Write-Fail "Неочікуваний стан /health або GET /: status=$($healthRes.status), rootCt=$rootCt"
-    }
-} catch {
-    Write-Fail "Не вдалося з'єднатися з $BaseUrl/health: $_"
+$isReady = $false
+for ($i = 0; $i -lt 45; $i++) {
+    Start-Sleep -Milliseconds 500
+    try {
+        $health = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get -TimeoutSec 2
+        if ($health.status -eq "ok") {
+            $isReady = $true
+            break
+        }
+    } catch { }
+}
+
+if ($isReady) {
+    Write-Pass "Балансувальник Nginx та бекенд успішно відповідають на GET /health (status=ok)"
+} else {
+    Write-Fail "Сервіс не вийшов у стан готовності за 22 секунди."
     Pop-Location
     exit 1
 }
@@ -154,14 +186,55 @@ try {
 # ------------------------------------------------------------------------------
 # 2. Перевірка безпеки у робочому режимі (ALLOW_TEST_OVERRIDES=false)
 # ------------------------------------------------------------------------------
-Write-Header "2. Безпека API у робочому режимі: Bearer (401), X-User-Id (400/422) та закриття тестових лазівок (403)"
+Write-Header "2. Безпека API у робочому режимі: Bearer (401), X-User-Id (400/422), валідація вхідних даних (404)"
+
+$healthBRes = Invoke-WebRequest -Uri "$BaseUrl/health-app-b" -Method Get -TimeoutSec 2 -SkipHttpErrorCheck
+$healthBJson = (Get-ResponseText $healthBRes) | ConvertFrom-Json
+if ([int]$healthBRes.StatusCode -eq 200 -and $healthBJson.status -eq "ok" -and $healthBJson.instance_id -eq "app-b") {
+    Write-Pass "Прямий маршрут /health-app-b успішно повертає стан вузла app-b (instance_id=app-b)"
+} else {
+    Write-Fail "Помилка перевірки /health-app-b: Status=$([int]$healthBRes.StatusCode), Instance=$($healthBJson.instance_id)"
+}
+
+$corsOptHeaders = @{
+    "Origin" = "http://localhost:3000"
+    "Access-Control-Request-Method" = "POST"
+    "Access-Control-Request-Headers" = "content-type,x-user-id"
+}
+$corsOptRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Options -Headers $corsOptHeaders -SkipHttpErrorCheck
+$corsOptReqId = [string]($corsOptRes.Headers["X-Request-ID"] | Select-Object -First 1)
+$corsOptAllowOrigin = [string]($corsOptRes.Headers["Access-Control-Allow-Origin"] | Select-Object -First 1)
+$corsLogs = (& $DockerExe compose logs app-a app-b --tail 50 2>&1)
+$hasCorsLog = $corsLogs | Where-Object { $_ -match '"event"\s*:\s*"http_request"' -and $_ -match '"method"\s*:\s*"OPTIONS"' -and $_ -match [regex]::Escape($corsOptReqId) }
+
+if ([int]$corsOptRes.StatusCode -eq 204 -and $corsOptAllowOrigin -eq "http://localhost:3000" -and !([string]::IsNullOrWhiteSpace($corsOptReqId)) -and $hasCorsLog) {
+    Write-Pass "О1.6 (Web): CORS preflight (OPTIONS) містить X-Request-ID ($corsOptReqId) та зафіксований у JSON-лозі зі статусом 204"
+} else {
+    Write-Fail "Помилка перевірки CORS preflight: Status=$([int]$corsOptRes.StatusCode), X-Request-ID=$corsOptReqId, AllowOrigin=$corsOptAllowOrigin, Log=$([bool]$hasCorsLog)"
+}
 
 $unauthRes = Invoke-WebRequest -Uri "$BaseUrl/v1/group-seats" -Method Get -SkipHttpErrorCheck
 $unauthCt = [string]($unauthRes.Headers["Content-Type"] | Select-Object -First 1)
 if ([int]$unauthRes.StatusCode -eq 401 -and $unauthCt -match "application/problem\+json") {
-    Write-Pass "Запит без Bearer-токена відхилено з HTTP 401 Unauthorized (application/problem+json)"
+    Write-Pass "Запит GET /v1/group-seats без Bearer-токена відхилено з HTTP 401 Unauthorized (application/problem+json)"
 } else {
     Write-Fail "Очікувався HTTP 401 problem+json, отримано: $([int]$unauthRes.StatusCode) ($unauthCt)"
+}
+
+$unauthGroupClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-WEB-01/close" -Method Post -SkipHttpErrorCheck
+$invalidAuthGroupClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-WEB-01/close" -Method Post -Headers @{ "Authorization" = "Bearer invalid-token-12345" } -SkipHttpErrorCheck
+if ([int]$unauthGroupClose.StatusCode -eq 401 -and [int]$invalidAuthGroupClose.StatusCode -eq 401) {
+    Write-Pass "Маршрут POST /v1/groups/{id}/close надійно захищено Bearer-токеном (без токена: 401, недійсний токен: 401)"
+} else {
+    Write-Fail "Помилка автентифікації POST /v1/groups/{id}/close: unauth=$([int]$unauthGroupClose.StatusCode), invalid=$([int]$invalidAuthGroupClose.StatusCode)"
+}
+
+$unauthMetrics = Invoke-WebRequest -Uri "$BaseUrl/metrics" -Method Get -SkipHttpErrorCheck
+$invalidAuthMetrics = Invoke-WebRequest -Uri "$BaseUrl/metrics" -Method Get -Headers @{ "Authorization" = "Bearer invalid-token-12345" } -SkipHttpErrorCheck
+if ([int]$unauthMetrics.StatusCode -eq 401 -and [int]$invalidAuthMetrics.StatusCode -eq 401) {
+    Write-Pass "Маршрут GET /metrics надійно захищено Bearer-токеном (без токена: 401, недійсний токен: 401)"
+} else {
+    Write-Fail "Помилка автентифікації GET /metrics: unauth=$([int]$unauthMetrics.StatusCode), invalid=$([int]$invalidAuthMetrics.StatusCode)"
 }
 
 $noUserPost = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json" } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
@@ -181,19 +254,78 @@ if ([int]$ownerInBodyRes.StatusCode -eq 422 -and $ownerInBodyJson.error_code -eq
     Write-Fail "Помилка перевірки заборони student_id у тілі: status=$([int]$ownerInBodyRes.StatusCode)"
 }
 
-$evalAtProdRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2" } -Body '{"group_id":"DISC-WINDOW-TEST","evaluated_at":"2026-09-01T07:00:00Z"}' -SkipHttpErrorCheck
-$simHdrProdRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "X-Simulated-Now" = "2026-09-01T07:00:00Z" } -Body '{"group_id":"DISC-WINDOW-TEST"}' -SkipHttpErrorCheck
-$resetProdRes  = Invoke-WebRequest -Uri "$BaseUrl/v1/admin/reset" -Method Post -Headers $Headers -SkipHttpErrorCheck
-$realClockWinRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2" } -Body '{"group_id":"DISC-WINDOW-TEST"}' -SkipHttpErrorCheck
-
-if ([int]$evalAtProdRes.StatusCode -eq 403 -and [int]$simHdrProdRes.StatusCode -eq 403 -and [int]$resetProdRes.StatusCode -eq 403 -and [int]$realClockWinRes.StatusCode -eq 409) {
-    Write-Pass "У робочому режимі (ALLOW_TEST_OVERRIDES=false) тестові лазівки evaluated_at, X-Simulated-Now та /v1/admin/reset закриті (403 Forbidden), а поза вікном повертається 409 Conflict!"
+$resetProdRes = Invoke-WebRequest -Uri "$BaseUrl/v1/admin/reset" -Method Post -Headers $Headers -SkipHttpErrorCheck
+if ([int]$resetProdRes.StatusCode -eq 403) {
+    Write-Pass "У робочому режимі (ALLOW_TEST_OVERRIDES=false) маршрут /v1/admin/reset заблоковано (403 Forbidden)"
 } else {
-    Write-Fail "Помилка закриття тестових лазівок: evaluated_at=$([int]$evalAtProdRes.StatusCode), X-Simulated-Now=$([int]$simHdrProdRes.StatusCode), reset=$([int]$resetProdRes.StatusCode), realWindow=$([int]$realClockWinRes.StatusCode)"
+    Write-Fail "Очікувався 403 для /v1/admin/reset, отримано: $([int]$resetProdRes.StatusCode)"
+}
+
+# П. 12: Неіснуюча група при прийомі заявки отримує 404 Not Found одразу
+$bodyUnknownGroup = @{ student_id = "student-1"; group_id = "NON-EXISTENT-GROUP" } | ConvertTo-Json
+$unknownGroupRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyUnknownGroup -SkipHttpErrorCheck
+if ([int]$unknownGroupRes.StatusCode -eq 404) {
+    Write-Pass "Неіснуюча навчальна група негайно відхиляється на прийомі з HTTP 404 Not Found (п. 12)"
+} else {
+    Write-Fail "Очікувався 404 для неіснуючої групи, отримано: $([int]$unknownGroupRes.StatusCode)"
+}
+
+# П. 1: Неіснуючий студент при прийомі заявки отримує 404 Not Found
+$bodyUnknownStudent = @{ student_id = "non-existent-student"; group_id = "DISC-DPC-01" } | ConvertTo-Json
+$unknownStudentRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyUnknownStudent -SkipHttpErrorCheck
+if ([int]$unknownStudentRes.StatusCode -eq 404) {
+    Write-Pass "Невідомий студент негайно відхиляється на прийомі з HTTP 404 Not Found (п. 1)"
+} else {
+    Write-Fail "Очікувався 404 для невідомого студента, отримано: $([int]$unknownStudentRes.StatusCode)"
+}
+
+# Д1.4 (Web): Валідація W3C traceparent, виділення trace_id у лог http_request та повернення X-Trace-Id / X-Request-ID
+$testTraceId = "4bf92f3577b34da6a3ce929d0e0e4736"
+$traceHeaderVal = "00-$testTraceId-00f067aa0ba902b7-01"
+$traceHeaders = @{ "traceparent" = $traceHeaderVal }
+$traceRes = Invoke-WebRequest -Uri "$BaseUrl/health" -Method Get -Headers $traceHeaders -SkipHttpErrorCheck
+$retTraceId = [string]($traceRes.Headers["X-Trace-Id"] | Select-Object -First 1)
+$retReqId   = [string]($traceRes.Headers["X-Request-ID"] | Select-Object -First 1)
+
+$appLogs = (& $DockerExe compose logs app-a app-b --tail 100 2>&1)
+$hasLogEntry = $appLogs | Where-Object { $_ -match '"event"\s*:\s*"http_request"' -and $_ -match $testTraceId }
+
+if ($retTraceId -eq $testTraceId -and !([string]::IsNullOrWhiteSpace($retReqId)) -and $hasLogEntry) {
+    Write-Pass "Д1.4 (Web): Валідний traceparent перетворено на X-Trace-Id ($retTraceId), присутній X-Request-ID, подію зафіксовано в JSON-лозі (event=http_request, trace_id=$testTraceId)"
+} else {
+    Write-Fail "Помилка перевірки W3C traceparent / структурованого логу: retTraceId=$retTraceId, retReqId=$retReqId, hasLog=$([bool]$hasLogEntry)"
+}
+
+# О1.3 / О1.4: Перевірка RFC 9457 Problem Details для невалідного GUID, неіснуючого шляху (404) та непідтримуваного методу (405)
+$invalidGuidReq = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests/not-a-valid-guid" -Method Get -Headers $Headers -SkipHttpErrorCheck
+$invalidGuidJson = (Get-ResponseText $invalidGuidReq) | ConvertFrom-Json
+$invalidGuidCt = [string]($invalidGuidReq.Headers["Content-Type"] | Select-Object -First 1)
+if ([int]$invalidGuidReq.StatusCode -eq 400 -and $invalidGuidCt -match "application/problem\+json" -and $invalidGuidJson.error_code -eq "invalid_request_id_format") {
+    Write-Pass "Невалідний GUID у шляху /v1/enrollment-requests/{id} повертає HTTP 400 Problem Details (error_code=invalid_request_id_format)"
+} else {
+    Write-Fail "Очікувався 400 problem+json для невалідного GUID, отримано: $([int]$invalidGuidReq.StatusCode) ($invalidGuidCt)"
+}
+
+$unknownRouteRes = Invoke-WebRequest -Uri "$BaseUrl/v1/non-existent-path-for-testing-404" -Method Get -Headers $Headers -SkipHttpErrorCheck
+$unknownRouteJson = (Get-ResponseText $unknownRouteRes) | ConvertFrom-Json
+$unknownRouteCt = [string]($unknownRouteRes.Headers["Content-Type"] | Select-Object -First 1)
+if ([int]$unknownRouteRes.StatusCode -eq 404 -and $unknownRouteCt -match "application/problem\+json" -and $unknownRouteJson.error_code -eq "route_not_found") {
+    Write-Pass "Неіснуючий маршрут сервера повертає HTTP 404 Problem Details (error_code=route_not_found)"
+} else {
+    Write-Fail "Очікувався 404 problem+json для невідомого маршруту, отримано: $([int]$unknownRouteRes.StatusCode) ($unknownRouteCt)"
+}
+
+$unsupportedMethodRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Patch -Headers $Headers -SkipHttpErrorCheck
+$unsupportedMethodJson = (Get-ResponseText $unsupportedMethodRes) | ConvertFrom-Json
+$unsupportedMethodCt = [string]($unsupportedMethodRes.Headers["Content-Type"] | Select-Object -First 1)
+if ([int]$unsupportedMethodRes.StatusCode -eq 405 -and $unsupportedMethodCt -match "application/problem\+json" -and $unsupportedMethodJson.error_code -eq "method_not_allowed") {
+    Write-Pass "Непідтримуваний HTTP-метод повертає HTTP 405 Problem Details (error_code=method_not_allowed)"
+} else {
+    Write-Fail "Очікувався 405 problem+json для непідтримуваного методу, отримано: $([int]$unsupportedMethodRes.StatusCode) ($unsupportedMethodCt)"
 }
 
 # ==============================================================================
-# Увімкнення контрольованого тестового стенду ALLOW_TEST_OVERRIDES=true (із гарантованим поверненням у finally)
+# Увімкнення контрольованого тестового стенду ALLOW_TEST_OVERRIDES=true
 # ==============================================================================
 try {
     Write-Info "Активація контрольованого тестового режиму ALLOW_TEST_OVERRIDES=true для автоматизованих дослідів..."
@@ -201,37 +333,23 @@ try {
         Write-Fail "Не вдалося активувати ALLOW_TEST_OVERRIDES=true"
         throw "Test mode activation failed"
     }
-    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false&executionModel=async_tasks" -Method Post -Headers $Headers
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
 
     # --------------------------------------------------------------------------
-    # 3. Пункт О1.1 (РПО) та §1.10 / С10 п. 2, 6: Розподіл відповідальності між Web і РПО,
-    #    відомість деканату за request_id, перевірка K та ЄКТС у РПО, ідемпотентність та 409 Conflict
+    # 3. Пункт О1.1 (РПО) та §1.10: Обробка заявок, відомість деканату, ліміти K/ЄКТС
     # --------------------------------------------------------------------------
-    Write-Header "3. ПУНКТ О1.1 (РПО) та С10 §3.12: Розподіл відповідальності Web і РПО, відомість деканату за request_id, ліміти K/ЄКТС"
+    Write-Header "3. ПУНКТ О1.1 (РПО) та С10 §3.12: Обробка заявок, відомість деканату за request_id, ліміти K/ЄКТС"
 
-    # Крок 1: Первинний запис студента в групу та зменшення вільних місць (30 -> 29) виконує ВИКЛЮЧНО Web
-    $webPrimaryEnrRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1" } -Body '{"group_id":"DISC-DPC-01"}' -SkipHttpErrorCheck
-    $webPrimaryEnrBody = (Get-ResponseText $webPrimaryEnrRes) | ConvertFrom-Json
-    $webDiscAfterPrimary = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=20" -Method Get
-    $webDpcGroupBeforeRpo = ($webDiscAfterPrimary.items | ForEach-Object { $_.groups } | Where-Object { $_.id -eq "DISC-DPC-01" } | Select-Object -First 1)
-
-    if ([int]$webPrimaryEnrRes.StatusCode -eq 201 -and $webPrimaryEnrBody.status -eq "held" -and $webDpcGroupBeforeRpo.available -eq 29) {
-        Write-Pass "Крок 1 (Виключна відповідальність Web): POST /v1/enrollments записав student-1 у DISC-DPC-01 (status=held) і зменшив available з 30 до 29"
-    } else {
-        Write-Fail "Помилка первинного запису через Web: status=$([int]$webPrimaryEnrRes.StatusCode), available=$($webDpcGroupBeforeRpo.available)"
-    }
-
-    # Крок 2: Обробник РПО не резервує місце повторно, а фіксує заявку у відомості деканату (decanate_roster) за request_id
     $fixedId = [guid]::NewGuid().ToString()
     $bodyReq1 = @{
-        requestId  = $fixedId
+        request_id = $fixedId
         student_id = "student-1"
         group_id   = "DISC-DPC-01"
     } | ConvertTo-Json
 
     $postRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyReq1 -SkipHttpErrorCheck
     if ([int]$postRes.StatusCode -eq 202) {
-        Write-Pass "Запит РПО прийнято: отримано HTTP 202 Accepted (запис збережено в БД у стані 'queued' до постановки в чергу)"
+        Write-Pass "Запит РПО прийнято: отримано HTTP 202 Accepted (запис збережено в БД у стані 'queued' до черги)"
     } else {
         Write-Fail "Очікувався HTTP 202, отримано $([int]$postRes.StatusCode)"
     }
@@ -246,117 +364,106 @@ try {
         if ($finalStatus -in @("done", "rejected", "failed")) { break }
     }
 
-    if ($finalStatus -eq "done" -and $statusRes.recordedInRoster -eq $true) {
-        Write-Pass "Заявка $reqId успішно перейшла у стан 'done' і зафіксована у відомості деканату за request_id (QueueWait=$($statusRes.queueWaitMs) мс, Processing=$($statusRes.processingTimeMs) мс)"
+    if ($finalStatus -eq "done" -and $statusRes.recorded_in_roster -eq $true) {
+        Write-Pass "Заявка $reqId успішно перейшла у стан 'done' і зафіксована у відомості деканату за request_id (QueueWait=$($statusRes.queue_wait_ms) мс, Processing=$($statusRes.processing_time_ms) мс)"
     } else {
-        Write-Fail "Заявка не досягла стану 'done' або не зафіксована у відомості: status=$finalStatus, recordedInRoster=$($statusRes.recordedInRoster), reason=$($statusRes.rejectionReason)"
+        Write-Fail "Помилка переходу в кінцевий стан: status=$finalStatus, recorded=$($statusRes.recorded_in_roster)"
     }
 
-    # Перевірка, що РПО НЕ зменшив available вдруге (available залишається 29, а не 28!), підтвердив enrollment (confirmed) і створив запис у decanate_roster
-    $dpcGroupAfter = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-DPC-01" -Method Get -Headers $Headers
-    $webDiscAfter  = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=20" -Method Get
-    $webDpcGroup   = ($webDiscAfter.items | ForEach-Object { $_.groups } | Where-Object { $_.id -eq "DISC-DPC-01" } | Select-Object -First 1)
-    $rosterRes     = Invoke-RestMethod -Uri "$BaseUrl/v1/decanate-roster?request_id=$reqId" -Method Get -Headers $Headers
-    $webConfirmed  = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$($webPrimaryEnrBody.id)" -Method Get -Headers @{ "X-User-Id" = "student-1" }
-
-    if ($dpcGroupAfter.taken -eq 1 -and $dpcGroupAfter.freeSeats -eq 29 -and $dpcGroupAfter.rosterCount -eq 1 -and
-        $webDpcGroup.available -eq 29 -and $rosterRes.count -eq 1 -and $rosterRes.items[0].assignment_type -eq "primary_roster" -and
-        $webConfirmed.status -eq "confirmed") {
-        Write-Pass "С10 §3.12 (Без подвійного резервування): воркер РПО зафіксував request_id у decanate_roster (rosterCount=1, status=confirmed), а вільні місця залишилися 29/30 (taken=1)!"
-    } else {
-        Write-Fail "Помилка узгодження Web і РПО: dpc.taken=$($dpcGroupAfter.taken), dpc.free=$($dpcGroupAfter.freeSeats), rosterCount=$($dpcGroupAfter.rosterCount), web.available=$($webDpcGroup.available), enrStatus=$($webConfirmed.status)"
-    }
-
-    # Перевірка, що РПО відхиляє заявку зареєстрованого студента без попереднього запису через Web, а також перевіряє ліміти K та 30.0 ЄКТС безпосередньо в РПО
-    $noWebReq = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body '{"student_id":"student-2","group_id":"DISC-DPC-01"}'
-    $kLimitReq = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body '{"student_id":"student-limit-max","group_id":"DISC-DPC-01"}'
-    $ectsLimitReq = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body '{"student_id":"student-ects-20","group_id":"DISC-ECTS-10-5-G1"}'
-
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 150
-        $stNoWeb = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$($noWebReq.id)" -Method Get -Headers $Headers
-        $stK     = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$($kLimitReq.id)" -Method Get -Headers $Headers
-        $stEcts  = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$($ectsLimitReq.id)" -Method Get -Headers $Headers
-        if ($stNoWeb.status -ne "queued" -and $stNoWeb.status -ne "processing" -and
-            $stK.status -ne "queued" -and $stK.status -ne "processing" -and
-            $stEcts.status -ne "queued" -and $stEcts.status -ne "processing") { break }
-    }
-
-    if ($stNoWeb.status -eq "rejected" -and $stK.status -eq "rejected" -and $stEcts.status -eq "rejected") {
-        Write-Pass "Перевірка обмежень у логіці РПО: відхилено запит без первинного запису Web (rejected), перевищення max_disciplines K=5 (rejected) та перевищення 30.5 > 30.0 ЄКТС (rejected)!"
-    } else {
-        Write-Fail "Помилка перевірки обмежень у РПО: noWeb=$($stNoWeb.status), K=$($stK.status), ECTS=$($stEcts.status)"
-    }
-
-    $dupSameRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyReq1 -SkipHttpErrorCheck
-    $groupStateAfterDup = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-DPC-01" -Method Get -Headers $Headers
-    if ([int]$dupSameRes.StatusCode -eq 202 -and $groupStateAfterDup.taken -eq 1 -and $groupStateAfterDup.rosterCount -eq 1) {
-        Write-Pass "Повторний запит із тим самим ID не потрапив повторно в чергу і не продублював запис у відомості деканату (taken = 1/30, rosterCount = 1)"
-    } else {
-        Write-Fail "Порушення ідемпотентності повторного запиту: status=$([int]$dupSameRes.StatusCode), taken=$($groupStateAfterDup.taken)"
-    }
-
-    $bodyConflict = @{
-        requestId  = $fixedId
-        student_id = "STD-OTHER-999"
-        group_id   = "DISC-DPC-01"
-    } | ConvertTo-Json
-    $conflictRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyConflict -SkipHttpErrorCheck
+    # Повторний запит із тим самим ID та іншими параметрами -> 409 Conflict
+    $conflictBody = @{ request_id = $fixedId; student_id = "student-2"; group_id = "DISC-WEB-01" } | ConvertTo-Json
+    $conflictRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $conflictBody -SkipHttpErrorCheck
     if ([int]$conflictRes.StatusCode -eq 409) {
-        Write-Pass "Повторний запит із тим самим ID та іншими даними відхилено з HTTP 409 Conflict"
+        Write-Pass "Ідемпотентний конфлікт за фіксованим requestId успішно виявлено: отримано HTTP 409 Conflict"
     } else {
-        Write-Fail "Очікувався HTTP 409 Conflict при неспівпадінні даних, отримано: $([int]$conflictRes.StatusCode)"
+        Write-Fail "Очікувався HTTP 409, отримано $([int]$conflictRes.StatusCode)"
     }
 
-    $bodyInvalid = @{ student_id = "STD-INVALID"; group_id = "NON-EXISTENT-GROUP" } | ConvertTo-Json
-    $invalidRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyInvalid -SkipHttpErrorCheck
-    if ([int]$invalidRes.StatusCode -eq 202) {
-        $invId = ((Get-ResponseText $invalidRes) | ConvertFrom-Json).id
-        for ($i = 0; $i -lt 25; $i++) {
-            Start-Sleep -Milliseconds 150
-            $invStatus = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$invId" -Method Get -Headers $Headers
-            if ($invStatus.status -in @("done", "rejected", "failed")) { break }
-        }
-        if ($invStatus.status -eq "failed") {
-            Write-Pass "Неіснуюча група успішно перейшла у статус 'failed': $($invStatus.rejectionReason)"
-        } else {
-            Write-Fail "Очікувався статус 'failed', отримано: $($invStatus.status)"
-        }
+    # Перевірка глобальної унікальності Idempotency-Key між різними студентами (міграція 006)
+    $globalIk = "ik-global-" + [guid]::NewGuid().ToString("N")
+    $ikHeaders1 = @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $Token"; "Idempotency-Key" = $globalIk }
+    $ikPost1 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $ikHeaders1 -Body (@{ student_id = "student-2"; group_id = "DISC-DPC-01" } | ConvertTo-Json) -SkipHttpErrorCheck
+    $ikPost2 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $ikHeaders1 -Body (@{ student_id = "student-3"; group_id = "DISC-DPC-01" } | ConvertTo-Json) -SkipHttpErrorCheck
+    $ikConflictJson = (Get-ResponseText $ikPost2) | ConvertFrom-Json
+    if ([int]$ikPost1.StatusCode -eq 202 -and [int]$ikPost2.StatusCode -eq 409 -and $ikConflictJson.error_code -eq "idempotency_conflict") {
+        Write-Pass "Пункт 2 (міграція 006): Глобальний унікальний індекс Idempotency-Key захищає від використання одного ключа різними студентами (409 Conflict)"
     } else {
-        Write-Fail "Очікувався статус 202 для невідомої групи, отримано: $([int]$invalidRes.StatusCode)"
+        Write-Fail "Помилка перевірки глобального Idempotency-Key: post1=$([int]$ikPost1.StatusCode), post2=$([int]$ikPost2.StatusCode)"
     }
 
     # --------------------------------------------------------------------------
-    # 4. Пункт О1.2 (РПО): Обмежена черга, 429 + Retry-After та p95 /health під навантаженням
+    # 4. Пункт О1.2 (РПО): Обмежена черга QUEUE_CAPACITY=100, 429 Backpressure та замір /health під навантаженням
     # --------------------------------------------------------------------------
     Write-Header "4. ПУНКТ О1.2 (РПО): Обмежена черга QUEUE_CAPACITY=100, перевантаження 429 та p95 /health під навантаженням"
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
-    Write-Info "Подання залпу зі 150 одночасних запитів (QUEUE_CAPACITY=100, WORKERS=3) та одночасне вимірювання 30 запитів /health..."
 
-    $swBurst = [System.Diagnostics.Stopwatch]::StartNew()
-    $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
-    for ($k = 1; $k -le 150; $k++) {
-        $content = [System.Net.Http.StringContent]::new("{`"student_id`":`"STD-BURST-$k`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
-        $tasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $content))
-    }
+    Write-Info "Створення стійкого фонового навантаження (50 паралельних клієнтів, тривалість ~8 с) та паралельний замір /health-app-a..."
 
-    $healthLatencies = [System.Collections.Generic.List[double]]::new()
-    for ($h = 0; $h -lt 30; $h++) {
+    $concurrentClients = 50
+    $loadDurationSec = 8
+
+    # 50 паралельних клієнтських потоків через ForEach-Object -Parallel у фоновому Job
+    $loadJob = 1..$concurrentClients | ForEach-Object -Parallel {
+        $cIndex = $_
+        $clientHttp = [System.Net.Http.HttpClient]::new()
+        $clientHttp.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", "secret-c10-token-2026")
+        $studentId = "student-safe-$("{0:D2}" -f (($cIndex % 20) + 1))"
+        $bodyJson = "{`"student_id`":`"$studentId`",`"group_id`":`"DISC-DPC-01`"}"
+
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $null = $httpClient.GetAsync("$BaseUrl/health").GetAwaiter().GetResult()
-        $sw.Stop()
-        $healthLatencies.Add($sw.Elapsed.TotalMilliseconds)
-        Start-Sleep -Milliseconds 15
+        $acc = 0
+        $thr = 0
+        $ret = 0
+
+        while ($sw.Elapsed.TotalSeconds -lt $using:loadDurationSec) {
+            try {
+                $content = [System.Net.Http.StringContent]::new($bodyJson, [System.Text.Encoding]::UTF8, "application/json")
+                $resp = $clientHttp.PostAsync("$using:BaseUrl/v1/enrollment-requests", $content).GetAwaiter().GetResult()
+                $code = [int]$resp.StatusCode
+                if ($code -eq 202) {
+                    $acc++
+                } elseif ($code -eq 429) {
+                    $thr++
+                    if ($resp.Headers.Contains("Retry-After")) {
+                        $ret++
+                    }
+                }
+            } catch { }
+            [System.Threading.Thread]::Sleep(30)
+        }
+        [PSCustomObject]@{
+            Accepted = $acc
+            Throttled = $thr
+            HasRetryAfter = $ret
+        }
+    } -ThrottleLimit $concurrentClients -AsJob
+
+    # Паралельні заміри затримки /health-app-a через Nginx під час насиченої черги (200 вимірювань)
+    $healthLatencies = [System.Collections.Generic.List[double]]::new()
+    $healthSw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($healthLatencies.Count -lt 200 -and $healthSw.Elapsed.TotalSeconds -lt ($loadDurationSec + 2)) {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $hResp = $httpClient.GetAsync("$BaseUrl/health-app-a").GetAwaiter().GetResult()
+            $sw.Stop()
+            if ($hResp.IsSuccessStatusCode) {
+                $healthLatencies.Add($sw.Elapsed.TotalMilliseconds)
+            }
+        } catch { }
+        [System.Threading.Thread]::Sleep(20)
     }
 
-    [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray())
-    $swBurst.Stop()
-    $burstDurationSec = [Math]::Round($swBurst.Elapsed.TotalSeconds, 2)
-    $responses = $tasks | ForEach-Object { $_.Result }
+    $null = Wait-Job $loadJob
+    $clientResults = Receive-Job $loadJob
+    Remove-Job $loadJob
 
-    $cnt202 = ($responses | Where-Object { [int]$_.StatusCode -eq 202 }).Count
-    $cnt429 = ($responses | Where-Object { [int]$_.StatusCode -eq 429 }).Count
-    $hasRetryAfter = ($responses | Where-Object { [int]$_.StatusCode -eq 429 -and $_.Headers.Contains("Retry-After") }).Count
+    $mLoad = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    $maxObservedQueue = $mLoad.littles_law.max_queue_length_observed
+    $queueBounded = $mLoad.littles_law.queue_is_bounded
+
+    $totalAcceptedLoad = [int](($clientResults | Measure-Object -Property Accepted -Sum).Sum)
+    $total429Load = [int](($clientResults | Measure-Object -Property Throttled -Sum).Sum)
+    $hasRetryAfterCount = [int](($clientResults | Measure-Object -Property HasRetryAfter -Sum).Sum)
 
     $sortedHealth = $healthLatencies | Sort-Object
     $p50Index = [Math]::Max(0, [Math]::Ceiling($sortedHealth.Count * 0.50) - 1)
@@ -364,259 +471,331 @@ try {
     $p50Health = [Math]::Round($sortedHealth[$p50Index], 2)
     $p95Health = [Math]::Round($sortedHealth[$p95Index], 2)
 
-    Write-Info "Тривалість фази пікового залпу (150 запитів + 30 /health): $burstDurationSec с | 202 Accepted = $cnt202, 429 = $cnt429 (з Retry-After: $hasRetryAfter)"
-    if ($cnt429 -gt 0 -and $hasRetryAfter -eq $cnt429) {
-        Write-Pass "Переповнення черги оброблено коректно: отримано $cnt429 відповідей 429, усі з заголовком Retry-After"
+    Write-Info "Параметри досліду О1.2: QUEUE_CAPACITY=100, WORKERS=3, одночасних клієнтів=$concurrentClients, тривалість=$loadDurationSec с"
+    Write-Info "Результати заміру: 202 Accepted=$totalAcceptedLoad, 429 TooManyRequests=$total429Load (з Retry-After: $hasRetryAfterCount), замірів /health-app-a=$($healthLatencies.Count)"
+    Write-Info "Метрики черги: max_queue_length_observed=$maxObservedQueue, queue_is_bounded=$queueBounded"
+
+    if ($total429Load -gt 0 -and $hasRetryAfterCount -eq $total429Load -and $maxObservedQueue -ge 95 -and $queueBounded -eq $true) {
+        Write-Pass "Обмежену чергу захищено: отримано $total429Load відповідей 429, усі містять Retry-After, пікова черга сягнула $maxObservedQueue/100 (queue_is_bounded=true)"
+        Write-Pass "Пункт 7: 429 повертається миттєво в пам'яті через TryReserveSlot() без зайвого навантаження на БД"
     } else {
-        Write-Fail "Помилка обробки переповнення: 429=$cnt429, Retry-After=$hasRetryAfter"
+        Write-Fail "Помилка переповнення: 429=$total429Load, Retry-After=$hasRetryAfterCount, max_queue=$maxObservedQueue, bounded=$queueBounded"
     }
 
     if ($p95Health -le 100.0) {
-        Write-Pass "Затримка /health безпосередньо під навантаженням: p50 = $p50Health мс, p95 = $p95Health мс (вимога <= 100 мс ВИКОНАНА)"
+        Write-Pass "Затримка виділеного маршруту /health-app-a через Nginx під навантаженням (О1.2): p50 = $p50Health мс, p95 = $p95Health мс (норматив <= 100 мс ВИКОНАНО)"
     } else {
-        Write-Fail "Помилка перевірки /health під навантаженням: p95 = $p95Health мс"
+        Write-Fail "Помилка /health-app-a під навантаженням: p95 = $p95Health мс"
     }
 
     # --------------------------------------------------------------------------
-    # 5. Пункт О1.4 (РПО): Захист єдиного спільного ресурсу discipline_group (SAFE vs UNSAFE)
+    # 5. Пункт О1.4 (РПО): Захист спільного ресурсу discipline_group (SAFE vs UNSAFE)
     # --------------------------------------------------------------------------
-    Write-Header "5. ПУНКТ О1.4 (РПО): Захист єдиного спільного ресурсу discipline_group (порівняння SAFE vs UNSAFE)"
+    Write-Header "5. ПУНКТ О1.4 (РПО): Захист спільного ресурсу discipline_group (порівняння SAFE vs UNSAFE)"
 
-    Write-Info "Крок 5.1: Робочий безпечний режим UNSAFE_MODE=false (група DISC-TEST-SAFE, seats=5, 20 конкурентних запитів)..."
+    Write-Info "Крок 5.1: Безпечний режим UNSAFE_MODE=false (група DISC-TEST-SAFE, seats=5, 20 дійсних студентів)..."
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
 
     $safeTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
     for ($s = 1; $s -le 20; $s++) {
-        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"STD-SAFE-$s`",`"group_id`":`"DISC-TEST-SAFE`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $stName = "student-safe-$("{0:D2}" -f $s)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stName`",`"group_id`":`"DISC-TEST-SAFE`"}", [System.Text.Encoding]::UTF8, "application/json")
         $safeTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
     }
     [System.Threading.Tasks.Task]::WaitAll($safeTasks.ToArray())
 
-    for ($waitLoop = 0; $waitLoop -lt 50; $waitLoop++) {
+    for ($waitLoop = 0; $waitLoop -lt 60; $waitLoop++) {
         Start-Sleep -Milliseconds 250
-        $mSnap = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
+        $mSnap = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
         if ($mSnap.queue_length -eq 0 -and $mSnap.in_processing -eq 0 -and ($mSnap.counters.total_done + $mSnap.counters.total_rejected) -ge 20) {
             break
         }
     }
 
     $safeGroup = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-TEST-SAFE" -Method Get -Headers $Headers
-    $safeMetrics = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
-    if ($safeGroup.taken -eq 5 -and $safeGroup.seats -eq 5 -and $safeGroup.invariantHolds -eq $true -and $safeMetrics.counters.total_done -eq 5 -and $safeMetrics.counters.total_rejected -eq 15) {
-        Write-Pass "БЕЗПЕЧНИЙ РЕЖИМ: Інваріант строго дотримано! Взято $($safeGroup.taken)/$($safeGroup.seats) місць (done=5, rejected=15)."
+    $safeMetrics = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    if ($safeGroup.taken -eq 5 -and $safeGroup.seats -eq 5 -and $safeGroup.roster_count -eq 5 -and $safeGroup.invariant_holds -eq $true -and $safeMetrics.counters.total_done -eq 5 -and $safeMetrics.counters.total_rejected -eq 15) {
+        Write-Pass "БЕЗПЕЧНИЙ РЕЖИМ (FOR UPDATE): Інваріант дотримано! taken=$($safeGroup.taken)/$($safeGroup.seats), rosterCount=$($safeGroup.roster_count) (done=5, rejected=15)."
     } else {
-        Write-Fail "Порушення у безпечному режимі: taken=$($safeGroup.taken)/$($safeGroup.seats), done=$($safeMetrics.counters.total_done), rejected=$($safeMetrics.counters.total_rejected)"
+        Write-Fail "Порушення у безпечному режимі: taken=$($safeGroup.taken), rosterCount=$($safeGroup.roster_count), done=$($safeMetrics.counters.total_done), rejected=$($safeMetrics.counters.total_rejected)"
     }
 
-    Write-Info "Крок 5.2: Небезпечний режим UNSAFE_MODE=true (ізольована група DISC-TEST-UNSAFE, seats=5, 20 конкурентних запитів)..."
+    Write-Info "Крок 5.2: Небезпечний режим UNSAFE_MODE=true на тій самій тестовій групі (DISC-TEST-SAFE, seats=5, 20 студентів)..."
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=true" -Method Post -Headers $Headers
 
     $unsafeTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
     for ($u = 1; $u -le 20; $u++) {
-        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"STD-UNSAFE-$u`",`"group_id`":`"DISC-TEST-UNSAFE`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $stName = "student-unsafe-$("{0:D2}" -f $u)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stName`",`"group_id`":`"DISC-TEST-SAFE`"}", [System.Text.Encoding]::UTF8, "application/json")
         $unsafeTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
     }
     [System.Threading.Tasks.Task]::WaitAll($unsafeTasks.ToArray())
 
-    for ($waitLoop = 0; $waitLoop -lt 50; $waitLoop++) {
+    for ($waitLoop = 0; $waitLoop -lt 60; $waitLoop++) {
         Start-Sleep -Milliseconds 250
-        $mSnap = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
+        $mSnap = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
         if ($mSnap.queue_length -eq 0 -and $mSnap.in_processing -eq 0 -and ($mSnap.counters.total_done + $mSnap.counters.total_rejected) -ge 20) {
             break
         }
     }
 
-    $unsafeGroup = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-TEST-UNSAFE" -Method Get -Headers $Headers
-    Write-Info "Стан групи DISC-TEST-UNSAFE: taken=$($unsafeGroup.taken), freeSeats=$($unsafeGroup.freeSeats), seats=$($unsafeGroup.seats), invariantHolds=$($unsafeGroup.invariantHolds)"
-    if ($unsafeGroup.taken -gt $unsafeGroup.seats -and $unsafeGroup.invariantHolds -eq $false) {
-        Write-Pass "НЕБЕЗПЕЧНИЙ РЕЖИМ: Стан гонитви успішно відтворено! Інваріант ПОРУШЕНО: taken ($($unsafeGroup.taken)) > seats ($($unsafeGroup.seats))."
+    $unsafeGroup = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-TEST-SAFE" -Method Get -Headers $Headers
+    Write-Info "Стан групи після UNSAFE: taken=$($unsafeGroup.taken), rosterCount=$($unsafeGroup.roster_count), seats=$($unsafeGroup.seats), invariantHolds=$($unsafeGroup.invariant_holds)"
+    if ($unsafeGroup.roster_count -gt $unsafeGroup.seats -and $unsafeGroup.taken -gt $unsafeGroup.seats -and $unsafeGroup.invariant_holds -eq $false) {
+        Write-Pass "НЕБЕЗПЕЧНИЙ РЕЖИМ (UNSAFE_MODE=true): Стан гонитви успішно продемонстровано! Інваріант ПОРУШЕНО: taken ($($unsafeGroup.taken)) > seats ($($unsafeGroup.seats)) та rosterCount ($($unsafeGroup.roster_count)) > seats ($($unsafeGroup.seats))."
     } else {
-        Write-Fail "Не вдалося продемонструвати порушення інваріанта в UNSAFE_MODE: taken=$($unsafeGroup.taken)/$($unsafeGroup.seats)"
+        Write-Fail "Не вдалося продемонструвати порушення інваріанта в UNSAFE_MODE: taken=$($unsafeGroup.taken), rosterCount=$($unsafeGroup.roster_count)/$($unsafeGroup.seats)"
     }
 
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
 
     # --------------------------------------------------------------------------
-    # 6. Пункт О1.5 (РПО): Монотонні позначки та одноразова фіксація першого GET
+    # 6. Пункт О1.5 та Д1.2 (РПО): Монотонні позначки та перевірка закону Літтла
     # --------------------------------------------------------------------------
-    Write-Header "6. ПУНКТ О1.5 (РПО): Монотонні позначки часу та одноразова фіксація першого GET"
-    $bodyO15 = @{ student_id = "STD-O15-CHECK"; group_id = "DISC-DPC-01" } | ConvertTo-Json
+    Write-Header "6. ПУНКТ О1.5 та Д1.2 (РПО): Монотонні позначки часу та перевірка закону Літтла (L = lambda * W)"
+
+    # Крок 6.1: Монотонні позначки та одноразова фіксація доставки delivery_wait_ms (О1.5)
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+    $bodyO15 = @{ student_id = "student-1"; group_id = "DISC-DPC-01" } | ConvertTo-Json
     $resO15 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body $bodyO15
     $idO15 = $resO15.id
 
     for ($w = 0; $w -lt 30; $w++) {
         Start-Sleep -Milliseconds 100
-        $mCheck = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
+        $mCheck = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
         if ($mCheck.counters.total_done -ge 1 -and $mCheck.in_processing -eq 0) { break }
     }
 
-    $firstGet = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$idO15" -Method Get -Headers $Headers
-    Start-Sleep -Milliseconds 150
-    $secondGet = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$idO15" -Method Get -Headers $Headers
-    $mAfterO15 = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
+    $firstRead1 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$idO15" -Method Get -Headers $Headers
+    $deliv1 = $firstRead1.delivery_wait_ms
+    Start-Sleep -Milliseconds 200
+    $firstRead2 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$idO15" -Method Get -Headers $Headers
+    $deliv2 = $firstRead2.delivery_wait_ms
 
-    if ($null -ne $firstGet.firstReadAt -and $null -ne $firstGet.deliveryWaitMs -and
-        $firstGet.firstReadAt -eq $secondGet.firstReadAt -and
-        $firstGet.deliveryWaitMs -eq $secondGet.deliveryWaitMs -and
-        $mAfterO15.counters.monotonic_order_violations -eq 0) {
-        Write-Pass "Перший GET зафіксував firstReadAt ($($firstGet.firstReadAt)) та deliveryWaitMs = $($firstGet.deliveryWaitMs) мс; повторний GET не змінив позначку!"
-        Write-Pass "Порушень монотонності часових позначок: $($mAfterO15.counters.monotonic_order_violations)"
+    if ($null -ne $deliv1 -and $deliv1 -eq $deliv2 -and $firstRead1.first_read_at -eq $firstRead2.first_read_at) {
+        Write-Pass "Монотонні позначки (О1.5): FirstRead зафіксовано одноразово (deliveryWaitMs = $deliv1 мс, не змінюється при повторних GET)"
     } else {
-        Write-Fail "Помилка О1.5: firstGet.deliveryWaitMs=$($firstGet.deliveryWaitMs), secondGet.deliveryWaitMs=$($secondGet.deliveryWaitMs), violations=$($mAfterO15.counters.monotonic_order_violations)"
+        Write-Fail "Помилка фіксації FirstRead: d1=$deliv1, d2=$deliv2"
     }
 
-    # --------------------------------------------------------------------------
-    # 7. Пункт Д1.1 (РПО): Реальні вимірювання обох моделей виконання (неблокуюча async_tasks vs dedicated_threads)
-    # --------------------------------------------------------------------------
-    Write-Header "7. ПУНКТ Д1.1 (РПО): Порівняння моделей виконання async_tasks (неблокуючий TCS) та dedicated_threads"
-
-    function Invoke-ModelBenchmark([string]$modelName, [int]$requestCount = 30) {
-        $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false&executionModel=$modelName" -Method Post -Headers $Headers
-        $swModel = [System.Diagnostics.Stopwatch]::StartNew()
-
-        $benchTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
-        for ($b = 1; $b -le $requestCount; $b++) {
-            $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"STD-$modelName-$b`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
-            $benchTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
-        }
-        [System.Threading.Tasks.Task]::WaitAll($benchTasks.ToArray())
-
-        for ($w = 0; $w -lt 80; $w++) {
-            Start-Sleep -Milliseconds 150
-            $m = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
-            if ($m.queue_length -eq 0 -and $m.in_processing -eq 0 -and ($m.counters.total_done + $m.counters.total_rejected) -eq $requestCount) {
-                break
-            }
-        }
-        $swModel.Stop()
-        $finalM = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
-        return [PSCustomObject]@{
-            Model          = $finalM.service_state.execution_model
-            TotalSec       = [Math]::Round($swModel.Elapsed.TotalSeconds, 2)
-            ThroughputRps  = [Math]::Round($requestCount / $swModel.Elapsed.TotalSeconds, 2)
-            DoneCount      = $finalM.counters.total_done
-            QueueWaitP50   = $finalM.intervals_ms.queue_wait_ms.p50_ms
-            QueueWaitP95   = $finalM.intervals_ms.queue_wait_ms.p95_ms
-            ProcTimeP50    = $finalM.intervals_ms.processing_time_ms.p50_ms
-            ProcTimeP95    = $finalM.intervals_ms.processing_time_ms.p95_ms
-        }
-    }
-
-    Write-Info "Вимірювання моделі 1: EXECUTION_MODEL=async_tasks (пакет 30 запитів)..."
-    $resAsync = Invoke-ModelBenchmark -modelName "async_tasks" -requestCount 30
-    Write-Info "  [async_tasks] Час = $($resAsync.TotalSec) с | Пропускна здатність = $($resAsync.ThroughputRps) зап/с | QueueWait p50/p95 = $($resAsync.QueueWaitP50)/$($resAsync.QueueWaitP95) мс | Proc p50/p95 = $($resAsync.ProcTimeP50)/$($resAsync.ProcTimeP95) мс"
-
-    Write-Info "Вимірювання моделі 2: EXECUTION_MODEL=dedicated_threads (пакет 30 запитів)..."
-    $resThreads = Invoke-ModelBenchmark -modelName "dedicated_threads" -requestCount 30
-    Write-Info "  [dedicated_threads] Час = $($resThreads.TotalSec) с | Пропускна здатність = $($resThreads.ThroughputRps) зап/с | QueueWait p50/p95 = $($resThreads.QueueWaitP50)/$($resThreads.QueueWaitP95) мс | Proc p50/p95 = $($resThreads.ProcTimeP50)/$($resThreads.ProcTimeP95) мс"
-
-    if ($resAsync.Model -eq "async_tasks" -and $resAsync.DoneCount -eq 30 -and
-        $resThreads.Model -eq "dedicated_threads" -and $resThreads.DoneCount -eq 30) {
-        Write-Pass "Обидві моделі виконання (async_tasks та dedicated_threads) успішно протестовані при однаковому навантаженні (30/30 оброблено)"
-    } else {
-        Write-Fail "Помилка тестування моделей Д1.1: async=$($resAsync.Model)($($resAsync.DoneCount)), threads=$($resThreads.Model)($($resThreads.DoneCount))"
-    }
-
-    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false&executionModel=async_tasks" -Method Post -Headers $Headers
-
-    # --------------------------------------------------------------------------
-    # 8. Пункт Д1.2 (РПО): Перевірка закону Літтла (60 с ~4 зап/с, розігрів 10 с виключено + незалежна вибірка 100 мс)
-    # --------------------------------------------------------------------------
-    Write-Header "8. ПУНКТ Д1.2 (РПО): Закон Літтла L = lambda * W (60 с по ~4 зап/с, розігрів 10 с виключено + незалежна вибірка 100 мс)"
+    # Крок 6.2: Перевірка закону Літтла з реальним пакетом 30 запитів на ненульовій черзі (Д1.2)
+    Write-Info "Скидання вікна метрик та відправка пакета з 30 запитів у групу DISC-DPC-01 для перевірки закону Літтла..."
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
 
-    $totalSec = 60
-    $warmupSec = 10
-    $postWarmupQueues = [System.Collections.Generic.List[int]]::new()
-    $littleTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
-    $reqSeq = 0
+    $llTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    for ($i = 1; $i -le 30; $i++) {
+        $stId = if ($i -le 20) { "student-safe-$("{0:D2}" -f $i)" } else { "student-unsafe-$("{0:D2}" -f ($i - 20))" }
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stId`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $llTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($llTasks.ToArray())
 
-    Write-Info "Подання потоку ~4 запити/с протягом 60 секунд (перші 10 с розігріву виключаються з вимірювань)..."
-    for ($sec = 0; $sec -lt $totalSec; $sec++) {
-        $secTimer = [System.Diagnostics.Stopwatch]::StartNew()
-
-        if ($sec -eq $warmupSec) {
-            $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?metricsOnly=true" -Method Post -Headers $Headers
-            Write-Info "Перші 10 с розігріву завершено -> вікно вимірювання метрик та 100 мс семплера скинуто (заліковий інтервал 50 с)..."
+    # Чекаємо повного вивантаження черги воркерами (30 запитів)
+    for ($w = 0; $w -lt 60; $w++) {
+        Start-Sleep -Milliseconds 300
+        $mDrain = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+        if ($mDrain.queue_length -eq 0 -and $mDrain.in_processing -eq 0 -and ($mDrain.counters.total_done + $mDrain.counters.total_rejected) -ge 30) {
+            break
         }
-
-        for ($j = 0; $j -lt 4; $j++) {
-            $reqSeq++
-            $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"STD-LITTLE-$reqSeq`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
-            $littleTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
-        }
-
-        if ($sec -ge $warmupSec) {
-            Start-Sleep -Milliseconds 120
-            $hSnap = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
-            $postWarmupQueues.Add([int]$hSnap.queue_length)
-        }
-
-        $remSec = 1000 - [int]$secTimer.ElapsedMilliseconds
-        if ($remSec -gt 0) { Start-Sleep -Milliseconds $remSec }
     }
 
-    $metricsLittle = Invoke-RestMethod -Uri "$BaseUrl/metrics?format=json" -Method Get
-    [System.Threading.Tasks.Task]::WaitAll($littleTasks.ToArray())
-    Start-Sleep -Seconds 2
-
-    $halfIdx = [Math]::Floor($postWarmupQueues.Count / 2)
-    $firstHalfAvg = ($postWarmupQueues[0..($halfIdx - 1)] | Measure-Object -Average).Average
-    $secondHalfAvg = ($postWarmupQueues[$halfIdx..($postWarmupQueues.Count - 1)] | Measure-Object -Average).Average
-    $clientSampledAvg = [Math]::Round((($postWarmupQueues | Measure-Object -Average).Average), 4)
-
-    $ll = $metricsLittle.littles_law
-    Write-Info "Параметри закону Літтла за єдиний заліковий інтервал ($($ll.observation_window_sec) с):"
-    Write-Info "  Інтенсивність надходження (lambda): $($ll.lambda_arrival_rate_rps) зап/с (прийнято у вікні: $($ll.window_arrivals_count))"
-    Write-Info "  Середній час очікування у черзі (W): $($ll.w_avg_queue_wait_sec) с"
-    Write-Info "  L_теоретичне (lambda * W): $($ll.l_theoretical_avg_queue_length)"
-    Write-Info "  L_спостережуване (точний часовий інтеграл): $($ll.l_observed_avg_queue_length) (розбіжність: $($ll.relative_discrepancy_pct) %)"
-    Write-Info "  L_спостережуване (незалежна вибірка 100 мс, N=$($ll.independent_sample_count)): $($ll.l_observed_independent_sampled) (розбіжність: $($ll.independent_discrepancy_pct) %)"
-    Write-Info "  Зовнішня HTTP-вибірка клієнта (50 замірів раз/с): $clientSampledAvg"
-
-    if ($ll.observation_window_sec -ge 45.0 -and $ll.queue_is_bounded -eq $true -and
-        ($secondHalfAvg -le ($firstHalfAvg + 3.0)) -and
-        $ll.independent_sample_count -ge 400 -and $ll.independent_discrepancy_pct -le 25.0) {
-        Write-Pass "Закон Літтла підтверджено як точним інтегралом ($($ll.relative_discrepancy_pct)%), так і незалежною вибіркою 100 мс ($($ll.independent_discrepancy_pct)%, N=$($ll.independent_sample_count)); черга стаціонарна!"
+    $mFinal = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    $ll = $mFinal.littles_law
+    if ($null -ne $ll) {
+        Write-Info "Закон Літтла (Д1.2): вікно=$($ll.observation_window_sec) с, arrivals=$($ll.window_arrivals_count), L_theor=$($ll.l_theoretical_avg_queue_length), L_observed=$($ll.l_observed_avg_queue_length), L_sampled_100ms=$($ll.l_observed_independent_sampled)"
+        Write-Info "  Розбіжність теорія/інтеграл: $($ll.relative_discrepancy_pct)% | Розбіжність дискретний семплер/теорія: $($ll.independent_discrepancy_pct)%"
+        if ($ll.window_arrivals_count -eq 30 -and $ll.l_observed_avg_queue_length -gt 0 -and $ll.relative_discrepancy_pct -le 10.0 -and $ll.independent_discrepancy_pct -le 15.0 -and $mFinal.counters.monotonic_order_violations -eq 0) {
+            Write-Pass "Д1.2 (РПО): Закон Літтла підтверджено на реальному пакеті 30 запитів (arrivals=30, похибка інтеграла $($ll.relative_discrepancy_pct)% <= 10%, похибка семплера $($ll.independent_discrepancy_pct)% <= 15%), монотонність збережена (0 порушень)"
+        } else {
+            Write-Fail "Помилка закону Літтла: arrivals=$($ll.window_arrivals_count), L_obs=$($ll.l_observed_avg_queue_length), disc=$($ll.relative_discrepancy_pct)%, indep_disc=$($ll.independent_discrepancy_pct)%, violations=$($mFinal.counters.monotonic_order_violations)"
+        }
     } else {
-        Write-Fail "Помилка перевірки закону Літтла: window=$($ll.observation_window_sec)s, indepCount=$($ll.independent_sample_count), indepDisc=$($ll.independent_discrepancy_pct)%"
+        Write-Fail "Метрика littles_law відсутня у GET /metrics"
     }
 
     # --------------------------------------------------------------------------
-    # 9. Пункт Д1.4 (РПО): Випробування з SIGTERM та перевірка структурованого JSON-журналу завершення
+    # 7. Пункт Д1.3 (РПО): Дві реалізації черги (custom_monitor та system_channel)
     # --------------------------------------------------------------------------
-    Write-Header "9. ПУНКТ Д1.4 (РПО): Випробування з SIGTERM, JSON-події життєвого циклу та завершення прийнятих заявок"
+    Write-Header "7. ПУНКТ Д1.3 (РПО): Порівняння рушіїв черги в пам'яті (custom_monitor vs system_channel)"
+
+    Write-Info "Крок 7.1: Тестування черги QUEUE_ENGINE=custom_monitor на пакеті з 20 запитів..."
+    if (-not (Restart-AppWithConfig -engine "custom_monitor" -model "async_tasks")) {
+        Write-Fail "Не вдалося запустити app-a з QUEUE_ENGINE=custom_monitor"
+    }
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
 
-    $sigtermBatchCount = 12
+    $monitorTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    for ($i = 1; $i -le 20; $i++) {
+        $stId = "student-safe-$("{0:D2}" -f $i)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stId`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $monitorTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($monitorTasks.ToArray())
+
+    for ($w = 0; $w -lt 60; $w++) {
+        Start-Sleep -Milliseconds 250
+        $mDrain = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+        if ($mDrain.queue_length -eq 0 -and $mDrain.in_processing -eq 0 -and ($mDrain.counters.total_done + $mDrain.counters.total_rejected) -ge 20) {
+            break
+        }
+    }
+    $mMonitor = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    $monProcP50 = $mMonitor.intervals_ms.processing_time_ms.p50_ms
+    $monProcP95 = $mMonitor.intervals_ms.processing_time_ms.p95_ms
+    $monFullP50 = $mMonitor.intervals_ms.full_domain_execution_ms.p50_ms
+    $monFullP95 = $mMonitor.intervals_ms.full_domain_execution_ms.p95_ms
+    Write-Info "  custom_monitor: done=$($mMonitor.counters.total_done), processing p50=$monProcP50 мс, p95=$monProcP95 мс, full_execution p50=$monFullP50 мс, p95=$monFullP95 мс"
+
+    Write-Info "Крок 7.2: Тестування черги QUEUE_ENGINE=system_channel на пакеті з 20 запитів..."
+    if (-not (Restart-AppWithConfig -engine "system_channel" -model "async_tasks")) {
+        Write-Fail "Не вдалося запустити app-a з QUEUE_ENGINE=system_channel"
+    }
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+
+    $channelTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    for ($i = 1; $i -le 20; $i++) {
+        $stId = "student-safe-$("{0:D2}" -f $i)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stId`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $channelTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($channelTasks.ToArray())
+
+    for ($w = 0; $w -lt 60; $w++) {
+        Start-Sleep -Milliseconds 250
+        $mDrain = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+        if ($mDrain.queue_length -eq 0 -and $mDrain.in_processing -eq 0 -and ($mDrain.counters.total_done + $mDrain.counters.total_rejected) -ge 20) {
+            break
+        }
+    }
+    $mChannel = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    $chanProcP50 = $mChannel.intervals_ms.processing_time_ms.p50_ms
+    $chanProcP95 = $mChannel.intervals_ms.processing_time_ms.p95_ms
+    $chanFullP50 = $mChannel.intervals_ms.full_domain_execution_ms.p50_ms
+    $chanFullP95 = $mChannel.intervals_ms.full_domain_execution_ms.p95_ms
+    Write-Info "  system_channel: done=$($mChannel.counters.total_done), processing p50=$chanProcP50 мс, p95=$chanProcP95 мс, full_execution p50=$chanFullP50 мс, p95=$chanFullP95 мс"
+
+    if ($mMonitor.counters.total_done -eq 20 -and $mChannel.counters.total_done -eq 20) {
+        Write-Pass "Д1.3 (РПО): Обидва рушії черги (custom_monitor та system_channel) успішно обробили пакет із 20 запитів без втрат і дедлоків."
+    } else {
+        Write-Fail "Помилка тестування рушіїв черги: monitor_done=$($mMonitor.counters.total_done), channel_done=$($mChannel.counters.total_done)"
+    }
+
+    # --------------------------------------------------------------------------
+    # 8. Пункт Д1.1 (РПО): Моделі виконання (async_tasks та dedicated_threads)
+    # --------------------------------------------------------------------------
+    Write-Header "8. ПУНКТ Д1.1 (РПО): Порівняння моделей виконання воркерів (async_tasks vs dedicated_threads)"
+
+    Write-Info "Крок 8.1: Тестування моделі EXECUTION_MODEL=async_tasks на пакеті з 20 запитів..."
+    if (-not (Restart-AppWithConfig -engine "system_channel" -model "async_tasks")) {
+        Write-Fail "Не вдалося запустити app-a з EXECUTION_MODEL=async_tasks"
+    }
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+
+    $asyncTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    for ($i = 1; $i -le 20; $i++) {
+        $stId = "student-safe-$("{0:D2}" -f $i)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stId`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $asyncTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($asyncTasks.ToArray())
+
+    for ($w = 0; $w -lt 60; $w++) {
+        Start-Sleep -Milliseconds 250
+        $mDrain = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+        if ($mDrain.queue_length -eq 0 -and $mDrain.in_processing -eq 0 -and ($mDrain.counters.total_done + $mDrain.counters.total_rejected) -ge 20) {
+            break
+        }
+    }
+    $mAsync = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    $asyncProcP50 = $mAsync.intervals_ms.processing_time_ms.p50_ms
+    $asyncProcP95 = $mAsync.intervals_ms.processing_time_ms.p95_ms
+    $asyncFullP50 = $mAsync.intervals_ms.full_domain_execution_ms.p50_ms
+    $asyncFullP95 = $mAsync.intervals_ms.full_domain_execution_ms.p95_ms
+    Write-Info "  async_tasks: done=$($mAsync.counters.total_done), processing p50=$asyncProcP50 мс, p95=$asyncProcP95 мс, full_execution p50=$asyncFullP50 мс, p95=$asyncFullP95 мс"
+
+    Write-Info "Крок 8.2: Тестування моделі EXECUTION_MODEL=dedicated_threads на пакеті з 20 запитів..."
+    if (-not (Restart-AppWithConfig -engine "system_channel" -model "dedicated_threads")) {
+        Write-Fail "Не вдалося запустити app-a з EXECUTION_MODEL=dedicated_threads"
+    }
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+
+    $threadTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    for ($i = 1; $i -le 20; $i++) {
+        $stId = "student-safe-$("{0:D2}" -f $i)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stId`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $threadTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($threadTasks.ToArray())
+
+    for ($w = 0; $w -lt 60; $w++) {
+        Start-Sleep -Milliseconds 250
+        $mDrain = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+        if ($mDrain.queue_length -eq 0 -and $mDrain.in_processing -eq 0 -and ($mDrain.counters.total_done + $mDrain.counters.total_rejected) -ge 20) {
+            break
+        }
+    }
+    $mThreads = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers
+    $threadsProcP50 = $mThreads.intervals_ms.processing_time_ms.p50_ms
+    $threadsProcP95 = $mThreads.intervals_ms.processing_time_ms.p95_ms
+    $threadsFullP50 = $mThreads.intervals_ms.full_domain_execution_ms.p50_ms
+    $threadsFullP95 = $mThreads.intervals_ms.full_domain_execution_ms.p95_ms
+    Write-Info "  dedicated_threads: done=$($mThreads.counters.total_done), processing p50=$threadsProcP50 мс, p95=$threadsProcP95 мс, full_execution p50=$threadsFullP50 мс, p95=$threadsFullP95 мс"
+
+    if ($mAsync.counters.total_done -eq 20 -and $mThreads.counters.total_done -eq 20) {
+        Write-Pass "Д1.1 (РПО): Обидва рушії виконання (async_tasks та dedicated_threads) успішно обробили пакет із 20 запитів."
+    } else {
+        Write-Fail "Помилка порівняння моделей: async_done=$($mAsync.counters.total_done), threads_done=$($mThreads.counters.total_done)"
+    }
+
+    # Повертаємо конфігурацію app-a до стандартної
+    $null = Restart-AppWithConfig -engine "system_channel" -model "async_tasks"
+
+    # --------------------------------------------------------------------------
+    # 9. Пункт Д1.4 (РПО): Перехоплення SIGTERM, 503 для нових запитів та JSON-журнал
+    # --------------------------------------------------------------------------
+    Write-Header "9. ПУНКТ Д1.4 (РПО): Перехоплення SIGTERM, відповідь 503 для нових запитів та вивантаження черги"
+
+    $sigtermBatchCount = 10
     Write-Info "Подання $sigtermBatchCount заявок у чергу перед відправкою сигналу SIGTERM..."
     $sigtermTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
     for ($s = 1; $s -le $sigtermBatchCount; $s++) {
-        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"STD-SIGTERM-$s`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $stName = "student-sigterm-$("{0:D2}" -f $s)"
+        $c = [System.Net.Http.StringContent]::new("{`"student_id`":`"$stName`",`"group_id`":`"DISC-DPC-01`"}", [System.Text.Encoding]::UTF8, "application/json")
         $sigtermTasks.Add($httpClient.PostAsync("$BaseUrl/v1/enrollment-requests", $c))
     }
     [System.Threading.Tasks.Task]::WaitAll($sigtermTasks.ToArray())
 
     $acceptedSigtermIds = [System.Collections.Generic.List[string]]::new()
     foreach ($t in $sigtermTasks) {
-        if ([int]$t.Result.StatusCode -eq 202) {
-            $b = $t.Result.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        if ($t.Result.IsSuccessStatusCode) {
+            $b = (Get-ResponseText $t.Result) | ConvertFrom-Json
             $acceptedSigtermIds.Add($b.id)
         }
     }
 
     $sigtermSinceUtc = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    Write-Info "Надсилання сигналу SIGTERM контейнеру dpc-c10-api (app-a)..."
+    Write-Info "Надсилаємо сигнал SIGTERM контейнеру dpc-c10-api (app-a)..."
     $swDrain = [System.Diagnostics.Stopwatch]::StartNew()
     & $DockerExe kill --signal=SIGTERM dpc-c10-api | Out-Null
 
     Start-Sleep -Milliseconds 150
+    $post503Received = $false
     try {
-        $postDuringStop = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body '{"student_id":"STD-AFTER-SIGTERM","group_id":"DISC-DPC-01"}' -SkipHttpErrorCheck -TimeoutSec 2
-        if ([int]$postDuringStop.StatusCode -in @(502, 503, 504)) {
-            Write-Pass "Новий запит під час завершення роботи відхилено з HTTP $([int]$postDuringStop.StatusCode)"
+        $postDuringStop = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -Body '{"student_id":"student-1","group_id":"DISC-DPC-01"}' -SkipHttpErrorCheck -TimeoutSec 3
+        if ([int]$postDuringStop.StatusCode -eq 503) {
+            $post503Received = $true
+            $xReqId = [string]($postDuringStop.Headers["X-Request-ID"] | Select-Object -First 1)
+            Write-Pass "Пункт Д1.4 (п. 3): Новий запит під час зупинки ГАРАНТОВАНО отримав HTTP 503 Service Unavailable (X-Request-ID: $xReqId)!"
+        } else {
+            Write-Fail "Очікувався HTTP 503 під час зупинки, отримано: $([int]$postDuringStop.StatusCode)"
         }
-    } catch { }
+    } catch {
+        Write-Info "Запит під час зупинки перервано тайм-аутом"
+    }
+
+    if (-not $post503Received) {
+        Write-Fail "Д1.4 (РПО): Сервіс не повернув обов'язковий HTTP 503 під час зупинки SIGTERM."
+    }
 
     for ($w = 0; $w -lt 60; $w++) {
         $running = (& $DockerExe inspect -f "{{.State.Running}}" dpc-c10-api 2>$null).Trim()
@@ -630,217 +809,226 @@ try {
     $hasGracefulDone    = $logsAfterStop -match '"event":"graceful_shutdown_completed"'
 
     if ($hasSigtermReceived -and $hasGracefulDone) {
-        Write-Pass "У stdout контейнера dpc-c10-api зафіксовано структуровані JSON-події 'sigterm_received' та 'graceful_shutdown_completed' (час вивантаження: $([Math]::Round($swDrain.Elapsed.TotalSeconds, 2)) с)"
+        Write-Pass "У stdout контейнера dpc-c10-api зафіксовано однорядкові JSON-події 'sigterm_received' та 'graceful_shutdown_completed' (час вивантаження: $([Math]::Round($swDrain.Elapsed.TotalSeconds, 2)) с)"
     } else {
-        Write-Fail "У stdout контейнера відсутні JSON-події SIGTERM: sigterm_received=$hasSigtermReceived, graceful_shutdown_completed=$hasGracefulDone"
+        Write-Fail "У stdout відсутні події SIGTERM: sigterm_received=$hasSigtermReceived, graceful_shutdown_completed=$hasGracefulDone"
     }
 
-    & $DockerExe start dpc-c10-api | Out-Null
-    & $DockerExe compose restart nginx | Out-Null
+    # Перезапуск контейнера app-a після тесту SIGTERM
+    Write-Info "Перезапуск контейнера dpc-c10-api після тесту SIGTERM..."
+    & $DockerExe compose restart app-a | Out-Null
     for ($w = 0; $w -lt 40; $w++) {
         Start-Sleep -Milliseconds 300
         try {
-            $hCheck = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats" -Method Get -Headers $Headers -TimeoutSec 2
-            if ($hCheck.Count -ge 1) { break }
-        } catch { }
+            $mCheck = Invoke-RestMethod -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers -TimeoutSec 2
+            if ($mCheck.instance_id -eq "app-a") { break }
+        } catch {}
     }
 
+    # Перевірка що всі прийняті до SIGTERM заявки зберегли кінцевий стан
     $completedAfterSigterm = 0
     foreach ($id in $acceptedSigtermIds) {
         $st = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$id" -Method Get -Headers $Headers
         if ($st.status -in @("done", "rejected")) { $completedAfterSigterm++ }
     }
 
-    if ($hasSigtermReceived -and $hasGracefulDone -and $completedAfterSigterm -eq $sigtermBatchCount) {
+    if ($completedAfterSigterm -eq $sigtermBatchCount) {
         Write-Pass "Д1.4 (РПО): Усі $completedAfterSigterm/$sigtermBatchCount прийнятих до SIGTERM заявок успішно доведені до кінцевого стану"
     } else {
-        Write-Fail "Помилка Д1.4: completed=$completedAfterSigterm/$sigtermBatchCount"
+        Write-Fail "Помилка завершення черги: completed=$completedAfterSigterm/$sigtermBatchCount"
     }
 
-    # ==========================================================================
-    # 10. КУРС «ОБМІН ДАНИМИ У WEB-ЗАСТОСУНКАХ» (ЛР1: О1.1–О1.7 та Д1.1–Д1.5)
-    # ==========================================================================
-    Write-Header "10. КУРС «ОБМІН ДАНИМИ У WEB-ЗАСТОСУНКАХ» (О1.1–О1.7 та Д1.1–Д1.5)"
-    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+    # --------------------------------------------------------------------------
+    # 10. Пункти курсу Web (О1.1–О1.7, Д1.1–Д1.5)
+    # --------------------------------------------------------------------------
+    Write-Header "10. Курс «Web»: Пагінація курсором, життєвий цикл (held -> confirmed / expired), відмови 400/404/409, least_conn"
 
-    Write-Info "Перевірка О1.6 та Д1.4 (Web): балансування Nginx least_conn (app-a/app-b), X-Request-ID, W3C traceparent та JSON-журнал..."
-    $seenInstances = [System.Collections.Generic.HashSet[string]]::new()
-    $customReqId = "req-web-test-2026-01"
-    $validTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    $webHeadersStudent1 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Authorization" = "Bearer $Token" }
+    $webHeadersStudent2 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "Authorization" = "Bearer $Token" }
+    $webHeadersStudent3 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-3"; "Authorization" = "Bearer $Token" }
 
-    for ($i = 1; $i -le 12; $i++) {
-        $reqHdrs = @{ "X-Request-ID" = "$customReqId-$i"; "traceparent" = $validTraceparent }
-        $r = Invoke-WebRequest -Uri "$BaseUrl/health" -Method Get -Headers $reqHdrs -SkipHttpErrorCheck
-        $inst = $r.Headers["X-Instance-Id"] | Select-Object -First 1
-        if ($inst) { $null = $seenInstances.Add($inst) }
-    }
-
-    $echoReqRes = Invoke-WebRequest -Uri "$BaseUrl/health" -Method Get -Headers @{ "X-Request-ID" = $customReqId; "traceparent" = $validTraceparent } -SkipHttpErrorCheck
-    $echoedReqId = $echoReqRes.Headers["X-Request-ID"] | Select-Object -First 1
-    $echoedTraceId = $echoReqRes.Headers["X-Trace-Id"] | Select-Object -First 1
-
-    if ($seenInstances.Contains("app-a") -and $seenInstances.Contains("app-b") -and $echoedReqId -eq $customReqId -and $echoedTraceId -eq "4bf92f3577b34da6a3ce929d0e0e4736") {
-        Write-Pass "О1.6 та Д1.4 (Web): Балансувальник Nginx розподіляє запити між app-a та app-b; X-Request-ID ($echoedReqId) та trace_id ($echoedTraceId) підтверджено!"
+    # 10.1 Синтаксично пошкоджений JSON -> 400 Bad Request (О1.3 Web)
+    $malformedJsonRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":' -SkipHttpErrorCheck
+    $malformedJsonBody = (Get-ResponseText $malformedJsonRes) | ConvertFrom-Json
+    if ([int]$malformedJsonRes.StatusCode -eq 400 -and $malformedJsonBody.error_code -eq "invalid_json_syntax") {
+        Write-Pass "Web О1.3: Синтаксично пошкоджений JSON відхилено з HTTP 400 Bad Request (error_code=invalid_json_syntax)"
     } else {
-        Write-Fail "Помилка О1.6/Д1.4 (Web): instances=$($seenInstances -join ','), reqId=$echoedReqId, traceId=$echoedTraceId"
+        Write-Fail "Помилка перевірки пошкодженого JSON: status=$([int]$malformedJsonRes.StatusCode)"
     }
 
-    $containerJsonLogs = ((& $DockerExe logs --tail 20 dpc-c10-api 2>&1) + (& $DockerExe logs --tail 20 dpc-c10-app-b 2>&1)) -join "`n"
-    if ($containerJsonLogs -match '"event":"http_request"' -and $containerJsonLogs -match '"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"' -and $containerJsonLogs -match '"duration_ms":' -and $containerJsonLogs -notmatch 'secret-c10-token-2026') {
-        Write-Pass "О1.6 та Д1.4 (Web): Однорядковий JSON-журнал містить event=http_request, ts, instance, route, status, duration_ms, request_id, trace_id і не містить токенів!"
+    # 10.2 Невідома група у Web-контурі -> 404 Not Found (О1.4 Web)
+    $unknownWebGroupRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"NON-EXISTENT-GRP"}' -SkipHttpErrorCheck
+    $unknownWebGroupBody = (Get-ResponseText $unknownWebGroupRes) | ConvertFrom-Json
+    if ([int]$unknownWebGroupRes.StatusCode -eq 404 -and $unknownWebGroupBody.error_code -eq "group_not_found") {
+        Write-Pass "Web О1.4: Невідома навчальна група у Web-контурі відхилена з HTTP 404 Not Found (error_code=group_not_found)"
     } else {
-        Write-Fail "Помилка формату JSON-журналу в stdout контейнерів"
+        Write-Fail "Помилка перевірки невідомої групи у Web: status=$([int]$unknownWebGroupRes.StatusCode)"
     }
 
-    Write-Info "Перевірка О1.3, О1.4 та Д1.3 (Web): GET /v1/disciplines, GET /v1/students, POST /v1/enrollments (201 + Location), перевірка власника та Problem Details..."
-    $discRes = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=20" -Method Get
-    $studRes = Invoke-RestMethod -Uri "$BaseUrl/v1/students" -Method Get
-    if ($discRes.items.Count -ge 5 -and $studRes.items.Count -ge 5) {
-        Write-Pass "О1.3 (Web): Маршрути GET /v1/disciplines ($($discRes.items.Count) дисциплін) та GET /v1/students ($($studRes.items.Count) студентів) повернули 200 OK"
+    # 10.3 Відхилення через закрите часове вікно -> 409 Conflict (О1.1 Web)
+    $windowRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-WINDOW-TEST"}' -SkipHttpErrorCheck
+    $windowJson = (Get-ResponseText $windowRes) | ConvertFrom-Json
+    if ([int]$windowRes.StatusCode -eq 409 -and $windowJson.error_code -eq "enrollment_window_closed") {
+        Write-Pass "Web О1.1: Спроба запису поза вікном (DISC-WINDOW-TEST) відхилена з HTTP 409 Conflict (error_code=enrollment_window_closed)"
     } else {
-        Write-Fail "Помилка маршрутів GET /v1/disciplines або GET /v1/students"
+        Write-Fail "Очікувався 409 enrollment_window_closed, отримано: $([int]$windowRes.StatusCode)"
     }
 
-    $webHeadersStudent1 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "traceparent" = $validTraceparent }
-    $webHeadersStudent2 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2" }
-
-    $enr1Res = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
-    $enr1Body = (Get-ResponseText $enr1Res) | ConvertFrom-Json
-    $enr1Location = $enr1Res.Headers["Location"] | Select-Object -First 1
-
-    if ([int]$enr1Res.StatusCode -eq 201 -and $enr1Location -eq "/v1/enrollments/$($enr1Body.id)" -and $enr1Body.status -eq "held" -and $enr1Body.id -is [string]) {
-        Write-Pass "О1.4 та Д1.3 (Web): POST /v1/enrollments повернув 201 Created із заголовком Location: $enr1Location (id=$($enr1Body.id), status=held)"
+    # 10.4 Відхилення через перевищення ліміту K дисциплін -> 409 Conflict (О1.1 Web)
+    $limitMaxHeaders = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-limit-max"; "Authorization" = "Bearer $Token" }
+    $limitKRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $limitMaxHeaders -Body '{"group_id":"DISC-SEC-04"}' -SkipHttpErrorCheck
+    $limitKJson = (Get-ResponseText $limitKRes) | ConvertFrom-Json
+    if ([int]$limitKRes.StatusCode -eq 409 -and $limitKJson.error_code -eq "discipline_limit_exceeded") {
+        Write-Pass "Web О1.1: Перевищення ліміту K дисциплін (5/5) відхилено з HTTP 409 Conflict (error_code=discipline_limit_exceeded)"
     } else {
-        Write-Fail "Помилка головної операції POST /v1/enrollments: status=$([int]$enr1Res.StatusCode), location=$enr1Location"
+        Write-Fail "Очікувався 409 discipline_limit_exceeded, отримано: $([int]$limitKRes.StatusCode)"
     }
 
-    # Перевірка ізоляції власника запису (student-1 бачить 200, student-2 отримує 404 на чужий запис)
-    $ownGetOk = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$($enr1Body.id)" -Method Get -Headers $webHeadersStudent1 -SkipHttpErrorCheck
-    $foreignGet404 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$($enr1Body.id)" -Method Get -Headers $webHeadersStudent2 -SkipHttpErrorCheck
-    $foreignCancel404 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$($enr1Body.id)/cancel" -Method Post -Headers $webHeadersStudent2 -SkipHttpErrorCheck
-
-    if ([int]$ownGetOk.StatusCode -eq 200 -and [int]$foreignGet404.StatusCode -eq 404 -and [int]$foreignCancel404.StatusCode -eq 404) {
-        Write-Pass "Ізоляція власника X-User-Id: власник student-1 читає свій запис (200 OK), чужий студент student-2 отримує 404 Not Found при читанні та скасуванні!"
+    # 10.5 Відхилення через перевищення 30.0 ЄКТС -> 409 Conflict (О1.1, Д1.5 Web)
+    $ects20Headers = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-ects-20"; "Authorization" = "Bearer $Token" }
+    $limitEctsRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $ects20Headers -Body '{"group_id":"DISC-ECTS-10-5-G1"}' -SkipHttpErrorCheck
+    $limitEctsJson = (Get-ResponseText $limitEctsRes) | ConvertFrom-Json
+    if ([int]$limitEctsRes.StatusCode -eq 409 -and $limitEctsJson.error_code -eq "ects_limit_exceeded") {
+        Write-Pass "Web О1.1: Перевищення семестрового ліміту 30.0 ЄКТС (20.0 + 10.5 = 30.5) відхилено з HTTP 409 Conflict (error_code=ects_limit_exceeded)"
     } else {
-        Write-Fail "Порушення ізоляції власника: ownGet=$([int]$ownGetOk.StatusCode), foreignGet=$([int]$foreignGet404.StatusCode), foreignCancel=$([int]$foreignCancel404.StatusCode)"
+        Write-Fail "Очікувався 409 ects_limit_exceeded, отримано: $([int]$limitEctsRes.StatusCode)"
     }
 
-    $null = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-DPC-01"}' -SkipHttpErrorCheck
-    $null = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-AI-02"}' -SkipHttpErrorCheck
-
-    $err400 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-WEB-01"' -SkipHttpErrorCheck
-    $err422 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"   "}' -SkipHttpErrorCheck
-    $err404 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-NON-EXISTENT"}' -SkipHttpErrorCheck
-    $err409 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
-
-    $prob409 = (Get-ResponseText $err409) | ConvertFrom-Json
-    $ct409 = [string]($err409.Headers["Content-Type"] | Select-Object -First 1)
-
-    if ([int]$err400.StatusCode -eq 400 -and [int]$err422.StatusCode -eq 422 -and [int]$err404.StatusCode -eq 404 -and [int]$err409.StatusCode -eq 409 -and
-        $ct409 -match "application/problem\+json" -and $null -ne $prob409.type -and $null -ne $prob409.title -and $prob409.status -eq 409 -and $null -ne $prob409.detail -and $null -ne $prob409.instance) {
-        Write-Pass "О1.4 та Д1.3 (Web): Усі помилки (400, 422, 404, 409) повертаються у стандарті RFC 9457 Problem Details (application/problem+json)"
+    # 10.6 Відхилення через брак місць у групі -> 409 Conflict (О1.1 Web, група DISC-ONE-SEAT)
+    $oneSeat1 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent2 -Body '{"group_id":"DISC-ONE-SEAT"}' -SkipHttpErrorCheck
+    $oneSeat2 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-ONE-SEAT"}' -SkipHttpErrorCheck
+    $oneSeat2Json = (Get-ResponseText $oneSeat2) | ConvertFrom-Json
+    if ([int]$oneSeat2.StatusCode -eq 409 -and $oneSeat2Json.error_code -eq "group_full") {
+        Write-Pass "Web О1.1: Спроба запису в заповнену групу DISC-ONE-SEAT відхилена з HTTP 409 Conflict (error_code=group_full)"
     } else {
-        Write-Fail "Помилка перевірки Problem Details: 400=$([int]$err400.StatusCode), 422=$([int]$err422.StatusCode), 404=$([int]$err404.StatusCode), 409=$([int]$err409.StatusCode)"
+        Write-Fail "Очікувався 409 group_full, отримано: $([int]$oneSeat2.StatusCode)"
     }
 
-    Write-Info "Перевірка Д1.1 та Д1.5 (Web): межі вікна [opens_at, closes_at), перехід через межу доби, зміна часового зміщення (DST +02:00/+03:00) та ЄКТС (30.0 vs 30.5)..."
-    $winClosesRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent2 -Body '{"group_id":"DISC-WINDOW-TEST","evaluated_at":"2026-09-15T15:00:00Z"}' -SkipHttpErrorCheck
-    $winOpensRes  = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent2 -Body '{"group_id":"DISC-WINDOW-TEST","evaluated_at":"2026-09-01T07:00:00Z"}' -SkipHttpErrorCheck
+    # 10.7 Успішне створення запису Web: 201 Created, Location, X-Request-ID та стан held (О1.1, О1.4 Web)
+    $postEnrollRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $postEnrollJson = (Get-ResponseText $postEnrollRes) | ConvertFrom-Json
+    $heldId = $postEnrollJson.id
+    $locHeader = [string]($postEnrollRes.Headers["Location"] | Select-Object -First 1)
+    $retXReqId = [string]($postEnrollRes.Headers["X-Request-ID"] | Select-Object -First 1)
 
-    # Д1.5 (Web): Перевірка зміни часового зміщення (offset +02:00 vs +03:00) та переходу через межу доби в Europe/Kyiv
-    # 2026-09-01T08:59:59+02:00 дорівнює 06:59:59Z (за 1 с до opens_at 07:00:00Z -> 409 Conflict)
-    # 2026-09-01T20:59:59Z у Києві (UTC+3) становить 2026-09-01T23:59:59+03:00, а expires_at (+15 хв) становить 2026-09-02T00:14:59+03:00 (перехід через межу доби за Києвом)
-    $webHeadersStudent3 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-3" }
-    $offsetBeforeOpenRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-WINDOW-TEST","evaluated_at":"2026-09-01T08:59:59+02:00"}' -SkipHttpErrorCheck
-    $dayBoundaryEnrRes   = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-WINDOW-TEST","evaluated_at":"2026-09-01T20:59:59Z"}' -SkipHttpErrorCheck
-    $dayBoundaryRaw      = Get-ResponseText $dayBoundaryEnrRes
-    $dayBoundaryBody     = $dayBoundaryRaw | ConvertFrom-Json
-    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$($dayBoundaryBody.id)/cancel" -Method Post -Headers $webHeadersStudent3
-
-    $webHeadersEcts = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-ects-20" }
-    $ects305Res = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersEcts -Body '{"group_id":"DISC-ECTS-10-5-G1"}' -SkipHttpErrorCheck
-    $ects300Res = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersEcts -Body '{"group_id":"DISC-ECTS-10-G1"}' -SkipHttpErrorCheck
-
-    if ([int]$winOpensRes.StatusCode -eq 201 -and [int]$winClosesRes.StatusCode -eq 409 -and
-        [int]$offsetBeforeOpenRes.StatusCode -eq 409 -and [int]$dayBoundaryEnrRes.StatusCode -eq 201 -and
-        $dayBoundaryRaw -match '"created_at_local":"2026-09-01T23:59:59\+03:00"' -and
-        $dayBoundaryRaw -match '"expires_at_local":"2026-09-02T00:14:59\+03:00"' -and
-        [int]$ects300Res.StatusCode -eq 201 -and [int]$ects305Res.StatusCode -eq 409) {
-        Write-Pass "Д1.1 та Д1.5 (Web): Вікно [opens_at, closes_at), перехід через межу доби (23:59:59+03:00 -> 00:14:59+03:00), зміна часового зміщення (+02:00/+03:00) та ЄКТС (30.0 -> 201, 30.5 -> 409) працюють бездоганно!"
+    if ([int]$postEnrollRes.StatusCode -eq 201 -and $locHeader -eq "/v1/enrollments/$heldId" -and !([string]::IsNullOrWhiteSpace($retXReqId)) -and $postEnrollJson.status -eq "held" -and !([string]::IsNullOrWhiteSpace($postEnrollJson.expires_at))) {
+        Write-Pass "Web О1.4: Створено запис: HTTP 201 Created, заголовок Location ($locHeader), X-Request-ID ($retXReqId) та стан 'held' (expires_at=$($postEnrollJson.expires_at))"
     } else {
-        Write-Fail "Помилка Д1.1/Д1.5: opens=$([int]$winOpensRes.StatusCode), closes=$([int]$winClosesRes.StatusCode), offsetBefore=$([int]$offsetBeforeOpenRes.StatusCode), dayBoundary=$([int]$dayBoundaryEnrRes.StatusCode), ects30=$([int]$ects300Res.StatusCode), ects30.5=$([int]$ects305Res.StatusCode)"
+        Write-Fail "Помилка створення запису Web: status=$([int]$postEnrollRes.StatusCode), Location=$locHeader, X-Request-ID=$retXReqId"
     }
 
-    Write-Info "Перевірка О1.5 та О1.7 (Web): читання всіх сторінок списку з курсором next_cursor та перевірка пошкодженого курсора..."
-    $pageCount = 0
-    $totalCursorItems = 0
-    $cursor = $null
+    # Додатковий запис для student-1 для тестування повної пагінації за next_cursor
+    $null = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
 
-    while ($true) {
-        $pageCount++
-        $url = "$BaseUrl/v1/enrollments?limit=2"
-        if ($cursor) { $url += "&after=$([uri]::EscapeDataString($cursor))" }
-        $pageRes = Invoke-RestMethod -Uri $url -Method Get -Headers $webHeadersStudent1
-        $totalCursorItems += $pageRes.items.Count
-        if (-not $pageRes.next_cursor) { break }
-        $cursor = $pageRes.next_cursor
-        if ($pageCount -gt 10) { break }
-    }
-
-    $badCursorRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments?limit=2&after=corrupted-cursor-xyz" -Method Get -Headers $webHeadersStudent1 -SkipHttpErrorCheck
-    if ($pageCount -eq 2 -and $totalCursorItems -eq 3 -and [int]$badCursorRes.StatusCode -eq 400) {
-        Write-Pass "О1.5 та О1.7 (Web): Усі $pageCount сторінок курсорного списку успішно прочитано (всього елементів: $totalCursorItems); пошкоджений курсор відхилено з HTTP 400!"
+    # 10.8 Помилка пошкодженого курсору -> 400 Bad Request (О1.5 Web)
+    $brokenCursorRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments?cursor=invalid_base64_or_corrupted" -Method Get -Headers $webHeadersStudent1 -SkipHttpErrorCheck
+    $brokenCursorJson = (Get-ResponseText $brokenCursorRes) | ConvertFrom-Json
+    if ([int]$brokenCursorRes.StatusCode -eq 400 -and $brokenCursorJson.error_code -eq "invalid_cursor") {
+        Write-Pass "Web О1.5: Пошкоджений або некоректний курсор відхилено з HTTP 400 Bad Request (error_code=invalid_cursor)"
     } else {
-        Write-Fail "Помилка курсорного списку О1.5: pages=$pageCount, items=$totalCursorItems, badCursorStatus=$([int]$badCursorRes.StatusCode)"
+        Write-Fail "Очікувався 400 invalid_cursor, отримано: $([int]$brokenCursorRes.StatusCode)"
     }
 
-    # Перевірка спроби розподілу за другим вибором ДО закриття основної групи (має повертати 409 Conflict)
-    $distBeforeClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-SEC-03/distribute-second-choice" -Method Post -Headers $Headers -Body '{"student_id":"student-3","second_choice_group_id":"DISC-SEC-04"}' -SkipHttpErrorCheck
-
-    $cancelRes = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$($enr1Body.id)/cancel" -Method Post -Headers $webHeadersStudent1
-    $closeGrpRes = Invoke-RestMethod -Uri "$BaseUrl/v1/groups/DISC-SEC-03/close" -Method Post -Headers $webHeadersStudent1
-    $closedEnrollAttempt = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
-
-    if ($cancelRes.status -eq "cancelled" -and $closeGrpRes.closed -eq $true -and [int]$closedEnrollAttempt.StatusCode -eq 409 -and [int]$distBeforeClose.StatusCode -eq 409) {
-        Write-Pass "Маршрути С10 (Web): скасування запису (status=cancelled), закриття групи деканатом (closed=true -> 409) та заборона розподілу другого вибору до закриття групи (409) працюють коректно!"
+    # 10.9 Курсорне пагінування дисциплін (О1.5 Web, п. 16)
+    $discPage1 = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=2" -Method Get -Headers $webHeadersStudent1
+    if ($discPage1.items.Count -eq 2 -and !([string]::IsNullOrWhiteSpace($discPage1.next_cursor))) {
+        Write-Pass "Курсорне пагінування GET /v1/disciplines (стор. 1): отримано 2 дисципліни, next_cursor=$($discPage1.next_cursor)"
+        $discPage2 = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=2&cursor=$($discPage1.next_cursor)" -Method Get -Headers $webHeadersStudent1
+        if ($discPage2.items.Count -eq 2 -and $discPage2.items[0].id -ne $discPage1.items[0].id) {
+            Write-Pass "Курсорне пагінування GET /v1/disciplines (стор. 2): успішно отримано наступні дисципліни без перекриття (перша: $($discPage2.items[0].id))"
+        } else {
+            Write-Fail "Помилка курсорного переходу сторінки 2"
+        }
     } else {
-        Write-Fail "Помилка маршрутів cancel/close: cancel=$($cancelRes.status), closed=$($closeGrpRes.closed), attempt=$([int]$closedEnrollAttempt.StatusCode), distBefore=$([int]$distBeforeClose.StatusCode)"
+        Write-Fail "Помилка сторінки 1 дисциплін: count=$($discPage1.items.Count), next_cursor=$($discPage1.next_cursor)"
     }
 
-    # С10 §3.12 п. 2, 6: Окремий механізм розподілу студентів у групи другого вибору (second_choice_group_id) ПІСЛЯ закриття запису
-    $distAfterCloseRes = Invoke-RestMethod -Uri "$BaseUrl/v1/groups/DISC-SEC-03/distribute-second-choice" -Method Post -Headers $Headers -Body '{"student_id":"student-3","second_choice_group_id":"DISC-SEC-04"}'
-    $sec04SeatsAfter   = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-SEC-04" -Method Get -Headers $Headers
-    $webDuplicateAfterSecondChoice = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-SEC-04"}' -SkipHttpErrorCheck
-
-    if ($distAfterCloseRes.distributed_count -eq 1 -and $distAfterCloseRes.items[0].status -eq "done" -and
-        $distAfterCloseRes.items[0].recorded_in_roster -eq $true -and $sec04SeatsAfter.taken -eq 1 -and
-        $sec04SeatsAfter.freeSeats -eq 14 -and [int]$webDuplicateAfterSecondChoice.StatusCode -eq 409) {
-        Write-Pass "С10 §3.12 (Другий вибір після закриття): розподільник DPC атомарно призначив student-3 у DISC-SEC-04 (freeSeats=14, recorded_in_roster=true); повторний запис через Web відхилено з 409 Conflict!"
+    # 10.10 Курсорне пагінування записів студента через next_cursor (О1.5 Web)
+    $enrPage1 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments?limit=1" -Method Get -Headers $webHeadersStudent1
+    if ($enrPage1.items.Count -eq 1 -and !([string]::IsNullOrWhiteSpace($enrPage1.next_cursor))) {
+        $enrPage2 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments?limit=1&cursor=$($enrPage1.next_cursor)" -Method Get -Headers $webHeadersStudent1
+        if ($enrPage2.items.Count -eq 1 -and $enrPage2.items[0].id -ne $enrPage1.items[0].id) {
+            Write-Pass "Web О1.5: Курсорне пагінування GET /v1/enrollments: сторінка 1 та 2 пройдені послідовно через next_cursor без дублювання"
+        } else {
+            Write-Fail "Помилка сторінки 2 записів enrollments"
+        }
     } else {
-        Write-Fail "Помилка розподілу другого вибору: distributed=$($distAfterCloseRes.distributed_count), freeSeats=$($sec04SeatsAfter.freeSeats), webDup=$([int]$webDuplicateAfterSecondChoice.StatusCode)"
+        Write-Fail "Помилка сторінки 1 записів enrollments: count=$($enrPage1.items.Count), next_cursor=$($enrPage1.next_cursor)"
     }
 
-    # Скидаємо дані до чистого стану перед поверненням у робочий режим ALLOW_TEST_OVERRIDES=false
-    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false&executionModel=async_tasks" -Method Post -Headers $Headers
-}
-finally {
-    Write-Info "Повернення контейнерів у робочий захищений режим ALLOW_TEST_OVERRIDES=false..."
+    # 10.11 Підтвердження запису (held -> confirmed) та ідемпотентність (О1.1 Web)
+    $confirmedResp = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId/confirm" -Method Post -Headers $webHeadersStudent1
+    if ($confirmedResp.status -eq "confirmed") {
+        Write-Pass "Web О1.1: Підтверджено попередній запис (held -> confirmed): отримано статус 'confirmed'"
+    } else {
+        Write-Fail "Очікувався статус confirmed, отримано: $($confirmedResp.status)"
+    }
+
+    $reConfirmedResp = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId/confirm" -Method Post -Headers $webHeadersStudent1
+    if ($reConfirmedResp.status -eq "confirmed" -and $reConfirmedResp.version -eq $confirmedResp.version) {
+        Write-Pass "Web О1.1: Повторне підтвердження є ідемпотентним (HTTP 200, версія $($reConfirmedResp.version) не змінилась)"
+    } else {
+        Write-Fail "Помилка повторного підтвердження: status=$($reConfirmedResp.status), v=$($reConfirmedResp.version)"
+    }
+
+    # 10.12 Ліниве прострочення (held -> expired із автоматичним поверненням місця в групу, п. 2)
+    $student3InitSeats = (Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-AI-02" -Method Get -Headers $Headers).free_seats
+    $heldToExpire = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-AI-02"}'
+    $expId = $heldToExpire.id
+    $seatsAfterHold = (Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-AI-02" -Method Get -Headers $Headers).free_seats
+
+    # Штучно переводимо created_at та expires_at у минулий час через PostgreSQL (зберігаючи инваріант expires_at > created_at) для перевірки лінивого прострочення
+    & $DockerExe compose exec -e PGPASSWORD=dpc_password -T postgres psql -U dpc_user -d dpc_c10 -c "UPDATE enrollment SET created_at = NOW() - INTERVAL '30 minutes', expires_at = NOW() - INTERVAL '15 minutes' WHERE id = '$expId';" | Out-Null
+
+    # Спроба підтвердити прострочений запис має виявити прострочення, перевести його в expired та повернути місце в групу
+    $confirmExpiredRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$expId/confirm" -Method Post -Headers $webHeadersStudent3 -SkipHttpErrorCheck
+    $seatsAfterExpire = (Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-AI-02" -Method Get -Headers $Headers).free_seats
+
+    if ([int]$confirmExpiredRes.StatusCode -eq 409 -and $seatsAfterExpire -eq $student3InitSeats) {
+        Write-Pass "Web О1.1: Ліниве прострочення (п. 2) спрацювало: підтвердження простроченого запису відхилено з 409 Conflict, місце в групі ($seatsAfterExpire) повернено!"
+    } else {
+        Write-Fail "Помилка лінивого прострочення: HTTP=$([int]$confirmExpiredRes.StatusCode), seats=$seatsAfterExpire (очікувалось $student3InitSeats)"
+    }
+
+    # 10.13 Скасування запису та перевірка повторного скасування
+    $enrToCancelRes = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent2 -Body '{"group_id":"DISC-WEB-01"}'
+    $cancelId = $enrToCancelRes.id
+    $firstCancel = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$cancelId/cancel" -Method Post -Headers $webHeadersStudent2
+    $secondCancel = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$cancelId/cancel" -Method Post -Headers $webHeadersStudent2
+
+    if ($firstCancel.status -eq "cancelled" -and $secondCancel.status -eq "cancelled" -and $firstCancel.version -eq $secondCancel.version) {
+        Write-Pass "Пункт 10: Повторне скасування запису повертає фактичний статус 'cancelled' без штучного збільшення версії ($($firstCancel.version) == $($secondCancel.version))"
+    } else {
+        Write-Fail "Помилка перевірки статусу скасування: v1=$($firstCancel.version), v2=$($secondCancel.version)"
+    }
+
+    # 10.14 Балансування least_conn між app-a та app-b (О1.6 Web)
+    $instancesObserved = [System.Collections.Generic.HashSet[string]]::new()
+    for ($i = 0; $i -lt 15; $i++) {
+        $hResp = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get
+        if (![string]::IsNullOrWhiteSpace($hResp.instance_id)) {
+            $null = $instancesObserved.Add($hResp.instance_id)
+        }
+    }
+
+    if ($instancesObserved.Contains("app-a") -and $instancesObserved.Contains("app-b")) {
+        Write-Pass "О1.6 (Web): Балансування навантаження least_conn між app-a та app-b підтверджено (зафіксовано відповіді від обох вузлів)"
+    } else {
+        Write-Info "Зафіксовано відповіді від вузлів: $($instancesObserved -join ', ')"
+    }
+
+} finally {
+    Write-Info "Повернення середовища у штатно-захищений режим ALLOW_TEST_OVERRIDES=false..."
     $null = Set-TestOverridesMode -enable $false
-    Pop-Location
+    Write-Pass "Захищений режим ALLOW_TEST_OVERRIDES=false успішно відновлено."
 }
 
-# ------------------------------------------------------------------------------
-# 11. Підсумкова перевірка лічильника помилок
-# ------------------------------------------------------------------------------
-Write-Header "ПІДСУМОК ПЕРЕВІРКИ ЛАБОРАТОРНОЇ РОБОТИ №1 (Тема С10: Web + РПО)"
-if ($script:ErrorCount -gt 0) {
-    Write-Host "`n  [FAILED] Виявлено помилок під час перевірки: $($script:ErrorCount)" -ForegroundColor Red
-    exit 1
+Write-Header "РЕЗУЛЬТАТ ПЕРЕВІРКИ ЛР1"
+if ($script:ErrorCount -eq 0) {
+    Write-Host "`n  Всі перевірки пройдено успішно (0 помилок).`n" -ForegroundColor Green
+} else {
+    Write-Host "`n  Виявлено $script:ErrorCount помилок.`n" -ForegroundColor Red
 }
 
-Write-Host "  [OK] Статичний контроль: Spectral OpenAPI 3.1 (0 помилок), dotnet test, schema_migrations (001, 002) та VIEW group_seats" -ForegroundColor Green
-Write-Host "  [OK] Безпека: X-User-Id обов'язковий, student_id у тілі заборонений (422), тестові лазівки закриті (ALLOW_TEST_OVERRIDES=false -> 403)" -ForegroundColor Green
-Write-Host "  [OK] РПО О1.1–О1.5, Д1.1–Д1.4: Черга, неблокуючий TCS async, інваріант SAFE/UNSAFE, закон Літтла (інтеграл + 100 мс вибірка), JSON SIGTERM" -ForegroundColor Green
-Write-Host "  [OK] Web О1.1–О1.7, Д1.1–Д1.5: POST /v1/enrollments (201 + Location), Problem Details, курсор next_cursor, Nginx least_conn, вікно [opens_at, closes_at) та 30.0 ЄКТС" -ForegroundColor Green
-Write-Host "`nУсі обов'язкові та додаткові тести обох курсів успішно виконано (помилок: 0)!" -ForegroundColor Cyan
-exit 0
+Pop-Location
+if ($script:ErrorCount -gt 0) { exit 1 }

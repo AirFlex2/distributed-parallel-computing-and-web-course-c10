@@ -28,16 +28,6 @@ public sealed class RequestIdentityMiddleware
         context.Items["RequestId"] = requestId;
         context.Response.Headers["X-Request-ID"] = requestId;
         context.Response.Headers["X-Instance-Id"] = _options.InstanceId;
-        context.Response.Headers["Access-Control-Allow-Origin"] = "*";
-        context.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
-        context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-User-Id, X-Request-ID, traceparent, X-Simulated-Now";
-        context.Response.Headers["Access-Control-Expose-Headers"] = "Location, X-Request-ID, X-Instance-Id, X-Trace-Id, Retry-After";
-
-        if (HttpMethods.IsOptions(context.Request.Method))
-        {
-            context.Response.StatusCode = StatusCodes.Status204NoContent;
-            return;
-        }
 
         string? traceId = null;
         if (EnrollmentDomainRules.TryExtractTraceId(context.Request.Headers["traceparent"].ToString(), out string? parsedTraceId))

@@ -1,6 +1,9 @@
+using System.IO;
 using EnrollmentService;
+using EnrollmentService.Http;
 using EnrollmentService.Queues;
 using EnrollmentService.Services;
+using Microsoft.AspNetCore.Http;
 using Xunit;
 
 namespace EnrollmentService.Tests;
@@ -31,7 +34,7 @@ public sealed class DomainAndQueueTests
         Assert.False(EnrollmentDomainRules.IsWithinEnrollmentWindow(closesAt, opensAt, closesAt));
     }
 
-    // Web Д1.5: Чиста функція перевірки точних кредитів ЄКТС (decimal / numeric(4,1), <= 30.0)
+    // Web Д1.5: Чиста функція перевірки точних кредитів ЄКТС (decimal / numeric(3,1), <= 30.0)
     [Fact]
     public void CanEnrollWithEcts_AllowsExact30AndRejects30Point5()
     {
@@ -210,5 +213,289 @@ public sealed class DomainAndQueueTests
         Assert.Equal(item1.Id, d1?.Id);
         Assert.Equal(item2.Id, d2?.Id);
         Assert.Null(dEnd);
+    }
+
+    // Web Д1.3: Одне правило RFC 9457 (Problem Details for HTTP APIs) як автоматизований тест
+    // Перевіряє, що відповідь містить Content-Type application/problem+json,
+    // поле 'status' чисельно дорівнює коду HTTP, а 'type' є валідним URI.
+    [Theory]
+    [InlineData(400, "invalid_json", "Синтаксична помилка JSON")]
+    [InlineData(400, "invalid_request_id_format", "Некоректний формат ідентифікатора заявки")]
+    [InlineData(404, "route_not_found", "Маршрут не знайдено")]
+    [InlineData(404, "group_not_found", "Групу не знайдено")]
+    [InlineData(405, "method_not_allowed", "HTTP-метод не підтримується")]
+    [InlineData(409, "ects_limit_exceeded", "Перевищено ліміт ЄКТС")]
+    [InlineData(422, "missing_required_fields", "Помилка валідації полів")]
+    [InlineData(503, "service_shutting_down", "Сервіс завершує роботу")]
+    public void Web_D13_Rfc9457_ProblemDetails_ContractCompliance(int statusCode, string errorCode, string title)
+    {
+        var httpContext = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        httpContext.Request.Path = "/v1/test-endpoint";
+        httpContext.Items["RequestId"] = "req-test-123";
+
+        var opts = new ServiceOptions { InstanceId = "app-test" };
+        var result = EnrollmentService.Http.ProblemDetailsMapper.CreateProblemResult(
+            httpContext, opts, statusCode, title, "Тестовий опис проблеми згідно з RFC 9457.", errorCode);
+
+        var problemHttpResult = Assert.IsAssignableFrom<Microsoft.AspNetCore.Http.IContentTypeHttpResult>(result);
+        Assert.Equal("application/problem+json", problemHttpResult.ContentType);
+
+        var statusCodeResult = Assert.IsAssignableFrom<Microsoft.AspNetCore.Http.IStatusCodeHttpResult>(result);
+        Assert.Equal(statusCode, statusCodeResult.StatusCode);
+
+        var valueResult = Assert.IsAssignableFrom<Microsoft.AspNetCore.Http.IValueHttpResult>(result);
+        var problem = Assert.IsAssignableFrom<Microsoft.AspNetCore.Mvc.ProblemDetails>(valueResult.Value);
+
+        Assert.Equal(statusCode, problem.Status);
+        Assert.Equal(title, problem.Title);
+        Assert.Equal("Тестовий опис проблеми згідно з RFC 9457.", problem.Detail);
+        Assert.StartsWith("https://urn.c10.edu.ua/problems/", problem.Type);
+        Assert.Equal("/v1/test-endpoint", problem.Instance);
+    }
+
+    // Спільна предметна політика (п. 13): Єдине правило перевірки запису для Web та РПО
+    [Fact]
+    public void EnrollmentPolicy_UnifiedCheck_CorrectlyValidatesAllConditions()
+    {
+        var now = DateTimeOffset.Parse("2026-09-05T12:00:00Z");
+        var open = now.AddDays(-2);
+        var close = now.AddDays(2);
+
+        var validStudent = new EnrollmentService.Domain.StudentEntity("s-1", "s@test.com", "Test Student", 5, 2, 10.0m);
+        var validGroup = new EnrollmentService.Domain.DisciplineGroupEntity("g-1", "d-1", "G1", 20, 5, open, close, "Europe/Kyiv", false, 5.0m);
+
+        // 1. Успішний запис
+        var okResult = EnrollmentService.Domain.EnrollmentPolicy.Check(validStudent, validGroup, 5.0m, now, alreadyEnrolledForDiscipline: false);
+        Assert.True(okResult.Allowed);
+
+        // 2. Закрита група
+        var closedGroup = validGroup with { Closed = true };
+        var closedResult = EnrollmentService.Domain.EnrollmentPolicy.Check(validStudent, closedGroup, 5.0m, now, false);
+        Assert.False(closedResult.Allowed);
+        Assert.Equal("group_closed", closedResult.ErrorCode);
+
+        // 3. Поза вікном
+        var windowResult = EnrollmentService.Domain.EnrollmentPolicy.Check(validStudent, validGroup, 5.0m, close.AddMinutes(1), false);
+        Assert.False(windowResult.Allowed);
+        Assert.Equal("enrollment_window_closed", windowResult.ErrorCode);
+
+        // 4. Повторний запис на ту саму дисципліну
+        var dupResult = EnrollmentService.Domain.EnrollmentPolicy.Check(validStudent, validGroup, 5.0m, now, alreadyEnrolledForDiscipline: true);
+        Assert.False(dupResult.Allowed);
+        Assert.Equal("duplicate_discipline_enrollment", dupResult.ErrorCode);
+
+        // 5. Перевищення ліміту K дисциплін
+        var maxCountStudent = validStudent with { ActiveCount = 5, MaxDisciplines = 5 };
+        var countResult = EnrollmentService.Domain.EnrollmentPolicy.Check(maxCountStudent, validGroup, 5.0m, now, false);
+        Assert.False(countResult.Allowed);
+        Assert.Equal("discipline_limit_exceeded", countResult.ErrorCode);
+
+        // 6. Перевищення 30 ЄКТС
+        var maxEctsStudent = validStudent with { ActiveEcts = 26.0m };
+        var ectsResult = EnrollmentService.Domain.EnrollmentPolicy.Check(maxEctsStudent, validGroup, 5.0m, now, false);
+        Assert.False(ectsResult.Allowed);
+        Assert.Equal("ects_limit_exceeded", ectsResult.ErrorCode);
+
+        // 7. Відсутність вільних місць у групі
+        var fullGroup = validGroup with { Available = 0 };
+        var fullResult = EnrollmentService.Domain.EnrollmentPolicy.Check(validStudent, fullGroup, 5.0m, now, false);
+        Assert.False(fullResult.Allowed);
+        Assert.Equal("group_full", fullResult.ErrorCode);
+    }
+
+    // РПО: Перевірка життєвого циклу резервування слотів у чергах (MonitorRequestQueue та ChannelRequestQueue)
+    [Fact]
+    public void RequestQueue_SlotReservationLifecycle_TracksAvailableCapacityCorrectly()
+    {
+        var monitorQueue = new MonitorRequestQueue(capacity: 2);
+        Assert.True(monitorQueue.TryReserveSlot());
+        Assert.True(monitorQueue.TryReserveSlot());
+        Assert.False(monitorQueue.TryReserveSlot()); // capacity exhausted
+
+        // Звільнення слота при помилці/відмові
+        monitorQueue.ReleaseSlot();
+        Assert.True(monitorQueue.TryReserveSlot());
+
+        var item = new QueuedRequestItem
+        {
+            Id = Guid.NewGuid(),
+            StudentId = "student-1",
+            GroupId = "DISC-DPC-01",
+            CreatedAtUtc = DateTimeOffset.UtcNow
+        };
+        // Постановка у зарезервований слот
+        Assert.True(monitorQueue.EnqueueReserved(item));
+        Assert.Equal(1, monitorQueue.Count);
+
+        var channelQueue = new ChannelRequestQueue(capacity: 2);
+        Assert.True(channelQueue.TryReserveSlot());
+        Assert.True(channelQueue.TryReserveSlot());
+        Assert.False(channelQueue.TryReserveSlot());
+
+        channelQueue.ReleaseSlot();
+        Assert.True(channelQueue.TryReserveSlot());
+        Assert.True(channelQueue.EnqueueReserved(item));
+        Assert.Equal(1, channelQueue.Count);
+    }
+
+    // РПО Д1.2: Перевірка накопичення метрик для закону Літтла без втрати історії
+    [Fact]
+    public void MetricsCollector_LittlesLawAccumulators_MaintainsCorrectSumsAndAverages()
+    {
+        var metrics = new EnrollmentService.Metrics.MetricsCollector();
+        var opts = new ServiceOptions { QueueCapacity = 10, Workers = 2 };
+
+        metrics.ResetMeasurementWindow(currentQueueLength: 0);
+
+        // Імітація періодичних незалежних вибірок (більше 500 вибірок)
+        // 600 вибірок по (0, 1, 2, 3, 4) повторюються 120 разів. Сума = 120 * 10 = 1200, середнє = 2.0, max = 4.
+        for (int i = 0; i < 600; i++)
+        {
+            metrics.RecordIndependentPeriodicSample(i % 5);
+        }
+
+        object snapshotObj = metrics.BuildMetricsSnapshot(0, opts, false);
+        Assert.NotNull(snapshotObj);
+
+        var json = System.Text.Json.JsonSerializer.Serialize(snapshotObj);
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var littlesLaw = doc.RootElement.GetProperty("littles_law");
+
+        Assert.Equal(600, littlesLaw.GetProperty("independent_sample_count").GetInt32());
+        Assert.Equal(2.0, littlesLaw.GetProperty("l_observed_independent_sampled").GetDouble());
+        Assert.Equal(4, littlesLaw.GetProperty("max_queue_length_observed").GetInt32());
+    }
+
+    // РПО Д1.1 та Д1.3: Перевірка ChannelRequestQueue з кількома паралельними воркерами (перевірка while на WaitToReadAsync)
+    [Fact]
+    public async Task ChannelRequestQueue_MultipleWorkers_ProcessesAllItemsWithoutPrematureExit()
+    {
+        var queue = new ChannelRequestQueue(capacity: 50);
+        int workerCount = 4;
+        int totalItems = 30;
+        var processed = new System.Collections.Concurrent.ConcurrentBag<Guid>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var workers = Enumerable.Range(0, workerCount).Select(async _ =>
+        {
+            while (true)
+            {
+                var item = await queue.DequeueAsync(cts.Token);
+                if (item == null) break;
+                processed.Add(item.Id);
+                await Task.Yield();
+            }
+        }).ToArray();
+
+        for (int i = 0; i < totalItems; i++)
+        {
+            var item = new QueuedRequestItem
+            {
+                Id = Guid.NewGuid(),
+                StudentId = $"student-{i}",
+                GroupId = "DISC-DPC-01",
+                CreatedAtUtc = DateTimeOffset.UtcNow
+            };
+            Assert.True(queue.TryEnqueue(item));
+            if (i % 5 == 0) await Task.Delay(5);
+        }
+
+        queue.Complete();
+        await Task.WhenAll(workers);
+
+        Assert.Equal(totalItems, processed.Count);
+    }
+
+    // О1.5: Перевірка коректності вимірювання delivery_wait_ms при першому читанні ДО фіксації завершення обробки
+    [Fact]
+    public void MetricsCollector_FirstReadBeforeWorkerFinished_CorrectlyRecordsDeliverySample()
+    {
+        var metrics = new EnrollmentService.Metrics.MetricsCollector();
+        var opts = new ServiceOptions { QueueCapacity = 10, Workers = 2 };
+        var id = Guid.NewGuid();
+
+        var item = new QueuedRequestItem
+        {
+            Id = id,
+            StudentId = "student-1",
+            GroupId = "DISC-DPC-01",
+            CreatedAtUtc = DateTimeOffset.UtcNow
+        };
+
+        metrics.RecordAccepted(item, currentQueueLength: 1);
+        metrics.RecordWorkerStarted(item, currentQueueLength: 0);
+
+        // 1. Клієнт встигає прочитати статус з БД через GET ДО виклику MarkProcessingFinished воркером
+        metrics.RecordFirstReadIfCompleted(id);
+
+        // 2. Воркер встановлює відмітку завершення
+        metrics.MarkProcessingFinished(item);
+        metrics.RecordWorkerFinished(item, "done", currentQueueLength: 0);
+
+        // Перевіряємо, що таймінги зафіксовані коректно, delivery не null і >= 0
+        var (qWait, proc, deliv) = metrics.GetItemTimings(id);
+        Assert.NotNull(qWait);
+        Assert.NotNull(proc);
+        Assert.NotNull(deliv);
+        Assert.True(deliv >= 0.0);
+
+        // Перевіряємо, що в загальному знімку метрик delivery_wait_ms має sample_count = 1
+        var snapshot = metrics.BuildMetricsSnapshot(0, opts, false);
+        var json = System.Text.Json.JsonSerializer.Serialize(snapshot);
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var deliveryWait = doc.RootElement.GetProperty("intervals_ms").GetProperty("delivery_wait_ms");
+        Assert.Equal(1, deliveryWait.GetProperty("sample_count").GetInt32());
+    }
+
+    // Д1.4: Перевірка обов'язкового Bearer-токена для /metrics та /v1/groups/{id}/close
+    [Fact]
+    public async Task BearerAuthMiddleware_EnforcesTokenOnMetricsAndGroupClose()
+    {
+        var opts = new ServiceOptions { ApiAuthToken = "test-token-123" };
+        var nextCalled = false;
+        RequestDelegate next = (ctx) => { nextCalled = true; return Task.CompletedTask; };
+        var middleware = new BearerAuthMiddleware(next, opts);
+
+        // 1. /metrics без токена -> 401 Unauthorized
+        var ctx1 = new DefaultHttpContext();
+        ctx1.Request.Path = "/metrics";
+        ctx1.Response.Body = new MemoryStream();
+        await middleware.InvokeAsync(ctx1);
+        Assert.False(nextCalled);
+        Assert.Equal(StatusCodes.Status401Unauthorized, ctx1.Response.StatusCode);
+
+        // 2. /metrics з недійсним токеном -> 401 Unauthorized
+        nextCalled = false;
+        var ctx2 = new DefaultHttpContext();
+        ctx2.Request.Path = "/metrics";
+        ctx2.Request.Headers.Authorization = "Bearer wrong-token";
+        ctx2.Response.Body = new MemoryStream();
+        await middleware.InvokeAsync(ctx2);
+        Assert.False(nextCalled);
+        Assert.Equal(StatusCodes.Status401Unauthorized, ctx2.Response.StatusCode);
+
+        // 3. /metrics з валідним токеном -> доступ дозволено (виклик наступного middleware)
+        nextCalled = false;
+        var ctx3 = new DefaultHttpContext();
+        ctx3.Request.Path = "/metrics";
+        ctx3.Request.Headers.Authorization = "Bearer test-token-123";
+        await middleware.InvokeAsync(ctx3);
+        Assert.True(nextCalled);
+
+        // 4. /v1/groups/DISC-01/close без токена -> 401 Unauthorized
+        nextCalled = false;
+        var ctx4 = new DefaultHttpContext();
+        ctx4.Request.Path = "/v1/groups/DISC-01/close";
+        ctx4.Response.Body = new MemoryStream();
+        await middleware.InvokeAsync(ctx4);
+        Assert.False(nextCalled);
+        Assert.Equal(StatusCodes.Status401Unauthorized, ctx4.Response.StatusCode);
+
+        // 5. /health без токена -> доступ дозволено без автентифікації
+        nextCalled = false;
+        var ctx5 = new DefaultHttpContext();
+        ctx5.Request.Path = "/health";
+        await middleware.InvokeAsync(ctx5);
+        Assert.True(nextCalled);
     }
 }

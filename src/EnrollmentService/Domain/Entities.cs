@@ -19,7 +19,6 @@ public sealed record DisciplineGroupEntity(
     DateTimeOffset ClosesAt,
     string UniversityTz,
     bool Closed,
-    bool AllowOvercommitUnsafe,
     decimal DisciplineEcts = 0.0m
 );
 
@@ -28,12 +27,4 @@ public sealed record DisciplineEntity(
     string Code,
     string Title,
     decimal Ects
-);
-
-public sealed record GroupSeatEntity(
-    string GroupId,
-    string DisciplineTitle,
-    int Seats,
-    int Taken,
-    int RosterCount
 );

@@ -34,17 +34,16 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddRepositories(this IServiceCollection services)
     {
-        services.AddSingleton<IGroupRepository, GroupRepository>();
-        services.AddSingleton<IEnrollmentRepository, EnrollmentRepository>();
-        services.AddSingleton<IEnrollmentRequestRepository, EnrollmentRequestRepository>();
-        services.AddSingleton<IDecanateRepository, DecanateRepository>();
+        services.AddSingleton<GroupRepository>();
+        services.AddSingleton<EnrollmentRepository>();
+        services.AddSingleton<EnrollmentRequestRepository>();
+        services.AddSingleton<DecanateRepository>();
         return services;
     }
 
     public static IServiceCollection AddApplicationServices(this IServiceCollection services)
     {
-        services.AddSingleton<IEnrollmentService, Services.EnrollmentService>();
-        services.AddSingleton<ISecondChoiceDistributor, SecondChoiceDistributor>();
+        services.AddSingleton<EnrollmentService.Services.EnrollmentService>();
         return services;
     }
 
@@ -52,15 +51,13 @@ public static class ServiceCollectionExtensions
         this IServiceCollection services,
         bool migrateOnly)
     {
-        services.AddSingleton<ISlowOperationSimulator, SlowOperationSimulator>();
-        services.AddSingleton<ISafeEnrollmentProcessor, SafeEnrollmentProcessor>();
-        services.AddSingleton<IUnsafeEnrollmentProcessor, UnsafeEnrollmentProcessor>();
-        services.AddSingleton<IEnrollmentRequestProcessor, EnrollmentRequestProcessor>();
+        services.AddSingleton<EnrollmentRequestProcessor>();
         services.AddSingleton<EnrollmentWorkerPool>();
 
         if (!migrateOnly)
         {
             services.AddHostedService(sp => sp.GetRequiredService<EnrollmentWorkerPool>());
+            services.AddHostedService<HeldEnrollmentExpirationBackgroundService>();
         }
 
         return services;

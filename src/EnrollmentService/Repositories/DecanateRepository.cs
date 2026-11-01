@@ -2,7 +2,7 @@ using Npgsql;
 
 namespace EnrollmentService.Repositories;
 
-public sealed class DecanateRepository : IDecanateRepository
+public sealed class DecanateRepository
 {
     private readonly IDbConnectionFactory _connectionFactory;
 
@@ -23,67 +23,6 @@ public sealed class DecanateRepository : IDecanateRepository
 
         var obj = await cmd.ExecuteScalarAsync(cancellationToken);
         return obj as string;
-    }
-
-    public async Task<(string GroupId, Guid? EnrollmentId)?> GetRosterAssignmentForRequestAsync(
-        Guid requestId,
-        NpgsqlConnection conn,
-        NpgsqlTransaction? tx = null,
-        CancellationToken cancellationToken = default)
-    {
-        await using var cmd = new NpgsqlCommand(
-            "SELECT group_id, enrollment_id FROM decanate_roster WHERE request_id = @requestId;", conn, tx);
-        cmd.Parameters.AddWithValue("requestId", requestId);
-
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-        {
-            return null;
-        }
-
-        string grp = reader.GetString(0);
-        Guid? enrId = reader.IsDBNull(1) ? null : reader.GetGuid(1);
-        return (grp, enrId);
-    }
-
-    public async Task<(bool AlreadyInRoster, int OtherDisciplineCount, decimal OtherEcts)> GetStudentRosterStatsAsync(
-        string studentId,
-        string disciplineId,
-        NpgsqlConnection conn,
-        NpgsqlTransaction? tx = null,
-        CancellationToken cancellationToken = default)
-    {
-        await using var cmd = new NpgsqlCommand(@"
-            SELECT
-                EXISTS(SELECT 1 FROM decanate_roster WHERE student_id = @studentId AND discipline_id = @disciplineId),
-                COUNT(DISTINCT discipline_id)::INT,
-                COALESCE(SUM(ects), 0.0)
-            FROM decanate_roster
-            WHERE student_id = @studentId AND discipline_id <> @disciplineId;", conn, tx);
-        cmd.Parameters.AddWithValue("studentId", studentId);
-        cmd.Parameters.AddWithValue("disciplineId", disciplineId);
-
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-        {
-            return (false, 0, 0.0m);
-        }
-
-        return (reader.GetBoolean(0), reader.GetInt32(1), reader.GetDecimal(2));
-    }
-
-    public async Task<int> GetGroupRosterCountAsync(
-        string groupId,
-        NpgsqlConnection conn,
-        NpgsqlTransaction? tx = null,
-        CancellationToken cancellationToken = default)
-    {
-        await using var cmd = new NpgsqlCommand(
-            "SELECT COUNT(*)::INT FROM decanate_roster WHERE group_id = @groupId;", conn, tx);
-        cmd.Parameters.AddWithValue("groupId", groupId);
-
-        var val = await cmd.ExecuteScalarAsync(cancellationToken);
-        return Convert.ToInt32(val);
     }
 
     public async Task InsertRosterEntryAsync(
@@ -117,25 +56,6 @@ public sealed class DecanateRepository : IDecanateRepository
         });
         cmd.Parameters.AddWithValue("assignmentType", assignmentType);
         cmd.Parameters.AddWithValue("createdAt", createdAt);
-
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    public async Task DeleteRosterEntryForEnrollmentAsync(
-        Guid enrollmentId,
-        string studentId,
-        string groupId,
-        NpgsqlConnection conn,
-        NpgsqlTransaction tx,
-        CancellationToken cancellationToken = default)
-    {
-        await using var cmd = new NpgsqlCommand(@"
-            DELETE FROM decanate_roster
-            WHERE enrollment_id = @enrollmentId
-               OR (student_id = @studentId AND group_id = @groupId);", conn, tx);
-        cmd.Parameters.AddWithValue("enrollmentId", enrollmentId);
-        cmd.Parameters.AddWithValue("studentId", studentId);
-        cmd.Parameters.AddWithValue("groupId", groupId);
 
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
