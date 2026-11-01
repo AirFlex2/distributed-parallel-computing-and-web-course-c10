@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using EnrollmentService.Repositories;
 using EnrollmentService.Services;
 using Npgsql;
@@ -7,12 +8,10 @@ namespace EnrollmentService.Tests;
 
 public static class TestEnvironment
 {
-    private static readonly Lazy<string> CachedConnectionString = new(ResolveConnectionString);
-    private static readonly Lazy<string> CachedApiToken = new(ResolveApiToken);
     private static readonly Lazy<Task> DatabaseReadyTask = new(InitializeTestDatabaseAsync);
 
-    public static string ConnectionString => CachedConnectionString.Value;
-    public static string ApiAuthToken => CachedApiToken.Value;
+    public static string ConnectionString => ResolveConnectionString();
+    public static string ApiAuthToken => ResolveApiToken();
 
     public static Task EnsureTestDatabaseReadyAsync() => DatabaseReadyTask.Value;
 
@@ -52,7 +51,7 @@ public static class TestEnvironment
         return "Host=localhost;Port=5432;Database=dpc_c10_test;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50";
     }
 
-    private static void ValidateTestConnectionString(string connStr)
+    public static void ValidateTestConnectionString(string connStr)
     {
         var builder = new NpgsqlConnectionStringBuilder(connStr);
         string host = (builder.Host ?? "").Trim().ToLowerInvariant();
@@ -66,18 +65,41 @@ public static class TestEnvironment
                 "Запуск інтеграційних тестів із модифікацією та очищенням даних на цій БД суворо заборонено!");
         }
 
-        // Перевірка дозволу примусового обходу виключно для спеціалізованого CI-сценарію
-        bool isCiOverride = bool.TryParse(Environment.GetEnvironmentVariable("TEST_ALLOW_UNSAFE_DB_OVERRIDE"), out var allow) && allow;
+        // Перевірка обходу TEST_ALLOW_UNSAFE_DB_OVERRIDE: доступний виключно в явно контрольованому CI-окруженні (CI=true / GITHUB_ACTIONS=true)
+        bool hasOverrideFlag = bool.TryParse(Environment.GetEnvironmentVariable("TEST_ALLOW_UNSAFE_DB_OVERRIDE"), out var allow) && allow;
+        bool isCiEnvironment = string.Equals(Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Environment.GetEnvironmentVariable("GITLAB_CI"), "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Environment.GetEnvironmentVariable("TF_BUILD"), "True", StringComparison.OrdinalIgnoreCase);
 
-        // 2. Тестове підключення суворо вимагає явного маркера тестової БД ('test' у назві, наприклад 'dpc_c10_test'),
-        // а не просто локального хоста. Локальний хост сам по собі не захищає від перезапису основної БД dpc_c10.
-        bool isExplicitTestDb = db.Contains("test");
-        if (!isExplicitTestDb && !isCiOverride)
+        if (hasOverrideFlag && !isCiEnvironment)
         {
             throw new InvalidOperationException(
-                $"[CRITICAL SAFETY ERROR]: База даних '{builder.Database}' не має обов'язкового маркера тестової БД ('test' у назві, наприклад 'dpc_c10_test'). " +
-                $"Сам лише локальний хост '{builder.Host}' не доводить, що база є тестовою. " +
-                "Інтеграційні та E2E-тести вимагають окремої виділеної тестової бази даних для запобігання пошкодженню основної бази розробки або експлуатації.");
+                "[CRITICAL SAFETY ERROR]: Обхід TEST_ALLOW_UNSAFE_DB_OVERRIDE дозволений виключно в автоматизованому CI-окруженні " +
+                "(змінні CI=true або GITHUB_ACTIONS=true) і суворо заборонений для звичайної локальної розробки.");
+        }
+
+        bool isCiOverride = hasOverrideFlag && isCiEnvironment;
+
+        // 2. Сувора перевірка імені тестової БД:
+        // Вимагається точне ім'я 'dpc_c10_test' або встановлений формат 'dpc_c10_test_<суфікс>'
+        bool isExactTestDb = string.Equals(db, "dpc_c10_test", StringComparison.OrdinalIgnoreCase)
+            || Regex.IsMatch(db, @"^dpc_c10_test(_[a-z0-9_]+)?$");
+
+        if (!isExactTestDb && !isCiOverride)
+        {
+            throw new InvalidOperationException(
+                $"[CRITICAL SAFETY ERROR]: База даних '{builder.Database}' не відповідає строго встановленому формату тестової БД ('dpc_c10_test'). " +
+                $"Підключення до '{builder.Database}' (у тому числі до основної БД 'dpc_c10' або довільних баз) суворо заборонено.");
+        }
+
+        // 3. Захист хоста: якщо немає явного CI-обходу, хост має бути локальним
+        bool isLocalHost = host is "localhost" or "127.0.0.1" or "::1" or "dpc-c10-postgres" or "postgres";
+        if (!isLocalHost && !isCiOverride)
+        {
+            throw new InvalidOperationException(
+                $"[CRITICAL SAFETY ERROR]: Хост '{builder.Host}' не є локальним або дозволеним контейнерним хостом. " +
+                "Інтеграційні тести дозволено запускати лише локально або у виділеному CI-оточенні.");
         }
     }
 
@@ -123,19 +145,31 @@ public static class TestEnvironment
         await initializer.InitializeAsync();
     }
 
-    private static async Task EnsureDatabaseCreatedAsync()
+    public static async Task EnsureDatabaseCreatedAsync(string? connectionString = null)
     {
-        var builder = new NpgsqlConnectionStringBuilder(ConnectionString);
-        string targetDb = builder.Database ?? "dpc_c10_test";
-        string ownerUser = builder.Username ?? "dpc_user";
+        string connStr = connectionString ?? ConnectionString;
+        var builder = new NpgsqlConnectionStringBuilder(connStr);
+        string targetDb = (builder.Database ?? "dpc_c10_test").Trim();
+        string ownerUser = (builder.Username ?? "dpc_user").Trim();
+
+        if (!Regex.IsMatch(targetDb, @"^[a-zA-Z0-9_]+$"))
+        {
+            throw new ArgumentException($"Некоректне ім'я цільової тестової бази даних: '{targetDb}'. Дозволені лише символи [a-zA-Z0-9_].");
+        }
+        if (!Regex.IsMatch(ownerUser, @"^[a-zA-Z0-9_]+$"))
+        {
+            throw new ArgumentException($"Некоректне ім'я користувача бази даних: '{ownerUser}'. Дозволені лише символи [a-zA-Z0-9_].");
+        }
 
         string[] candidateMaintenanceDbs = { "postgres", "dpc_c10" };
+        var maintenanceErrors = new List<Exception>();
+        bool databaseVerifiedOrCreated = false;
 
         foreach (var mDb in candidateMaintenanceDbs)
         {
             try
             {
-                var mBuilder = new NpgsqlConnectionStringBuilder(ConnectionString)
+                var mBuilder = new NpgsqlConnectionStringBuilder(connStr)
                 {
                     Database = mDb
                 };
@@ -149,29 +183,91 @@ public static class TestEnvironment
 
                 if (exists == null)
                 {
-                    await using var createCmd = new NpgsqlCommand($"CREATE DATABASE \"{targetDb}\" OWNER \"{ownerUser}\";", conn);
-                    await createCmd.ExecuteNonQueryAsync();
+                    string createSql = $"CREATE DATABASE \"{targetDb}\" OWNER \"{ownerUser}\";";
+                    try
+                    {
+                        await using var createCmd = new NpgsqlCommand(createSql, conn);
+                        await createCmd.ExecuteNonQueryAsync();
+                    }
+                    catch (PostgresException pgEx) when (pgEx.SqlState == "42501") // insufficient_privilege
+                    {
+                        throw new InvalidOperationException(
+                            $"[DATABASE PERMISSION ERROR]: Користувач '{ownerUser}' не має дозволу (CREATEDB) на створення тестової бази даних '{targetDb}' через службову БД '{mDb}': {pgEx.Message}", pgEx);
+                    }
                 }
 
+                databaseVerifiedOrCreated = true;
                 return;
             }
-            catch
+            catch (InvalidOperationException)
             {
-                // Пробуємо наступну системну БД або продовжуємо, якщо створення неможливе
+                // Помилки відсутності прав прокидаємо негайно
+                throw;
+            }
+            catch (Exception ex)
+            {
+                maintenanceErrors.Add(new InvalidOperationException($"Спроба через службову БД '{mDb}' зазнала невдачі: {ex.Message}", ex));
             }
         }
+
+        if (!databaseVerifiedOrCreated)
+        {
+            string details = string.Join(" | ", maintenanceErrors.Select(e => e.Message));
+            Console.Error.WriteLine($"[TestEnvironment Error]: Не вдалося перевірити або створити тестову БД '{targetDb}'. Деталі: {details}");
+            throw new InvalidOperationException(
+                $"Не вдалося перевірити або створити тестову БД '{targetDb}' через жодну зі службових баз ({string.Join(", ", candidateMaintenanceDbs)}). Деталі: {details}",
+                new AggregateException(maintenanceErrors));
+        }
+    }
+
+    public static async Task DropDatabaseIfExistsAsync(string databaseName)
+    {
+        if (!Regex.IsMatch(databaseName, @"^dpc_c10_test_[a-z0-9_]+$"))
+        {
+            throw new ArgumentException($"Дозволено видаляти лише тимчасові тестові БД виду 'dpc_c10_test_*': {databaseName}");
+        }
+
+        var mBuilder = new NpgsqlConnectionStringBuilder(ConnectionString) { Database = "postgres" };
+        try
+        {
+            await using var conn = new NpgsqlConnection(mBuilder.ConnectionString);
+            await conn.OpenAsync();
+
+            await using var terminateCmd = new NpgsqlCommand(@"
+                SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = @db AND pid <> pg_backend_pid();", conn);
+            terminateCmd.Parameters.AddWithValue("db", databaseName);
+            await terminateCmd.ExecuteNonQueryAsync();
+
+            await using var dropCmd = new NpgsqlCommand($"DROP DATABASE IF EXISTS \"{databaseName}\";", conn);
+            await dropCmd.ExecuteNonQueryAsync();
+        }
+        catch { }
     }
 
     public static async Task<bool> IsDatabaseAvailableAsync()
     {
+        // 1. Валідація connection string (викине InvalidOperationException при порушенні формату dpc_c10_test)
         string connStr = ConnectionString;
 
         try
         {
+            // 2. СПОЧАТКУ гарантуємо створення тестової БД dpc_c10_test та застосування міграцій
+            await EnsureTestDatabaseReadyAsync();
+
+            // 3. ПОТІМ відкриваємо з'єднання та перевіряємо доступність
             await using var conn = new NpgsqlConnection(connStr);
             await conn.OpenAsync();
-            await EnsureTestDatabaseReadyAsync();
+
+            await using var pingCmd = new NpgsqlCommand("SELECT 1;", conn);
+            await pingCmd.ExecuteScalarAsync();
+
             return true;
+        }
+        catch (InvalidOperationException)
+        {
+            // Помилки валідації безпеки та відсутності прав на створення БД НЕ повинні глушитися
+            // і повертати false (що призвело б до пропуску тесту через Skip.If) — вони мають явно завершувати тест помилкою!
+            throw;
         }
         catch (NpgsqlException)
         {
