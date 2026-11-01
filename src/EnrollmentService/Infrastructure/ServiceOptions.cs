@@ -37,9 +37,11 @@ public sealed class ServiceOptions
         bool isProduction = string.Equals(config["ASPNETCORE_ENVIRONMENT"], "Production", StringComparison.OrdinalIgnoreCase)
             || string.Equals(config["DOTNET_ENVIRONMENT"], "Production", StringComparison.OrdinalIgnoreCase);
 
-        if (isProduction && string.Equals(options.ApiAuthToken, "secret-c10-token-2026", StringComparison.Ordinal))
+        if (isProduction && (string.IsNullOrWhiteSpace(options.ApiAuthToken) || string.Equals(options.ApiAuthToken, "secret-c10-token-2026", StringComparison.Ordinal)))
         {
-            Console.Error.WriteLine("[SECURITY WARNING]: У виробничому середовищі (Production) використовується стандартний навчальний API_AUTH_TOKEN. Необхідно задати виділений секрет через конфігурацію виробничого оточення.");
+            throw new InvalidOperationException(
+                "[CRITICAL SECURITY ERROR]: Запуск у виробничому середовищі (Production) зі стандартним або порожнім API_AUTH_TOKEN заборонено. " +
+                "Необхідно задати унікальний криптографічно стійкий секрет через конфігурацію виробничого оточення (змінна API_AUTH_TOKEN).");
         }
 
         return options;

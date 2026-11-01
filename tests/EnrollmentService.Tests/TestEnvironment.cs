@@ -1,5 +1,6 @@
 using System.Text.Json;
 using EnrollmentService.Repositories;
+using EnrollmentService.Services;
 using Npgsql;
 
 namespace EnrollmentService.Tests;
@@ -8,9 +9,12 @@ public static class TestEnvironment
 {
     private static readonly Lazy<string> CachedConnectionString = new(ResolveConnectionString);
     private static readonly Lazy<string> CachedApiToken = new(ResolveApiToken);
+    private static readonly Lazy<Task> DatabaseReadyTask = new(InitializeTestDatabaseAsync);
 
     public static string ConnectionString => CachedConnectionString.Value;
     public static string ApiAuthToken => CachedApiToken.Value;
+
+    public static Task EnsureTestDatabaseReadyAsync() => DatabaseReadyTask.Value;
 
     private static string ResolveConnectionString()
     {
@@ -44,18 +48,12 @@ public static class TestEnvironment
         }
         catch { }
 
-        // 3. Безпечний локальний дефолт (ізольований контейнер розробки/тестування)
-        return "Host=localhost;Port=5432;Database=dpc_c10;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50";
+        // 3. Безпечний локальний дефолт: суворо виділена тестова БД dpc_c10_test
+        return "Host=localhost;Port=5432;Database=dpc_c10_test;Username=dpc_user;Password=dpc_password;Maximum Pool Size=50";
     }
 
     private static void ValidateTestConnectionString(string connStr)
     {
-        // Перевірка дозволу примусового обходу для спеціалізованих CI-конфігурацій
-        if (bool.TryParse(Environment.GetEnvironmentVariable("TEST_ALLOW_UNSAFE_DB_OVERRIDE"), out var allow) && allow)
-        {
-            return;
-        }
-
         var builder = new NpgsqlConnectionStringBuilder(connStr);
         string host = (builder.Host ?? "").Trim().ToLowerInvariant();
         string db = (builder.Database ?? "").Trim().ToLowerInvariant();
@@ -68,15 +66,18 @@ public static class TestEnvironment
                 "Запуск інтеграційних тестів із модифікацією та очищенням даних на цій БД суворо заборонено!");
         }
 
-        // 2. Дозволені безпечні цільові хости: localhost, 127.0.0.1, ::1, локальні Docker-мережі або явне позначення test у назві БД
-        bool isLocalHost = host is "localhost" or "127.0.0.1" or "::1" or "dpc-c10-postgres" or "postgres";
-        bool isExplicitTestDb = db.Contains("test");
+        // Перевірка дозволу примусового обходу виключно для спеціалізованого CI-сценарію
+        bool isCiOverride = bool.TryParse(Environment.GetEnvironmentVariable("TEST_ALLOW_UNSAFE_DB_OVERRIDE"), out var allow) && allow;
 
-        if (!isLocalHost && !isExplicitTestDb)
+        // 2. Тестове підключення суворо вимагає явного маркера тестової БД ('test' у назві, наприклад 'dpc_c10_test'),
+        // а не просто локального хоста. Локальний хост сам по собі не захищає від перезапису основної БД dpc_c10.
+        bool isExplicitTestDb = db.Contains("test");
+        if (!isExplicitTestDb && !isCiOverride)
         {
             throw new InvalidOperationException(
-                $"[CRITICAL SAFETY ERROR]: Цільова БД '{builder.Database}' на віддаленому хості '{builder.Host}' не є виділеною тестовою базою даних. " +
-                "Інтеграційні тести дозволено запускати лише проти локальних хостів або баз даних, які містять 'test' у назві.");
+                $"[CRITICAL SAFETY ERROR]: База даних '{builder.Database}' не має обов'язкового маркера тестової БД ('test' у назві, наприклад 'dpc_c10_test'). " +
+                $"Сам лише локальний хост '{builder.Host}' не доводить, що база є тестовою. " +
+                "Інтеграційні та E2E-тести вимагають окремої виділеної тестової бази даних для запобігання пошкодженню основної бази розробки або експлуатації.");
         }
     }
 
@@ -109,15 +110,67 @@ public static class TestEnvironment
         return "test-c10-isolated-bearer-token";
     }
 
+    private static async Task InitializeTestDatabaseAsync()
+    {
+        await EnsureDatabaseCreatedAsync();
+
+        var options = new ServiceOptions
+        {
+            DbConnectionString = ConnectionString,
+            InstanceId = "test-migrator"
+        };
+        var initializer = new DatabaseInitializer(options);
+        await initializer.InitializeAsync();
+    }
+
+    private static async Task EnsureDatabaseCreatedAsync()
+    {
+        var builder = new NpgsqlConnectionStringBuilder(ConnectionString);
+        string targetDb = builder.Database ?? "dpc_c10_test";
+        string ownerUser = builder.Username ?? "dpc_user";
+
+        string[] candidateMaintenanceDbs = { "postgres", "dpc_c10" };
+
+        foreach (var mDb in candidateMaintenanceDbs)
+        {
+            try
+            {
+                var mBuilder = new NpgsqlConnectionStringBuilder(ConnectionString)
+                {
+                    Database = mDb
+                };
+
+                await using var conn = new NpgsqlConnection(mBuilder.ConnectionString);
+                await conn.OpenAsync();
+
+                await using var checkCmd = new NpgsqlCommand("SELECT 1 FROM pg_database WHERE datname = @db;", conn);
+                checkCmd.Parameters.AddWithValue("db", targetDb);
+                var exists = await checkCmd.ExecuteScalarAsync();
+
+                if (exists == null)
+                {
+                    await using var createCmd = new NpgsqlCommand($"CREATE DATABASE \"{targetDb}\" OWNER \"{ownerUser}\";", conn);
+                    await createCmd.ExecuteNonQueryAsync();
+                }
+
+                return;
+            }
+            catch
+            {
+                // Пробуємо наступну системну БД або продовжуємо, якщо створення неможливе
+            }
+        }
+    }
+
     public static async Task<bool> IsDatabaseAvailableAsync()
     {
-        // Отримуємо ConnectionString (виконує ValidateTestConnectionString і кидає InvalidOperationException при загрозі безпеці)
         string connStr = ConnectionString;
 
         try
         {
             await using var conn = new NpgsqlConnection(connStr);
             await conn.OpenAsync();
+            await EnsureTestDatabaseReadyAsync();
             return true;
         }
         catch (NpgsqlException)
@@ -140,6 +193,7 @@ public static class TestEnvironment
 
     public static async Task<NpgsqlConnection> OpenConnectionAsync(CancellationToken cancellationToken = default)
     {
+        await EnsureTestDatabaseReadyAsync();
         var conn = new NpgsqlConnection(ConnectionString);
         await conn.OpenAsync(cancellationToken);
         return conn;
