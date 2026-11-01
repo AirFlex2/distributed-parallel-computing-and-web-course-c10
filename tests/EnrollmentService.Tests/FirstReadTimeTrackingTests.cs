@@ -71,10 +71,10 @@ public sealed class FirstReadTimeTrackingTests
     }
 
     // 1. Перший GET при queued фіксує t4
-    [Fact]
+    [SkippableFact]
     public async Task FirstGet_WhenStatusIsQueued_FixesT4()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
         try
@@ -96,10 +96,10 @@ public sealed class FirstReadTimeTrackingTests
     }
 
     // 2. Перший GET при processing фіксує t4
-    [Fact]
+    [SkippableFact]
     public async Task FirstGet_WhenStatusIsProcessing_FixesT4()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
         try
@@ -121,10 +121,10 @@ public sealed class FirstReadTimeTrackingTests
     }
 
     // 3. Перший GET при done фіксує t4
-    [Fact]
+    [SkippableFact]
     public async Task FirstGet_WhenStatusIsDone_FixesT4()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
         try
@@ -146,10 +146,10 @@ public sealed class FirstReadTimeTrackingTests
     }
 
     // 4. Повторний GET не змінює t4
-    [Fact]
+    [SkippableFact]
     public async Task SubsequentGet_DoesNotModifyInitialT4()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
         try
@@ -175,10 +175,10 @@ public sealed class FirstReadTimeTrackingTests
     }
 
     // 5. Одночасні GET не перезаписують початкову відмітку
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrentGets_DoNotOverwriteInitialTimestamp()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
         try
@@ -208,10 +208,10 @@ public sealed class FirstReadTimeTrackingTests
     }
 
     // 6. GET неіснуючої заявки не створює відмітку і повертає null
-    [Fact]
+    [SkippableFact]
     public async Task GetNonExistentRequest_ReturnsNull_DoesNotCreateTimestamp()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var nonExistentId = Guid.NewGuid();
         var now = DateTimeOffset.UtcNow;

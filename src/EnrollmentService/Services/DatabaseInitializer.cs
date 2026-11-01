@@ -17,14 +17,34 @@ public sealed class DatabaseInitializer
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        string[] candidateDirs =
-        [
-            Path.Combine(AppContext.BaseDirectory, "migrations"),
-            Path.Combine(Directory.GetCurrentDirectory(), "migrations"),
-            Path.Combine(Directory.GetCurrentDirectory(), "..", "..", "migrations")
-        ];
+        string? migrationDir = null;
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            var candidate = Path.Combine(dir.FullName, "migrations");
+            if (Directory.Exists(candidate) && Directory.GetFiles(candidate, "*.sql").Length > 0)
+            {
+                migrationDir = candidate;
+                break;
+            }
+            dir = dir.Parent;
+        }
 
-        string? migrationDir = candidateDirs.FirstOrDefault(Directory.Exists);
+        if (migrationDir == null)
+        {
+            dir = new DirectoryInfo(Directory.GetCurrentDirectory());
+            while (dir != null)
+            {
+                var candidate = Path.Combine(dir.FullName, "migrations");
+                if (Directory.Exists(candidate) && Directory.GetFiles(candidate, "*.sql").Length > 0)
+                {
+                    migrationDir = candidate;
+                    break;
+                }
+                dir = dir.Parent;
+            }
+        }
+
         if (migrationDir == null)
         {
             throw new DirectoryNotFoundException("Каталог міграцій 'migrations/' не знайдено.");

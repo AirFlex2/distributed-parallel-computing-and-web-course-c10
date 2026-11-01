@@ -151,7 +151,7 @@ if (-not (Get-Command "dotnet" -ErrorAction SilentlyContinue)) {
 
 $testOut = (& dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj -c Release 2>&1) -join "`n"
 if ($LASTEXITCODE -eq 0) {
-    Write-Pass "Модульні та інтеграційні тести (Domain, черги Monitor/Channel, відновлення queued/processing, фіксація t4 first_read_at, статуси 400/404/409/422): УСІ ПРОЙДЕНО (43 тестові випадки)"
+    Write-Pass "Модульні та інтеграційні тести (Domain, черги Monitor/Channel, відновлення queued/processing, фіксація t4 first_read_at, E2E HTTP статуси 400/404/409/422): УСІ ПРОЙДЕНО (57 тестових випадків)"
 } else {
     Write-Fail "Помилка модульних тестів:`n$testOut"
 }

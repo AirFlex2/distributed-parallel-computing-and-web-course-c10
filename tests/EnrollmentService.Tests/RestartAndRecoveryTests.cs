@@ -89,6 +89,24 @@ public sealed class RestartAndRecoveryTests
         await cmd.ExecuteNonQueryAsync();
     }
 
+    private async Task InsertRosterEntryAsync(Guid requestId, string studentId, string groupId, string disciplineId, decimal ects)
+    {
+        await using var conn = await _factory.OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(@"
+            INSERT INTO decanate_roster (
+                request_id, student_id, group_id, discipline_id, ects, assignment_type, created_at
+            ) VALUES (
+                @requestId, @studentId, @groupId, @disciplineId, @ects, 'primary', NOW()
+            )
+            ON CONFLICT (request_id) DO NOTHING;", conn);
+        cmd.Parameters.AddWithValue("requestId", requestId);
+        cmd.Parameters.AddWithValue("studentId", studentId);
+        cmd.Parameters.AddWithValue("groupId", groupId);
+        cmd.Parameters.AddWithValue("disciplineId", disciplineId);
+        cmd.Parameters.AddWithValue("ects", ects);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
     private async Task CleanupRequestAsync(Guid id)
     {
         try
@@ -104,10 +122,10 @@ public sealed class RestartAndRecoveryTests
     }
 
     // 1. Перезапуск застосунку з однією заявкою queued
-    [Fact]
+    [SkippableFact]
     public async Task RestartWithSingleQueuedRequest_RecoversIntoQueueAndReachesTerminalStatus()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
         var cleanupList = new List<Guid> { id };
@@ -132,11 +150,9 @@ public sealed class RestartAndRecoveryTests
 
             var pool = new EnrollmentWorkerPool(queue, processor, _requestRepo, options, metrics, lifetime);
 
-            // Запуск пулу (симуляція старту/перезапуску сервісу)
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             await pool.StartAsync(cts.Token);
 
-            // Очікуємо обробки заявки воркером
             EnrollmentStatusResponseDto? status = null;
             for (int i = 0; i < 50; i++)
             {
@@ -160,10 +176,10 @@ public sealed class RestartAndRecoveryTests
     }
 
     // 2. Перезапуск із кількома заявками queued
-    [Fact]
+    [SkippableFact]
     public async Task RestartWithMultipleQueuedRequests_RecoversAllIntoQueue()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var ids = Enumerable.Range(1, 4).Select(_ => Guid.NewGuid()).ToList();
 
@@ -194,7 +210,6 @@ public sealed class RestartAndRecoveryTests
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
             await pool.StartAsync(cts.Token);
 
-            // Чекаємо завершення всіх 4 заявок
             bool allTerminal = false;
             for (int i = 0; i < 60; i++)
             {
@@ -224,12 +239,11 @@ public sealed class RestartAndRecoveryTests
     }
 
     // 3. Кількість збережених заявок більше QUEUE_CAPACITY (дозавантаження без втрат)
-    [Fact]
+    [SkippableFact]
     public async Task StoredRequestsExceedQueueCapacity_ReplenishesSequentiallyWithoutLoss()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
-        // 6 заявок при місткості черги 2
         var ids = Enumerable.Range(1, 6).Select(_ => Guid.NewGuid()).ToList();
 
         try
@@ -260,7 +274,6 @@ public sealed class RestartAndRecoveryTests
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             await pool.StartAsync(cts.Token);
 
-            // Очікуємо, поки всі 6 заявок будуть послідовно підтягнуті з БД та завершені
             bool allDoneOrTerminal = false;
             for (int i = 0; i < 80; i++)
             {
@@ -289,29 +302,30 @@ public sealed class RestartAndRecoveryTests
         }
     }
 
-    // 4. Перезапуск із заявками processing
-    [Fact]
-    public async Task RestartWithProcessingRequests_RecoversStuckRequestsToTerminalStatus()
+    // 4.1 Відновлення processing: аварія ДО транзакції (немає запису у відомості -> перехід у failed без списання місць)
+    [SkippableFact]
+    public async Task RecoverProcessing_CrashBeforeTransaction_SetsFailedAndLeavesSeatsUntouched()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
 
         try
         {
+            // Симуляція падіння сервера під час повільного виклику або до відкриття транзакції
             await InsertRequestWithStatusAsync(id, "student-1", "DISC-DPC-01", "processing");
 
-            // Викликаємо відновлення завислих processing-заявок
+            // Виклик відновлення завислих processing-заявок
             int recovered = await _requestRepo.RecoverStuckProcessingRequestsAsync();
-
             Assert.True(recovered >= 1);
 
             var status = await _requestRepo.GetStatusByIdAsync(id);
             Assert.NotNull(status);
-            // Заявка не була у відомості, тому переведена у 'failed' з поясненням
             Assert.Equal("failed", status.Status);
             Assert.NotNull(status.RejectionReason);
             Assert.Contains("перезапуском", status.RejectionReason);
+            Assert.False(status.RecordedInRoster);
+            Assert.NotNull(status.FinishedAt);
         }
         finally
         {
@@ -319,11 +333,90 @@ public sealed class RestartAndRecoveryTests
         }
     }
 
-    // 5. Перевірка відсутності подвійної обробки однієї заявки
-    [Fact]
+    // 4.2 Відновлення processing: аварія ПІСЛЯ фіксації відомості деканату (є запис у відомості -> перехід у done)
+    [SkippableFact]
+    public async Task RecoverProcessing_CrashAfterRosterCommit_SetsDoneAndPreservesRosterEntry()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
+
+        var id = Guid.NewGuid();
+
+        try
+        {
+            // Симуляція ситуації: транзакція зафіксувала запис у decanate_roster, але сервер упав до оновлення enrollment_requests
+            await InsertRequestWithStatusAsync(id, "student-2", "DISC-DPC-01", "processing");
+            await InsertRosterEntryAsync(id, "student-2", "DISC-DPC-01", "DISC-DPC", 6.0m);
+
+            // Виклик відновлення
+            int recovered = await _requestRepo.RecoverStuckProcessingRequestsAsync();
+            Assert.True(recovered >= 1);
+
+            var status = await _requestRepo.GetStatusByIdAsync(id);
+            Assert.NotNull(status);
+            // Оскільки запис у decanate_roster існує, статус переведено у 'done' без помилки відхилення
+            Assert.Equal("done", status.Status);
+            Assert.Null(status.RejectionReason);
+            Assert.True(status.RecordedInRoster);
+            Assert.NotNull(status.FinishedAt);
+        }
+        finally
+        {
+            await CleanupRequestAsync(id);
+        }
+    }
+
+    // 4.3 Відновлення processing: одночасний старт кількох воркерів під час відновлення (захист від гонитви)
+    [SkippableFact]
+    public async Task ConcurrentWorkerStartup_DuringRecovery_GuaranteesNoDuplicateProcessing()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
+
+        var ids = Enumerable.Range(1, 5).Select(_ => Guid.NewGuid()).ToList();
+
+        try
+        {
+            for (int i = 0; i < ids.Count; i++)
+            {
+                await InsertRequestWithStatusAsync(ids[i], $"student-{i + 1}", "DISC-DPC-01", "queued");
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            // 4 паралельні воркери одночасно змагаються за кожну заявку через атомарний TryMarkStartedAsync
+            var claimResults = new System.Collections.Concurrent.ConcurrentBag<(Guid Id, int WorkerId)>();
+
+            var workerTasks = Enumerable.Range(1, 4).Select(workerId => Task.Run(async () =>
+            {
+                foreach (var id in ids)
+                {
+                    bool claimed = await _requestRepo.TryMarkStartedAsync(id, now);
+                    if (claimed)
+                    {
+                        claimResults.Add((id, workerId));
+                    }
+                }
+            })).ToArray();
+
+            await Task.WhenAll(workerTasks);
+
+            // Кожна заявка повинна бути захоплена РІВНО ОДНИМ воркером
+            var grouped = claimResults.GroupBy(c => c.Id).ToList();
+            Assert.Equal(ids.Count, grouped.Count);
+            foreach (var g in grouped)
+            {
+                Assert.Single(g); // Рівно 1 переможець на кожну заявку
+            }
+        }
+        finally
+        {
+            foreach (var rId in ids) await CleanupRequestAsync(rId);
+        }
+    }
+
+    // 5. Перевірка відсутності подвійної обробки однієї заявки двома воркерами
+    [SkippableFact]
     public async Task NoDuplicateProcessing_WhenTwoWorkersAttemptSameItem_OnlyOneClaims()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var id = Guid.NewGuid();
 
@@ -332,20 +425,17 @@ public sealed class RestartAndRecoveryTests
             await InsertRequestWithStatusAsync(id, "student-1", "DISC-DPC-01", "queued");
 
             var now = DateTimeOffset.UtcNow;
-            // Два воркери одночасно намагаються взяти заявку через атомарний TryMarkStartedAsync
             var task1 = _requestRepo.TryMarkStartedAsync(id, now);
             var task2 = _requestRepo.TryMarkStartedAsync(id, now);
 
             var results = await Task.WhenAll(task1, task2);
 
-            // Рівно один воркер повинен отримати true, інший - false
             int successCount = results.Count(r => r);
             int failureCount = results.Count(r => !r);
 
             Assert.Equal(1, successCount);
             Assert.Equal(1, failureCount);
 
-            // Повторна спроба від будь-якого воркера також повертає false
             bool thirdAttempt = await _requestRepo.TryMarkStartedAsync(id, now);
             Assert.False(thirdAttempt);
         }
@@ -356,10 +446,10 @@ public sealed class RestartAndRecoveryTests
     }
 
     // 6. Перевірка, що після відновлення всі заявки отримують кінцевий статус
-    [Fact]
+    [SkippableFact]
     public async Task AllRecoveredRequests_EventuallyReceiveTerminalStatus()
     {
-        if (!await IsDatabaseAvailableAsync()) return;
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 
         var qId1 = Guid.NewGuid();
         var qId2 = Guid.NewGuid();
