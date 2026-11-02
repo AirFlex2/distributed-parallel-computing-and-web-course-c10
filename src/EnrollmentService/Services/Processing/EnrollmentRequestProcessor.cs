@@ -112,9 +112,9 @@ public sealed class EnrollmentRequestProcessor
         {
             var finishedAtUtc = _metrics.MarkProcessingFinished(item);
 
-            // П. 8: Якщо це не done або це UNSAFE режим, записуємо статус у БД
-            // (Для SAFE режиму 'done' вже зафіксовано атомарно всередині бізнес-транзакції tx)
-            if (finalStatus != "done" || (_options.AllowTestOverrides && _options.UnsafeMode))
+            // Якщо це не done (наприклад, rejected або failed), записуємо фінальний статус у БД
+            // (Для статусу 'done' у SAFE та UNSAFE режимах він вже зафіксований атомарно всередині tx)
+            if (finalStatus != "done")
             {
                 bool updated = false;
                 for (int attempt = 1; attempt <= 3 && !updated; attempt++)
@@ -126,7 +126,7 @@ public sealed class EnrollmentRequestProcessor
                             item.Id,
                             finalStatus,
                             rejectionReason,
-                            finalStatus == "done" ? item.GroupId : null,
+                            null,
                             finishedAtUtc,
                             conn,
                             tx: null,
@@ -176,16 +176,18 @@ public sealed class EnrollmentRequestProcessor
         bool isUnsafe,
         CancellationToken cancellationToken)
     {
-        if (!isUnsafe)
-        {
-            // SAFE: повільний зовнішній виклик (симуляція деканату 200–700 мс) виконується
-            // СТРОГО ПОЗА критичною секцією (до відкриття транзакції та взяття блокувань БД)
-            int slowDelayMs = Random.Shared.Next(_options.SlowCallMinMs, _options.SlowCallMaxMs + 1);
-            await Task.Delay(slowDelayMs, cancellationToken);
-        }
+        // Симуляція повільного виклику деканату (200–700 мс) виконується
+        // СТРОГО ПОЗА критичною секцією (до відкриття транзакції та взяття блокувань БД)
+        // в обох режимах (SAFE та UNSAFE, О1.3 РПО).
+        // В UNSAFE фіксована затримка (SlowCallMinMs = 200 мс) забезпечує одночасний вхід
+        // паралельних воркерів у транзакцію для надійної демонстрації Lost Update без блокування FOR UPDATE.
+        int slowDelayMs = isUnsafe
+            ? _options.SlowCallMinMs
+            : Random.Shared.Next(_options.SlowCallMinMs, _options.SlowCallMaxMs + 1);
+        await Task.Delay(slowDelayMs, cancellationToken);
 
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-        await using var tx = isUnsafe ? null : await conn.BeginTransactionAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
 
         try
         {
@@ -193,11 +195,11 @@ public sealed class EnrollmentRequestProcessor
             // 1. student FOR UPDATE (у SAFE режимі) або звичайний SELECT (в UNSAFE)
             var student = isUnsafe
                 ? await _enrollmentRepo.GetStudentByIdAsync(item.StudentId, cancellationToken)
-                : await _enrollmentRepo.GetStudentForUpdateAsync(item.StudentId, conn, tx!, cancellationToken);
+                : await _enrollmentRepo.GetStudentForUpdateAsync(item.StudentId, conn, tx, cancellationToken);
 
             if (student == null)
             {
-                if (tx != null) await tx.RollbackAsync(cancellationToken);
+                await tx.RollbackAsync(cancellationToken);
                 return ("rejected", $"Студента '{item.StudentId}' не знайдено в базі даних.");
             }
 
@@ -211,7 +213,7 @@ public sealed class EnrollmentRequestProcessor
 
             if (!groupWithDisc.HasValue)
             {
-                if (tx != null) await tx.RollbackAsync(cancellationToken);
+                await tx.RollbackAsync(cancellationToken);
                 return ("failed", $"Навчальну групу '{item.GroupId}' не знайдено.");
             }
 
@@ -226,19 +228,16 @@ public sealed class EnrollmentRequestProcessor
                 // О1.5 DPC: час завершення обробки публікується ДО COMMIT, щоб будь-який конкурентний GET
                 // гарантовано зафіксував delivery_wait_ms на найпершому отриманні фінального результату
                 var finishedAtUtc = _metrics.MarkProcessingFinished(item);
-                if (tx != null)
-                {
-                    await _requestRepo.UpdateStatusAsync(
-                        item.Id,
-                        "done",
-                        null,
-                        existingRosterGroup,
-                        finishedAtUtc,
-                        conn,
-                        tx,
-                        cancellationToken);
-                    await tx.CommitAsync(cancellationToken);
-                }
+                await _requestRepo.UpdateStatusAsync(
+                    item.Id,
+                    "done",
+                    null,
+                    existingRosterGroup,
+                    finishedAtUtc,
+                    conn,
+                    tx,
+                    cancellationToken);
+                await tx.CommitAsync(cancellationToken);
 
                 if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                 {
@@ -260,15 +259,8 @@ public sealed class EnrollmentRequestProcessor
 
             if (!policyResult.Allowed)
             {
-                if (tx != null) await tx.RollbackAsync(cancellationToken);
+                await tx.RollbackAsync(cancellationToken);
                 return ("rejected", policyResult.RejectionReason);
-            }
-
-            if (isUnsafe)
-            {
-                // UNSAFE: штучне часове вікно гонитви TOCTOU між перевіркою та списанням місць без блокування
-                int delayMs = Random.Shared.Next(_options.SlowCallMinMs, _options.SlowCallMaxMs + 1);
-                await Task.Delay(delayMs, cancellationToken);
             }
 
             if (!isUnsafe)
@@ -277,7 +269,7 @@ public sealed class EnrollmentRequestProcessor
                 bool decremented = await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, tx, cancellationToken);
                 if (!decremented)
                 {
-                    await tx!.RollbackAsync(cancellationToken);
+                    await tx.RollbackAsync(cancellationToken);
                     return ("rejected", $"У навчальній групі '{item.GroupId}' немає вільних місць (декремент available повернув false).");
                 }
 
@@ -313,7 +305,7 @@ public sealed class EnrollmentRequestProcessor
                     tx,
                     cancellationToken);
 
-                await tx!.CommitAsync(cancellationToken);
+                await tx.CommitAsync(cancellationToken);
 
                 if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                 {
@@ -325,10 +317,11 @@ public sealed class EnrollmentRequestProcessor
             else
             {
                 // НЕБЕЗПЕЧНИЙ РЕЖИМ (UNSAFE): відсутність транзакційного блокування FOR UPDATE.
-                // Всі конкурентні запити одночасно пройшли перевірку policyResult.Allowed
-                // і фіксують студентів у відомості деканату, перевищуючи ліміт місць (стан гонитви TOCTOU).
-                await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, null, cancellationToken);
-                await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, null, cancellationToken);
+                // Прочитали available, потім записали available - 1 без умови WHERE available > 0 (Lost Update).
+                int newAvailable = group.Available - 1;
+                await _groupRepo.SetAvailableUnsafeAsync(item.GroupId, newAvailable, conn, tx, cancellationToken);
+
+                await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
 
                 var finishedAtUtc = _metrics.MarkProcessingFinished(item);
                 await _decanateRepo.InsertRosterEntryAsync(
@@ -341,8 +334,25 @@ public sealed class EnrollmentRequestProcessor
                     "unsafe_overcommit",
                     finishedAtUtc,
                     conn,
-                    null,
+                    tx,
                     cancellationToken);
+
+                await _requestRepo.UpdateStatusAsync(
+                    item.Id,
+                    "done",
+                    null,
+                    item.GroupId,
+                    finishedAtUtc,
+                    conn,
+                    tx,
+                    cancellationToken);
+
+                await tx.CommitAsync(cancellationToken);
+
+                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
+                {
+                    await TestHookAfterCommitAsync(item);
+                }
 
                 return ("done", null);
             }
@@ -350,7 +360,7 @@ public sealed class EnrollmentRequestProcessor
         catch
         {
             _metrics.ResetProcessingFinished(item);
-            if (tx != null) await tx.RollbackAsync(cancellationToken);
+            await tx.RollbackAsync(cancellationToken);
             throw;
         }
     }

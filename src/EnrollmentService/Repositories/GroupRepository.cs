@@ -230,6 +230,23 @@ public sealed class GroupRepository
         return affected > 0;
     }
 
+    public async Task SetAvailableUnsafeAsync(
+        string groupId,
+        int newAvailable,
+        NpgsqlConnection conn,
+        NpgsqlTransaction? tx = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE discipline_group
+            SET available = @available
+            WHERE id = @groupId;", conn, tx);
+        cmd.Parameters.AddWithValue("groupId", groupId);
+        cmd.Parameters.AddWithValue("available", newAvailable);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task IncrementAvailableAsync(
         string groupId,
         NpgsqlConnection conn,
