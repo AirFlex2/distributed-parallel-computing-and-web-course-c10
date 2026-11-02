@@ -148,9 +148,24 @@ public static class TestEnvironment
     public static async Task EnsureDatabaseCreatedAsync(string? connectionString = null)
     {
         string connStr = connectionString ?? ConnectionString;
+
+        // 1. Обов'язкова валідація connection string до будь-яких операцій з PostgreSQL
+        ValidateTestConnectionString(connStr);
+
         var builder = new NpgsqlConnectionStringBuilder(connStr);
         string targetDb = (builder.Database ?? "dpc_c10_test").Trim();
         string ownerUser = (builder.Username ?? "dpc_user").Trim();
+
+        // 2. Сувора перевірка імені тестової БД: дозволено створювати та перевіряти виключно dpc_c10_test або dpc_c10_test_*
+        bool isValidTestDbName = string.Equals(targetDb, "dpc_c10_test", StringComparison.OrdinalIgnoreCase)
+            || Regex.IsMatch(targetDb, @"^dpc_c10_test_[a-z0-9_]+$", RegexOptions.IgnoreCase);
+
+        if (!isValidTestDbName)
+        {
+            throw new InvalidOperationException(
+                $"[CRITICAL SAFETY ERROR]: Метод EnsureDatabaseCreatedAsync дозволяє створювати та перевіряти виключно тестові бази даних " +
+                $"формату 'dpc_c10_test' або 'dpc_c10_test_*'. Створення та зміна бази даних '{targetDb}' суворо заборонені!");
+        }
 
         if (!Regex.IsMatch(targetDb, @"^[a-zA-Z0-9_]+$"))
         {
@@ -161,7 +176,7 @@ public static class TestEnvironment
             throw new ArgumentException($"Некоректне ім'я користувача бази даних: '{ownerUser}'. Дозволені лише символи [a-zA-Z0-9_].");
         }
 
-        string[] candidateMaintenanceDbs = { "postgres", "dpc_c10" };
+        string[] candidateMaintenanceDbs = { "postgres", "template1" };
         var maintenanceErrors = new List<Exception>();
         bool databaseVerifiedOrCreated = false;
 
@@ -192,7 +207,7 @@ public static class TestEnvironment
                     catch (PostgresException pgEx) when (pgEx.SqlState == "42501") // insufficient_privilege
                     {
                         throw new InvalidOperationException(
-                            $"[DATABASE PERMISSION ERROR]: Користувач '{ownerUser}' не має дозволу (CREATEDB) на створення тестової бази даних '{targetDb}' через службову БД '{mDb}': {pgEx.Message}", pgEx);
+                            $"[DATABASE PERMISSION ERROR]: Користувач '{ownerUser}' не має дозволу (CREATEDB) на створення тестової бази даних '{targetDb}' через службову БД '{mDb}': {pgEx.Message} (SQLSTATE: {pgEx.SqlState})", pgEx);
                     }
                 }
 
@@ -222,7 +237,7 @@ public static class TestEnvironment
 
     public static async Task DropDatabaseIfExistsAsync(string databaseName)
     {
-        if (!Regex.IsMatch(databaseName, @"^dpc_c10_test_[a-z0-9_]+$"))
+        if (!Regex.IsMatch(databaseName, @"^dpc_c10_test_[a-z0-9_]+$", RegexOptions.IgnoreCase))
         {
             throw new ArgumentException($"Дозволено видаляти лише тимчасові тестові БД виду 'dpc_c10_test_*': {databaseName}");
         }
@@ -240,8 +255,21 @@ public static class TestEnvironment
 
             await using var dropCmd = new NpgsqlCommand($"DROP DATABASE IF EXISTS \"{databaseName}\";", conn);
             await dropCmd.ExecuteNonQueryAsync();
+
+            // Перевіряємо, що база дійсно більше не існує в pg_database
+            await using var verifyCmd = new NpgsqlCommand("SELECT 1 FROM pg_database WHERE datname = @db;", conn);
+            verifyCmd.Parameters.AddWithValue("db", databaseName);
+            var exists = await verifyCmd.ExecuteScalarAsync();
+            if (exists != null)
+            {
+                throw new InvalidOperationException($"[CRITICAL SAFETY ERROR]: Тимчасова тестова база даних '{databaseName}' не була видалена після виконання DROP DATABASE.");
+            }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[TestEnvironment Error]: Помилка під час видалення тимчасової тестової БД '{databaseName}': {ex}");
+            throw new InvalidOperationException($"Не вдалося видалити тимчасову тестову базу даних '{databaseName}': {ex.Message}", ex);
+        }
     }
 
     public static async Task<bool> IsDatabaseAvailableAsync()
