@@ -66,9 +66,7 @@ public static class EnrollmentRequestEndpoints
             string groupId = dto!.GroupId!.Trim();
             string payloadFingerprint = $"{studentId}:{groupId}";
 
-            // Швидка перевірка переповнення черги БЕЗ навантаження бази даних (О1.2)
-            // Виконується строго до звернення до БД (зокрема, до перевірки Idempotency-Key),
-            // забезпечуючи надійний захист PostgreSQL від перевантаження (Backpressure).
+            // Швидка перевірка переповнення черги (О1.2)
             if (!queue.TryReserveSlot())
             {
                 if (workerPool.IsShuttingDown)
@@ -81,6 +79,37 @@ public static class EnrollmentRequestEndpoints
                         "service_shutting_down");
                 }
 
+                // Якщо черга заповнена, але клієнт повторює раніше прийнятий запит з Idempotency-Key
+                // (наприклад, через втрату відповіді в мережі), перевіряємо наявність заявки в БД.
+                // Якщо заявка вже збережена — повертаємо 202 Accepted (або 409 при конфлікті), не відхиляючи клієнта з 429.
+                if (!string.IsNullOrWhiteSpace(idempotencyKey))
+                {
+                    await using var connCheck = await connectionFactory.OpenConnectionAsync(httpContext.RequestAborted);
+                    var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, connCheck, httpContext.RequestAborted);
+                    if (existing != null)
+                    {
+                        if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                            !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
+                            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+                        {
+                            return ProblemDetailsMapper.CreateProblemResult(
+                                httpContext, opts,
+                                StatusCodes.Status409Conflict,
+                                "Конфлікт даних ідемпотентного запиту",
+                                $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id або group_id.",
+                                "idempotency_conflict");
+                        }
+
+                        return Results.Accepted($"/v1/enrollment-requests/{existing.Id}", new EnrollmentAcceptedResponseDto(
+                            existing.Id,
+                            existing.StudentId,
+                            existing.GroupId,
+                            existing.Status,
+                            existing.CreatedAt));
+                    }
+                }
+
+                // Сюди потрапляють виключно дійсно нові запити при переповненій черзі (Backpressure):
                 metrics.RecordRejected429();
                 httpContext.Response.Headers["Retry-After"] = "1";
                 return ProblemDetailsMapper.CreateProblemResult(

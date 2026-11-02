@@ -1167,7 +1167,11 @@ paths:
       operationId: enqueueDpcEnrollmentRequest
       tags: [DPC]
       summary: Приймання заявки у внутрішню обмежену чергу з негайною відповіддю 202 Accepted (О1.1, О1.2, Д1.4 РПО)
-      description: Перевіряє місткість обмеженої черги `QUEUE_CAPACITY`, зберігає запис зі статусом `queued` у PostgreSQL і ставить задачу у внутрішню чергу з підтримкою заголовка Idempotency-Key.
+      description: >-
+        Перевіряє місткість обмеженої черги QUEUE_CAPACITY, зберігає запис зі статусом queued у PostgreSQL і ставить задачу у внутрішню чергу з підтримкою заголовка Idempotency-Key (або request_id у тілі).
+        Повторний запит із тим самим ключем і незмінними параметрами повертає статус раніше збереженої заявки (202 Accepted) навіть за умови повного заповнення черги.
+        Якщо ключ повторюється з іншими параметрами student_id або group_id, повертається помилка 409 Conflict.
+        Нові заявки за умови переповнення черги негайно отримують 429 Too Many Requests із заголовком Retry-After.
       x-course: dpc
       security:
         - bearerAuth: []
@@ -1194,7 +1198,7 @@ paths:
                   group_id: "DISC-DPC-01"
       responses:
         "202":
-          description: Заявку збережено в БД зі статусом queued і поставлено у внутрішню чергу
+          description: Заявку збережено в БД зі статусом queued і поставлено у внутрішню чергу (або повернено збережену заявку при повторі Idempotency-Key, у тому числі при заповненій черзі)
           content:
             application/json:
               schema:

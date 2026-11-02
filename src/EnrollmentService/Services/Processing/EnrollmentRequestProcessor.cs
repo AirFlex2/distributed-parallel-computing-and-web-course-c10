@@ -265,7 +265,9 @@ public sealed class EnrollmentRequestProcessor
 
             if (!isUnsafe)
             {
-                // БЕЗПЕЧНИЙ РЕЖИМ (SAFE): атомарний декремент available та відкат у разі браку місць
+                // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
+                // Пряма паралельна обробка заявок черги з атомарним декрементом available під FOR UPDATE.
+                // (У цільовому Сценарії Б за подіями Web на ЛР4 первинне списання здійснює Web, а РПО веде відомість і second_choice у ЛР2).
                 bool decremented = await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, tx, cancellationToken);
                 if (!decremented)
                 {

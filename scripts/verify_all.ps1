@@ -185,7 +185,7 @@ if ($total -eq 0) {
     if ($testOut -match '(?i)(?:всього|Total)\s*[:=]\s*(\d+)') { $total = [int]$Matches[1] }
 }
 
-if ($testExit -eq 0 -and $failed -eq 0 -and $skipped -eq 0 -and $passed -ge 85) {
+if ($testExit -eq 0 -and $failed -eq 0 -and $skipped -eq 0 -and $passed -ge 90) {
     Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
     if ($skipped -gt 0) {
@@ -987,7 +987,7 @@ try {
     $null = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
 
     # 10.8 Помилка пошкодженого курсору -> 400 Bad Request (О1.5 Web)
-    $brokenCursorRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments?cursor=invalid_base64_or_corrupted" -Method Get -Headers $webHeadersStudent1 -SkipHttpErrorCheck
+    $brokenCursorRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments?after=invalid_base64_or_corrupted" -Method Get -Headers $webHeadersStudent1 -SkipHttpErrorCheck
     $brokenCursorJson = (Get-ResponseText $brokenCursorRes) | ConvertFrom-Json
     if ([int]$brokenCursorRes.StatusCode -eq 400 -and $brokenCursorJson.error_code -eq "invalid_cursor") {
         Write-Pass "Web О1.5: Пошкоджений або некоректний курсор відхилено з HTTP 400 Bad Request (error_code=invalid_cursor)"
@@ -999,7 +999,7 @@ try {
     $discPage1 = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=2" -Method Get -Headers $webHeadersStudent1
     if ($discPage1.items.Count -eq 2 -and !([string]::IsNullOrWhiteSpace($discPage1.next_cursor))) {
         Write-Pass "Курсорне пагінування GET /v1/disciplines (стор. 1): отримано 2 дисципліни, next_cursor=$($discPage1.next_cursor)"
-        $discPage2 = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=2&cursor=$($discPage1.next_cursor)" -Method Get -Headers $webHeadersStudent1
+        $discPage2 = Invoke-RestMethod -Uri "$BaseUrl/v1/disciplines?limit=2&after=$($discPage1.next_cursor)" -Method Get -Headers $webHeadersStudent1
         if ($discPage2.items.Count -eq 2 -and $discPage2.items[0].id -ne $discPage1.items[0].id) {
             Write-Pass "Курсорне пагінування GET /v1/disciplines (стор. 2): успішно отримано наступні дисципліни без перекриття (перша: $($discPage2.items[0].id))"
         } else {
@@ -1012,7 +1012,7 @@ try {
     # 10.10 Курсорне пагінування записів студента через next_cursor (О1.5 Web)
     $enrPage1 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments?limit=1" -Method Get -Headers $webHeadersStudent1
     if ($enrPage1.items.Count -eq 1 -and !([string]::IsNullOrWhiteSpace($enrPage1.next_cursor))) {
-        $enrPage2 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments?limit=1&cursor=$($enrPage1.next_cursor)" -Method Get -Headers $webHeadersStudent1
+        $enrPage2 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments?limit=1&after=$($enrPage1.next_cursor)" -Method Get -Headers $webHeadersStudent1
         if ($enrPage2.items.Count -eq 1 -and $enrPage2.items[0].id -ne $enrPage1.items[0].id) {
             Write-Pass "Web О1.5: Курсорне пагінування GET /v1/enrollments: сторінка 1 та 2 пройдені послідовно через next_cursor без дублювання"
         } else {
