@@ -33,6 +33,12 @@ public sealed class EnrollmentRequestProcessor
         _options = options;
     }
 
+    /// <summary>
+    /// Тестова точка перехоплення, що викликається детерміновано одразу після COMMIT бізнес-транзакції,
+    /// але до виходу з методу обробки (для перевірки відсутності гонки публікації FinishProcessingTimestamp).
+    /// </summary>
+    public Func<QueuedRequestItem, Task>? TestHookAfterCommitAsync { get; set; }
+
     public async Task ProcessItemAsync(
         int workerId,
         QueuedRequestItem item,
@@ -217,6 +223,9 @@ public sealed class EnrollmentRequestProcessor
             string? existingRosterGroup = await _decanateRepo.GetRosterGroupForRequestAsync(item.Id, conn, tx, cancellationToken);
             if (existingRosterGroup != null)
             {
+                // О1.5 DPC: час завершення обробки публікується ДО COMMIT, щоб будь-який конкурентний GET
+                // гарантовано зафіксував delivery_wait_ms на найпершому отриманні фінального результату
+                var finishedAtUtc = _metrics.MarkProcessingFinished(item);
                 if (tx != null)
                 {
                     await _requestRepo.UpdateStatusAsync(
@@ -224,12 +233,18 @@ public sealed class EnrollmentRequestProcessor
                         "done",
                         null,
                         existingRosterGroup,
-                        DateTimeOffset.UtcNow,
+                        finishedAtUtc,
                         conn,
                         tx,
                         cancellationToken);
                     await tx.CommitAsync(cancellationToken);
                 }
+
+                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
+                {
+                    await TestHookAfterCommitAsync(item);
+                }
+
                 return ("done", null);
             }
 
@@ -269,7 +284,9 @@ public sealed class EnrollmentRequestProcessor
                 // Оновлення кількості та кредитів студента
                 await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
 
-                var finishedAtUtc = DateTimeOffset.UtcNow;
+                // О1.5 DPC: час завершення обробки публікується ДО COMMIT, щоб будь-який конкурентний GET
+                // гарантовано зафіксував delivery_wait_ms на найпершому отриманні фінального результату
+                var finishedAtUtc = _metrics.MarkProcessingFinished(item);
 
                 // Запис до відомості деканату
                 await _decanateRepo.InsertRosterEntryAsync(
@@ -297,6 +314,12 @@ public sealed class EnrollmentRequestProcessor
                     cancellationToken);
 
                 await tx!.CommitAsync(cancellationToken);
+
+                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
+                {
+                    await TestHookAfterCommitAsync(item);
+                }
+
                 return ("done", null);
             }
             else
@@ -307,7 +330,7 @@ public sealed class EnrollmentRequestProcessor
                 await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, null, cancellationToken);
                 await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, null, cancellationToken);
 
-                var finishedAtUtc = DateTimeOffset.UtcNow;
+                var finishedAtUtc = _metrics.MarkProcessingFinished(item);
                 await _decanateRepo.InsertRosterEntryAsync(
                     item.Id,
                     item.StudentId,
@@ -326,6 +349,7 @@ public sealed class EnrollmentRequestProcessor
         }
         catch
         {
+            _metrics.ResetProcessingFinished(item);
             if (tx != null) await tx.RollbackAsync(cancellationToken);
             throw;
         }

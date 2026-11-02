@@ -1,5 +1,9 @@
 using EnrollmentService;
+using EnrollmentService.Domain;
+using EnrollmentService.Metrics;
+using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
+using EnrollmentService.Services.Processing;
 using Npgsql;
 using Xunit;
 
@@ -321,5 +325,209 @@ public sealed class FirstReadTimeTrackingTests
         var result = await _repo.MarkFirstReadAndGetStatusAsync(nonExistentId, now);
 
         Assert.Null(result);
+    }
+
+    // Сценарій 8 (О1.5 DPC): Детермінована регресійна перевірка гонки між COMMIT та FinishProcessingTimestamp.
+    // Перевіряє, що клієнтський GET, виконаний у момент фіксації COMMIT, фіксує delivery_wait_ms
+    // саме на першому читанні, а не відкладає його на повторні GET.
+    [SkippableFact]
+    public async Task Scenario8_DeterministicRace_CommitAndFinishProcessingTimestamp_SynchronizedOnFirstGet()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
+
+        string studentId = "student-e2e-race-01";
+        string groupId = "GRP-E2E-RACE-01";
+        string discId = "DISC-E2E-RACE-01";
+        var requestId = Guid.NewGuid();
+
+        var options = new ServiceOptions
+        {
+            AllowTestOverrides = true,
+            SlowCallMinMs = 0,
+            SlowCallMaxMs = 0,
+            Workers = 1
+        };
+
+        var groupRepo = new GroupRepository(_factory);
+        var enrollmentRepo = new EnrollmentRepository(_factory, options);
+        var decanateRepo = new DecanateRepository(_factory);
+        var metrics = new MetricsCollector();
+        var queue = new MonitorRequestQueue(10);
+
+        var processor = new EnrollmentRequestProcessor(
+            _repo,
+            groupRepo,
+            enrollmentRepo,
+            decanateRepo,
+            _factory,
+            metrics,
+            options);
+
+        try
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, requestId);
+
+            // 1. Створення тестових даних у БД
+            await using (var conn = await _factory.OpenConnectionAsync())
+            {
+                await using var cmdDisc = new NpgsqlCommand(@"
+                    INSERT INTO discipline (id, code, title, ects, is_test_only)
+                    VALUES (@dId, 'CODE-' || @dId, 'Race Discipline', 5.0, true)
+                    ON CONFLICT (id) DO UPDATE SET ects = 5.0;", conn);
+                cmdDisc.Parameters.AddWithValue("dId", discId);
+                await cmdDisc.ExecuteNonQueryAsync();
+
+                await using var cmdGrp = new NpgsqlCommand(@"
+                    INSERT INTO discipline_group (id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed)
+                    VALUES (@gId, @dId, 'GRP-' || @gId, 10, 10, NOW() - INTERVAL '1 hour', NOW() + INTERVAL '1 hour', 'Europe/Kyiv', false)
+                    ON CONFLICT (id) DO UPDATE SET seats = 10, available = 10, closed = false;", conn);
+                cmdGrp.Parameters.AddWithValue("gId", groupId);
+                cmdGrp.Parameters.AddWithValue("dId", discId);
+                await cmdGrp.ExecuteNonQueryAsync();
+
+                await using var cmdStud = new NpgsqlCommand(@"
+                    INSERT INTO student (id, email, full_name, max_disciplines, active_count, active_ects)
+                    VALUES (@sId, @sId || '@test.local', 'Race Student', 5, 0, 0.0)
+                    ON CONFLICT (id) DO UPDATE SET active_count = 0, active_ects = 0.0;", conn);
+                cmdStud.Parameters.AddWithValue("sId", studentId);
+                await cmdStud.ExecuteNonQueryAsync();
+            }
+
+            // 2. Вставка заявки зі статусом queued
+            await InsertTestRequestAsync(requestId, "queued", null);
+
+            var item = new QueuedRequestItem
+            {
+                Id = requestId,
+                StudentId = studentId,
+                GroupId = groupId,
+                CreatedAtUtc = DateTimeOffset.UtcNow
+            };
+
+            Assert.True(metrics.TryEnqueueReservedAndRecordAccepted(queue, item));
+
+            // 3. Перевірка проміжних статусів: ранній polling під час queued не фіксує FirstReadAt або delivery_wait_ms
+            var earlyQueuedGet = await _repo.MarkFirstReadAndGetStatusAsync(requestId, DateTimeOffset.UtcNow);
+            Assert.NotNull(earlyQueuedGet);
+            Assert.Equal("queued", earlyQueuedGet.Status);
+            Assert.Null(earlyQueuedGet.FirstReadAt);
+
+            metrics.RecordFirstReadIfCompleted(requestId);
+            var (earlyQWait, earlyProc, earlyDeliv) = metrics.GetItemTimings(requestId);
+            Assert.Null(earlyDeliv);
+
+            // 4. Налаштування точки перехоплення TestHookAfterCommitAsync:
+            // Викликається детерміновано ОДРАЗУ після COMMIT бізнес-транзакції в БД,
+            // коли статус у PostgreSQL вже став 'done', а воркер ще не вийшов з конвеєра обробки.
+            EnrollmentStatusResponseDto? hookedGetStatus = null;
+            double? hookedDeliveryMs = null;
+            DateTimeOffset? hookedFirstReadAt = null;
+
+            processor.TestHookAfterCommitAsync = async (finishedItem) =>
+            {
+                // Симуляція першого звернення іншого потоку (клієнтського GET) рівно в момент завершення транзакції
+                var t4 = DateTimeOffset.UtcNow;
+                hookedGetStatus = await _repo.MarkFirstReadAndGetStatusAsync(finishedItem.Id, t4);
+                hookedFirstReadAt = hookedGetStatus?.FirstReadAt;
+
+                if (hookedGetStatus?.Status is "done" or "rejected" or "failed")
+                {
+                    metrics.RecordFirstReadIfCompleted(finishedItem.Id);
+                }
+
+                var (_, _, deliv) = metrics.GetItemTimings(finishedItem.Id);
+                hookedDeliveryMs = deliv;
+            };
+
+            // 5. Запуск обробки воркером
+            await processor.ProcessItemAsync(1, item, isAsyncModel: true, queue);
+
+            // 6. Перевірка результатів перехопленого першого GET:
+            Assert.NotNull(hookedGetStatus);
+            Assert.Equal("done", hookedGetStatus.Status);
+            Assert.NotNull(hookedFirstReadAt);
+
+            // КРИТИЧНИЙ ІНВАРІАНТ: delivery_wait_ms зафіксовано САМЕ на найпершому GET після COMMIT, а не відкладено!
+            Assert.NotNull(hookedDeliveryMs);
+            Assert.True(hookedDeliveryMs.Value >= 0.0, $"delivery_wait_ms повинен бути >= 0, але отримано {hookedDeliveryMs.Value}");
+
+            // 7. Повторний GET клієнта:
+            var secondGet = await _repo.MarkFirstReadAndGetStatusAsync(requestId, DateTimeOffset.UtcNow.AddSeconds(1));
+            Assert.NotNull(secondGet);
+            Assert.Equal(hookedFirstReadAt.Value.ToUnixTimeMilliseconds(), secondGet.FirstReadAt!.Value.ToUnixTimeMilliseconds());
+
+            metrics.RecordFirstReadIfCompleted(requestId);
+            var (_, _, secondDeliveryMs) = metrics.GetItemTimings(requestId);
+            Assert.NotNull(secondDeliveryMs);
+            // delivery_wait_ms НЕ змінився на час другого GET, а зберігся з першого читання
+            Assert.Equal(hookedDeliveryMs.Value, secondDeliveryMs.Value);
+
+            // 8. Конкурентні паралельні GET (10 потоків) отримують ідентичний результат
+            var concurrentTasks = Enumerable.Range(1, 10).Select(async i =>
+            {
+                var now = DateTimeOffset.UtcNow.AddMilliseconds(i * 50);
+                var res = await _repo.MarkFirstReadAndGetStatusAsync(requestId, now);
+                metrics.RecordFirstReadIfCompleted(requestId);
+                var (_, _, d) = metrics.GetItemTimings(requestId);
+                return (res?.FirstReadAt, d);
+            }).ToArray();
+
+            var concurrentResults = await Task.WhenAll(concurrentTasks);
+            Assert.All(concurrentResults, r =>
+            {
+                Assert.NotNull(r.FirstReadAt);
+                Assert.Equal(hookedFirstReadAt.Value.ToUnixTimeMilliseconds(), r.FirstReadAt.Value.ToUnixTimeMilliseconds());
+                Assert.Equal(hookedDeliveryMs.Value, r.d!.Value);
+            });
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, requestId);
+        }
+    }
+
+    // Перевірка коректного відкату FinishProcessingTimestamp при неуспішній транзакції
+    [Fact]
+    public void TransactionRollback_ResetsFinishProcessingTimestamp_DoesNotPublishPrematureFinish()
+    {
+        var metrics = new MetricsCollector();
+        var id = Guid.NewGuid();
+
+        var item = new QueuedRequestItem
+        {
+            Id = id,
+            StudentId = "student-rollback-test",
+            GroupId = "GRP-TEST",
+            CreatedAtUtc = DateTimeOffset.UtcNow
+        };
+
+        metrics.RecordAccepted(item, currentQueueLength: 1);
+        metrics.RecordWorkerStarted(item, currentQueueLength: 0);
+
+        // 1. Воркер публікує позначку перед COMMIT
+        metrics.MarkProcessingFinished(item);
+        Assert.True(item.FinishProcessingTimestamp > 0);
+
+        // 2. Стається помилка / відкат транзакції (ROLLBACK)
+        metrics.ResetProcessingFinished(item);
+        Assert.Equal(0, item.FinishProcessingTimestamp);
+
+        // 3. Клієнтський GET під час незавершеного стану не може зафіксувати delivery
+        metrics.RecordFirstReadIfCompleted(id);
+        Assert.Equal(0, item.FirstReadTimestamp);
+
+        var (qWait, proc, deliv) = metrics.GetItemTimings(id);
+        Assert.Null(deliv);
+
+        // 4. Подальша фіксація статусу failure коректно перезаписує FinishProcessingTimestamp
+        metrics.MarkProcessingFinished(item);
+        metrics.RecordWorkerFinished(item, "failed", currentQueueLength: 0);
+        Assert.True(item.FinishProcessingTimestamp > 0);
+
+        // 5. Тепер перший GET неуспішної заявки фіксує час доставки
+        metrics.RecordFirstReadIfCompleted(id);
+        var (_, _, finalDeliv) = metrics.GetItemTimings(id);
+        Assert.NotNull(finalDeliv);
+        Assert.True(finalDeliv.Value >= 0.0);
     }
 }

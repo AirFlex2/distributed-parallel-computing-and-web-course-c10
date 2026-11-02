@@ -184,6 +184,13 @@ public sealed class MetricsCollector
         return DateTimeOffset.UtcNow;
     }
 
+    public void ResetProcessingFinished(QueuedRequestItem item)
+    {
+        Interlocked.Exchange(ref item.FinishProcessingTimestamp, 0);
+        Interlocked.Exchange(ref item.FirstReadTimestamp, 0);
+        Interlocked.Exchange(ref item.DeliverySampleRecorded, 0);
+    }
+
     public void RecordWorkerFinished(QueuedRequestItem item, string finalStatus, int currentQueueLength)
     {
         long now = item.FinishProcessingTimestamp > 0 ? item.FinishProcessingTimestamp : Stopwatch.GetTimestamp();
