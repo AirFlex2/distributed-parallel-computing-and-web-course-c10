@@ -224,7 +224,7 @@ public sealed class DomainAndQueueTests
     [InlineData(404, "route_not_found", "Маршрут не знайдено")]
     [InlineData(404, "group_not_found", "Групу не знайдено")]
     [InlineData(405, "method_not_allowed", "HTTP-метод не підтримується")]
-    [InlineData(409, "ects_limit_exceeded", "Перевищено ліміт ЄКТС")]
+    [InlineData(422, "ects_limit_exceeded", "Перевищено ліміт ЄКТС")]
     [InlineData(422, "missing_required_fields", "Помилка валідації полів")]
     [InlineData(503, "service_shutting_down", "Сервіс завершує роботу")]
     public void Web_D13_Rfc9457_ProblemDetails_ContractCompliance(int statusCode, string errorCode, string title)
