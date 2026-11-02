@@ -406,7 +406,7 @@ public sealed class DomainAndQueueTests
         Assert.Equal(totalItems, processed.Count);
     }
 
-    // О1.5: Перевірка коректності вимірювання delivery_wait_ms при першому читанні ДО фіксації завершення обробки
+    // О1.5: Перевірка коректності вимірювання delivery_wait_ms при ранньому опитуванні (polling) ДО завершення обробки
     [Fact]
     public void MetricsCollector_FirstReadBeforeWorkerFinished_CorrectlyRecordsDeliverySample()
     {
@@ -425,12 +425,21 @@ public sealed class DomainAndQueueTests
         metrics.RecordAccepted(item, currentQueueLength: 1);
         metrics.RecordWorkerStarted(item, currentQueueLength: 0);
 
-        // 1. Клієнт встигає прочитати статус з БД через GET ДО виклику MarkProcessingFinished воркером
+        // 1. Клієнт виконує ранній опрос (polling) через GET ДО завершення заявки воркером
         metrics.RecordFirstReadIfCompleted(id);
+
+        // Перевіряємо, що ранній опрос НЕ встановив delivery_wait_ms (він залишається null)
+        var (earlyQWait, earlyProc, earlyDeliv) = metrics.GetItemTimings(id);
+        Assert.NotNull(earlyQWait);
+        Assert.Null(earlyProc);
+        Assert.Null(earlyDeliv);
 
         // 2. Воркер встановлює відмітку завершення
         metrics.MarkProcessingFinished(item);
         metrics.RecordWorkerFinished(item, "done", currentQueueLength: 0);
+
+        // 3. Клієнт отримує вже завершену заявку через GET (done)
+        metrics.RecordFirstReadIfCompleted(id);
 
         // Перевіряємо, що таймінги зафіксовані коректно, delivery не null і >= 0
         var (qWait, proc, deliv) = metrics.GetItemTimings(id);

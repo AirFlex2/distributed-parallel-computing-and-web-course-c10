@@ -475,25 +475,20 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             string requestIdStr = postDoc.RootElement.GetProperty("id").GetString()!;
             createdRequestId = Guid.Parse(requestIdStr);
 
-            // 2. Перший GET /v1/enrollment-requests/{id} фіксує first_read_at (t4)
-            var getResp1 = await client.GetAsync($"/v1/enrollment-requests/{requestIdStr}");
-            Assert.Equal(HttpStatusCode.OK, getResp1.StatusCode);
+            // 2. Ранній опрос (polling) до завершення обробки:
+            // Якщо заявка все ще в queued або processing, first_read_at обов'язково null (О1.5 DPC)
+            var getRespEarly = await client.GetAsync($"/v1/enrollment-requests/{requestIdStr}");
+            Assert.Equal(HttpStatusCode.OK, getRespEarly.StatusCode);
+            var getEarlyJson = await getRespEarly.Content.ReadAsStringAsync();
+            using var getEarlyDoc = JsonDocument.Parse(getEarlyJson);
+            string earlyStatus = getEarlyDoc.RootElement.GetProperty("status").GetString()!;
+            if (earlyStatus is "queued" or "processing")
+            {
+                Assert.True(getEarlyDoc.RootElement.TryGetProperty("first_read_at", out var earlyProp));
+                Assert.Equal(JsonValueKind.Null, earlyProp.ValueKind);
+            }
 
-            var getJson1 = await getResp1.Content.ReadAsStringAsync();
-            using var getDoc1 = JsonDocument.Parse(getJson1);
-            Assert.True(getDoc1.RootElement.TryGetProperty("first_read_at", out var firstReadProp));
-            Assert.NotNull(firstReadProp.GetString());
-            string initialFirstRead = firstReadProp.GetString()!;
-
-            // 3. Повторний GET не повинен змінювати t4
-            var getResp2 = await client.GetAsync($"/v1/enrollment-requests/{requestIdStr}");
-            Assert.Equal(HttpStatusCode.OK, getResp2.StatusCode);
-            var getJson2 = await getResp2.Content.ReadAsStringAsync();
-            using var getDoc2 = JsonDocument.Parse(getJson2);
-            string secondFirstRead = getDoc2.RootElement.GetProperty("first_read_at").GetString()!;
-            Assert.Equal(initialFirstRead, secondFirstRead);
-
-            // 4. Очікуємо досягнення кінцевого статусу заявки фоновим воркером із тайм-аутом
+            // 3. Очікуємо досягнення кінцевого статусу заявки фоновим воркером із тайм-аутом
             string finalStatus = "";
             JsonElement finalDocRoot = default;
             var stopwatch = Stopwatch.StartNew();
@@ -522,6 +517,25 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Assert.True(finalDocRoot.TryGetProperty("finished_at", out var finProp) && finProp.GetString() != null);
             Assert.True(finalDocRoot.TryGetProperty("recorded_in_roster", out var rosterProp) && rosterProp.GetBoolean());
             Assert.True(finalDocRoot.TryGetProperty("assigned_group_id", out var grpProp) && grpProp.GetString() == groupId);
+
+            // 4. Перший GET кінцевого результату ('done') атомарно фіксує first_read_at (t4) (О1.5 DPC)
+            Assert.True(finalDocRoot.TryGetProperty("first_read_at", out var firstReadProp));
+            Assert.NotNull(firstReadProp.GetString());
+            string initialFirstRead = firstReadProp.GetString()!;
+
+            // 5. Повторний GET не повинен змінювати t4
+            var getRespRepeat = await client.GetAsync($"/v1/enrollment-requests/{requestIdStr}");
+            Assert.Equal(HttpStatusCode.OK, getRespRepeat.StatusCode);
+            var getRepeatJson = await getRespRepeat.Content.ReadAsStringAsync();
+            using var getRepeatDoc = JsonDocument.Parse(getRepeatJson);
+            string repeatFirstRead = getRepeatDoc.RootElement.GetProperty("first_read_at").GetString()!;
+            Assert.Equal(initialFirstRead, repeatFirstRead);
+
+            // delivery_wait_ms зафіксовано коректно і не обнулено раннім опитуванням
+            if (getRepeatDoc.RootElement.TryGetProperty("delivery_wait_ms", out var delivProp) && delivProp.ValueKind != JsonValueKind.Null)
+            {
+                Assert.True(delivProp.GetDouble() >= 0.0);
+            }
         }
         finally
         {

@@ -106,7 +106,10 @@ public sealed class EnrollmentRequestRepository
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
             UPDATE enrollment_requests
-            SET first_read_at = COALESCE(first_read_at, @now)
+            SET first_read_at = CASE
+                WHEN status IN ('done', 'rejected', 'failed') AND first_read_at IS NULL THEN @now
+                ELSE first_read_at
+            END
             WHERE id = @id
             RETURNING id, student_id, group_id, status, rejection_reason,
                       created_at, started_at, finished_at, first_read_at,

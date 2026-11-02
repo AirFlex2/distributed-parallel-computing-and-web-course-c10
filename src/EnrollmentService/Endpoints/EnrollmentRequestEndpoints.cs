@@ -286,7 +286,12 @@ public static class EnrollmentRequestEndpoints
                     "request_not_found");
             }
 
-            metrics.RecordFirstRead(parsedId);
+            // О1.5 DPC: час першої видачі кінцевого результату фіксується ТІЛЬКИ для вже завершених заявок
+            if (status.Status is "done" or "rejected" or "failed")
+            {
+                metrics.RecordFirstReadIfCompleted(parsedId);
+            }
+
             var (qWait, proc, deliv) = metrics.GetItemTimings(parsedId);
 
             return Results.Ok(status with

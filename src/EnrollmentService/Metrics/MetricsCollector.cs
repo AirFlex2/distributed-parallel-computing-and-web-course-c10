@@ -238,12 +238,19 @@ public sealed class MetricsCollector
             return;
         }
 
-        long now = Stopwatch.GetTimestamp();
-        // Фіксуємо перше звернення клієнта через GET, навіть якщо обробка воркером ще не встигла встановити FinishProcessingTimestamp
-        Interlocked.CompareExchange(ref item.FirstReadTimestamp, now, 0);
+        // О1.5 DPC: час першої видачі кінцевого результату фіксується ТІЛЬКИ для вже завершених заявок (finish > 0).
+        // Ранній опрос (polling) до завершення не повинен фіксувати FirstReadTimestamp
+        // та не повинен обнуляти delivery_wait_ms.
+        if (Volatile.Read(ref item.FinishProcessingTimestamp) == 0)
+        {
+            return;
+        }
 
-        // Якщо обидві мітки (завершення обробки та перше читання) вже присутні — фіксуємо delivery_wait_ms
-        TryRecordDeliverySample(item);
+        long now = Stopwatch.GetTimestamp();
+        if (Interlocked.CompareExchange(ref item.FirstReadTimestamp, now, 0) == 0)
+        {
+            TryRecordDeliverySample(item);
+        }
     }
 
     private void TryRecordDeliverySample(QueuedRequestItem item)
