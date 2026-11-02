@@ -19,7 +19,8 @@ public sealed record DisciplineGroupEntity(
     DateTimeOffset ClosesAt,
     string UniversityTz,
     bool Closed,
-    decimal DisciplineEcts = 0.0m
+    decimal DisciplineEcts = 0.0m,
+    bool DpcSandboxEnabled = false
 );
 
 public sealed record DisciplineEntity(

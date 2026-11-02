@@ -164,6 +164,16 @@ public static class EnrollmentRequestEndpoints
                         "group_not_found");
                 }
 
+                if (!group.DpcSandboxEnabled)
+                {
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        httpContext, opts,
+                        StatusCodes.Status422UnprocessableEntity,
+                        "Група не підтримує автономний прийом РПО",
+                        $"Навчальна група '{groupId}' є інтерактивною групою Web-контуру (dpc_sandbox_enabled = false). Прямий асинхронний прийом через POST /v1/enrollment-requests дозволено лише для груп автономного стенду РПО (DISC-DPC-01, DISC-TEST-SAFE).",
+                        "dpc_sandbox_disabled");
+                }
+
                 var student = await enrollmentRepo.GetStudentByIdAsync(studentId, httpContext.RequestAborted);
                 if (student == null)
                 {

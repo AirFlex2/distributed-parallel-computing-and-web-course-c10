@@ -24,7 +24,7 @@ public sealed class GroupRepository
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
             SELECT g.id, g.discipline_id, g.group_code, g.seats, g.available,
-                   g.opens_at, g.closes_at, g.university_tz, g.closed, d.ects
+                   g.opens_at, g.closes_at, g.university_tz, g.closed, d.ects, g.dpc_sandbox_enabled
             FROM discipline_group g
             JOIN discipline d ON d.id = g.discipline_id
             WHERE g.discipline_id = ANY(@ids)
@@ -45,7 +45,8 @@ public sealed class GroupRepository
                 reader.GetFieldValue<DateTimeOffset>(6),
                 reader.GetString(7),
                 reader.GetBoolean(8),
-                reader.GetDecimal(9)));
+                reader.GetDecimal(9),
+                reader.GetBoolean(10)));
         }
 
         return groups;
@@ -110,7 +111,7 @@ public sealed class GroupRepository
     {
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
-            SELECT g.id, g.discipline_id, g.group_code, g.seats, g.available, g.opens_at, g.closes_at, g.university_tz, g.closed, d.ects
+            SELECT g.id, g.discipline_id, g.group_code, g.seats, g.available, g.opens_at, g.closes_at, g.university_tz, g.closed, d.ects, g.dpc_sandbox_enabled
             FROM discipline_group g
             JOIN discipline d ON d.id = g.discipline_id
             WHERE g.id = @groupId;", conn);
@@ -132,7 +133,8 @@ public sealed class GroupRepository
             reader.GetFieldValue<DateTimeOffset>(6),
             reader.GetString(7),
             reader.GetBoolean(8),
-            reader.GetDecimal(9));
+            reader.GetDecimal(9),
+            reader.GetBoolean(10));
     }
 
     public async Task<(DisciplineGroupEntity Group, string DisciplineTitle, decimal DisciplineEcts)?> GetGroupWithDisciplineAsync(
@@ -144,7 +146,7 @@ public sealed class GroupRepository
     {
         string sql = @"
             SELECT g.id, g.discipline_id, g.group_code, g.seats, g.available, g.opens_at, g.closes_at, g.university_tz, g.closed,
-                   d.title, d.ects
+                   d.title, d.ects, g.dpc_sandbox_enabled
             FROM discipline_group g
             JOIN discipline d ON d.id = g.discipline_id
             WHERE g.id = @groupId" + (forUpdate ? " FOR UPDATE OF g;" : ";");
@@ -157,6 +159,10 @@ public sealed class GroupRepository
             return null;
         }
 
+        string title = reader.GetString(9);
+        decimal ects = reader.GetDecimal(10);
+        bool dpcSandbox = reader.GetBoolean(11);
+
         var group = new DisciplineGroupEntity(
             reader.GetString(0),
             reader.GetString(1),
@@ -166,10 +172,9 @@ public sealed class GroupRepository
             reader.GetFieldValue<DateTimeOffset>(5),
             reader.GetFieldValue<DateTimeOffset>(6),
             reader.GetString(7),
-            reader.GetBoolean(8));
-
-        string title = reader.GetString(9);
-        decimal ects = reader.GetDecimal(10);
+            reader.GetBoolean(8),
+            ects,
+            dpcSandbox);
 
         return (group, title, ects);
     }
@@ -190,7 +195,7 @@ public sealed class GroupRepository
         CancellationToken cancellationToken = default)
     {
         await using var cmd = new NpgsqlCommand(@"
-            SELECT id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed
+            SELECT id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed, dpc_sandbox_enabled
             FROM discipline_group
             WHERE id = @groupId
             FOR UPDATE;", conn, tx);
@@ -211,7 +216,9 @@ public sealed class GroupRepository
             reader.GetFieldValue<DateTimeOffset>(5),
             reader.GetFieldValue<DateTimeOffset>(6),
             reader.GetString(7),
-            reader.GetBoolean(8));
+            reader.GetBoolean(8),
+            0.0m,
+            reader.GetBoolean(9));
     }
 
     public async Task<bool> DecrementAvailableAsync(
@@ -271,7 +278,7 @@ public sealed class GroupRepository
             UPDATE discipline_group
             SET closed = TRUE
             WHERE id = @id
-            RETURNING id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed;", conn);
+            RETURNING id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed, dpc_sandbox_enabled;", conn);
         cmd.Parameters.AddWithValue("id", groupId);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -289,7 +296,9 @@ public sealed class GroupRepository
             reader.GetFieldValue<DateTimeOffset>(5),
             reader.GetFieldValue<DateTimeOffset>(6),
             reader.GetString(7),
-            reader.GetBoolean(8));
+            reader.GetBoolean(8),
+            0.0m,
+            reader.GetBoolean(9));
     }
 
     public async Task<GroupSeatsResponseDto?> GetGroupSeatsByIdAsync(

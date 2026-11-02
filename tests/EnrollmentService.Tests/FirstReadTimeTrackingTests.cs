@@ -378,9 +378,9 @@ public sealed class FirstReadTimeTrackingTests
                 await cmdDisc.ExecuteNonQueryAsync();
 
                 await using var cmdGrp = new NpgsqlCommand(@"
-                    INSERT INTO discipline_group (id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed)
-                    VALUES (@gId, @dId, 'GRP-' || @gId, 10, 10, NOW() - INTERVAL '1 hour', NOW() + INTERVAL '1 hour', 'Europe/Kyiv', false)
-                    ON CONFLICT (id) DO UPDATE SET seats = 10, available = 10, closed = false;", conn);
+                    INSERT INTO discipline_group (id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed, dpc_sandbox_enabled)
+                    VALUES (@gId, @dId, 'GRP-' || @gId, 10, 10, NOW() - INTERVAL '1 hour', NOW() + INTERVAL '1 hour', 'Europe/Kyiv', false, true)
+                    ON CONFLICT (id) DO UPDATE SET seats = 10, available = 10, closed = false, dpc_sandbox_enabled = true;", conn);
                 cmdGrp.Parameters.AddWithValue("gId", groupId);
                 cmdGrp.Parameters.AddWithValue("dId", discId);
                 await cmdGrp.ExecuteNonQueryAsync();

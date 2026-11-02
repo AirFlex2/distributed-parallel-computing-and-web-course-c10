@@ -1234,7 +1234,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "422":
-          description: Пропущені обов'язкові поля student_id або group_id, або невідповідність типів полів у JSON
+          description: Помилка валідації доменних інваріантів або подання заявки на інтерактивну групу Web-контуру (dpc_sandbox_disabled)
           content:
             application/problem+json:
               schema:

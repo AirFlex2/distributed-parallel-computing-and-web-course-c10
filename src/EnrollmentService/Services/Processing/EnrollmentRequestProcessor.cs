@@ -218,6 +218,12 @@ public sealed class EnrollmentRequestProcessor
             }
 
             var group = groupWithDisc.Value.Group;
+            if (!group.DpcSandboxEnabled)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ("rejected", $"Група '{item.GroupId}' не призначена для автономної обробки РПО (dpc_sandbox_enabled = false).");
+            }
+
             string disciplineId = group.DisciplineId;
             decimal disciplineEcts = groupWithDisc.Value.DisciplineEcts;
 
@@ -267,7 +273,7 @@ public sealed class EnrollmentRequestProcessor
             {
                 // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
                 // Пряма паралельна обробка заявок черги з атомарним декрементом available під FOR UPDATE.
-                // (У цільовому Сценарії Б за подіями Web на ЛР4 первинне списання здійснює Web, а РПО веде відомість і second_choice у ЛР2).
+                // (У цільовому Сценарії Б за подіями Web на ЛР4 первинне списання здійснює Web, а РПО веде відомість, а перерозподіл second_choice заплановано у ЛР6 (координація виконавців та захист спільного ресурсу поколінням)).
                 bool decremented = await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, tx, cancellationToken);
                 if (!decremented)
                 {

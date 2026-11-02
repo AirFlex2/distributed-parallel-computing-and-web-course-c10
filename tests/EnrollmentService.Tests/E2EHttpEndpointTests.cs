@@ -50,7 +50,8 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         int available,
         DateTimeOffset opensAt,
         DateTimeOffset closesAt,
-        decimal ects = 3.0m)
+        decimal ects = 3.0m,
+        bool dpcSandboxEnabled = true)
     {
         await using var conn = await TestEnvironment.OpenConnectionAsync();
 
@@ -63,16 +64,43 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         await cmdDisc.ExecuteNonQueryAsync();
 
         await using var cmdGroup = new NpgsqlCommand(@"
-            INSERT INTO discipline_group (id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed)
-            VALUES (@groupId, @discId, 'GRP-' || @groupId, @seats, @available, @opensAt, @closesAt, 'Europe/Kyiv', FALSE)
-            ON CONFLICT (id) DO UPDATE SET seats = @seats, available = @available, opens_at = @opensAt, closes_at = @closesAt, closed = FALSE;", conn);
+            INSERT INTO discipline_group (id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed, dpc_sandbox_enabled)
+            VALUES (@groupId, @discId, 'GRP-' || @groupId, @seats, @available, @opensAt, @closesAt, 'Europe/Kyiv', FALSE, @dpcSandboxEnabled)
+            ON CONFLICT (id) DO UPDATE SET seats = @seats, available = @available, opens_at = @opensAt, closes_at = @closesAt, closed = FALSE, dpc_sandbox_enabled = @dpcSandboxEnabled;", conn);
         cmdGroup.Parameters.AddWithValue("groupId", groupId);
         cmdGroup.Parameters.AddWithValue("discId", disciplineId);
         cmdGroup.Parameters.AddWithValue("seats", seats);
         cmdGroup.Parameters.AddWithValue("available", available);
         cmdGroup.Parameters.AddWithValue("opensAt", opensAt);
         cmdGroup.Parameters.AddWithValue("closesAt", closesAt);
+        cmdGroup.Parameters.AddWithValue("dpcSandboxEnabled", dpcSandboxEnabled);
         await cmdGroup.ExecuteNonQueryAsync();
+    }
+
+    private static async Task WaitForTerminalStatusAsync(
+        HttpClient client,
+        Guid requestId,
+        CancellationToken cancellationToken = default)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
+
+        while (true)
+        {
+            var response = await client.GetAsync($"/v1/enrollment-requests/{requestId}", linked.Token);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync(linked.Token);
+            using var doc = JsonDocument.Parse(json);
+            string status = doc.RootElement.GetProperty("status").GetString()!;
+
+            if (status is "done" or "rejected" or "failed")
+            {
+                return;
+            }
+
+            await Task.Delay(50, linked.Token);
+        }
     }
 
     [SkippableFact]
@@ -615,12 +643,27 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             }
             finally
             {
-                // Звільняємо штучно зарезервовані слоти
+                // Звільняємо штучно зарезервовані слоти, щоб воркер міг продовжити роботу
                 for (int i = 0; i < reservedSlots; i++)
                 {
                     queue.ReleaseSlot();
                 }
             }
+
+            // Дочікуємося завершення обробки заявки воркером
+            await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+
+            // Перевіряємо предметний ефект: рівно один запис у відомості, списано рівно одне місце
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = @reqId;", conn);
+            cmdRoster.Parameters.AddWithValue("reqId", createdRequestId.Value);
+            int rosterCount = (int)(await cmdRoster.ExecuteScalarAsync())!;
+            Assert.Equal(1, rosterCount);
+
+            await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+            cmdGrp.Parameters.AddWithValue("grpId", groupId);
+            int availableSeats = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            Assert.Equal(9, availableSeats);
         }
         finally
         {
@@ -677,6 +720,21 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             using var conflictDoc = JsonDocument.Parse(conflictJson);
             Assert.Equal(409, conflictDoc.RootElement.GetProperty("status").GetInt32());
             Assert.Contains("idempotency_conflict", conflictDoc.RootElement.GetProperty("type").GetString()!);
+
+            // 3. Дочікуємося завершення першої заявки
+            await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+
+            // 4. Перевіряємо предметний ефект: тільки studentId1 у відомості, списано 1 місце
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdRoster = new NpgsqlCommand("SELECT student_id FROM decanate_roster WHERE request_id = @reqId;", conn);
+            cmdRoster.Parameters.AddWithValue("reqId", createdRequestId.Value);
+            string? enrolledStudent = (string?)(await cmdRoster.ExecuteScalarAsync());
+            Assert.Equal(studentId1, enrolledStudent);
+
+            await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+            cmdGrp.Parameters.AddWithValue("grpId", groupId);
+            int availableSeats = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            Assert.Equal(9, availableSeats);
         }
         finally
         {
@@ -734,6 +792,26 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             using var conflictDoc = JsonDocument.Parse(conflictJson);
             Assert.Equal(409, conflictDoc.RootElement.GetProperty("status").GetInt32());
             Assert.Contains("idempotency_conflict", conflictDoc.RootElement.GetProperty("type").GetString()!);
+
+            // 3. Дочікуємося завершення першої заявки
+            await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+
+            // 4. Перевіряємо предметний ефект: тільки groupId1 у відомості
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdRoster = new NpgsqlCommand("SELECT group_id FROM decanate_roster WHERE request_id = @reqId;", conn);
+            cmdRoster.Parameters.AddWithValue("reqId", createdRequestId.Value);
+            string? enrolledGroup = (string?)(await cmdRoster.ExecuteScalarAsync());
+            Assert.Equal(groupId1, enrolledGroup);
+
+            await using var cmdGrp1 = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+            cmdGrp1.Parameters.AddWithValue("grpId", groupId1);
+            int available1 = (int)(await cmdGrp1.ExecuteScalarAsync())!;
+            Assert.Equal(9, available1);
+
+            await using var cmdGrp2 = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+            cmdGrp2.Parameters.AddWithValue("grpId", groupId2);
+            int available2 = (int)(await cmdGrp2.ExecuteScalarAsync())!;
+            Assert.Equal(10, available2);
         }
         finally
         {
@@ -785,12 +863,26 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
                 }
             }
 
+            // Дочікуємося завершення обробки заявки воркером
+            await WaitForTerminalStatusAsync(client, createdRequestId!.Value);
+
             // Перевіряємо базу даних: рівно один запис для даного ключа ідемпотентності
             await using var conn = await TestEnvironment.OpenConnectionAsync();
             await using var cmd = new NpgsqlCommand("SELECT COUNT(*)::INT FROM enrollment_requests WHERE idempotency_key = @key;", conn);
             cmd.Parameters.AddWithValue("key", idempotencyKey);
             int count = (int)(await cmd.ExecuteScalarAsync())!;
             Assert.Equal(1, count);
+
+            // Перевіряємо предметний ефект: рівно один запис у відомості та одне списання місця
+            await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = @reqId;", conn);
+            cmdRoster.Parameters.AddWithValue("reqId", createdRequestId.Value);
+            int rosterCount = (int)(await cmdRoster.ExecuteScalarAsync())!;
+            Assert.Equal(1, rosterCount);
+
+            await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+            cmdGrp.Parameters.AddWithValue("grpId", groupId);
+            int availableSeats = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            Assert.Equal(9, availableSeats);
         }
         finally
         {
@@ -844,16 +936,110 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             createdRequestId = Guid.Parse(firstId);
             Assert.All(responseIds, id => Assert.Equal(firstId, id));
 
-            // У базі повинен бути строго один запис
+            // Дочікуємося завершення обробки заявки воркером
+            await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+
+            // У базі повинен бути строго один запис enrollment_requests
             await using var conn = await TestEnvironment.OpenConnectionAsync();
             await using var cmd = new NpgsqlCommand("SELECT COUNT(*)::INT FROM enrollment_requests WHERE idempotency_key = @key;", conn);
             cmd.Parameters.AddWithValue("key", idempotencyKey);
             int count = (int)(await cmd.ExecuteScalarAsync())!;
             Assert.Equal(1, count);
+
+            // Перевіряємо предметний ефект: рівно один запис у decanate_roster та рівно одне списане місце
+            await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = @reqId;", conn);
+            cmdRoster.Parameters.AddWithValue("reqId", createdRequestId.Value);
+            int rosterCount = (int)(await cmdRoster.ExecuteScalarAsync())!;
+            Assert.Equal(1, rosterCount);
+
+            await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+            cmdGrp.Parameters.AddWithValue("grpId", groupId);
+            int availableSeats = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            Assert.Equal(9, availableSeats);
         }
         finally
         {
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, createdRequestId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task DpcQueue_WebGroupRequest_IsRejectedWith422_AndLeavesSeatsAndStudentStatsUnmodified()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-web-guard";
+        string groupId = "DISC-WEB-01"; // Інтерактивна група Web-контуру (dpc_sandbox_enabled = false)
+
+        await using (var conn = await TestEnvironment.OpenConnectionAsync())
+        {
+            await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
+            cmdClean.Parameters.AddWithValue("id", studentId);
+            await cmdClean.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            // Створюємо студента
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+
+            // Фіксуємо початковий стан групи DISC-WEB-01
+            int initialAvailable;
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+                cmdGrp.Parameters.AddWithValue("grpId", groupId);
+                initialAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            }
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            // Подаємо асинхронну заявку на групу Web-контуру через DPC чергу
+            var postContent = new StringContent(
+                JsonSerializer.Serialize(new { student_id = studentId, group_id = groupId }),
+                Encoding.UTF8,
+                "application/json");
+
+            var response = await client.PostAsync("/v1/enrollment-requests", postContent);
+
+            // Очікуємо відхилення 422 Unprocessable Content
+            Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+            Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            Assert.Equal(422, root.GetProperty("status").GetInt32());
+            Assert.Equal("dpc_sandbox_disabled", root.GetProperty("error_code").GetString());
+
+            // Перевіряємо базу даних: кількість місць у групі та статистика студента НЕ змінилися
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+                cmdGrp.Parameters.AddWithValue("grpId", groupId);
+                int currentAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
+                Assert.Equal(initialAvailable, currentAvailable);
+
+                await using var cmdStud = new NpgsqlCommand("SELECT active_count, active_ects FROM student WHERE id = @id;", conn);
+                cmdStud.Parameters.AddWithValue("id", studentId);
+                await using var reader = await cmdStud.ExecuteReaderAsync();
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal(0, reader.GetInt32(0));
+                Assert.Equal(0.0m, reader.GetDecimal(1));
+
+                await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE student_id = @id;", conn);
+                cmdRoster.Parameters.AddWithValue("id", studentId);
+                int rosterCount = (int)(await cmdRoster.ExecuteScalarAsync())!;
+                Assert.Equal(0, rosterCount);
+            }
+        }
+        finally
+        {
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
+            cmdClean.Parameters.AddWithValue("id", studentId);
+            await cmdClean.ExecuteNonQueryAsync();
         }
     }
 }
