@@ -1023,10 +1023,12 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
                 await using var cmdStud = new NpgsqlCommand("SELECT active_count, active_ects FROM student WHERE id = @id;", conn);
                 cmdStud.Parameters.AddWithValue("id", studentId);
-                await using var reader = await cmdStud.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
-                Assert.Equal(0, reader.GetInt32(0));
-                Assert.Equal(0.0m, reader.GetDecimal(1));
+                await using (var reader = await cmdStud.ExecuteReaderAsync())
+                {
+                    Assert.True(await reader.ReadAsync());
+                    Assert.Equal(0, reader.GetInt32(0));
+                    Assert.Equal(0.0m, reader.GetDecimal(1));
+                }
 
                 await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE student_id = @id;", conn);
                 cmdRoster.Parameters.AddWithValue("id", studentId);
@@ -1037,6 +1039,95 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         finally
         {
             await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
+            cmdClean.Parameters.AddWithValue("id", studentId);
+            await cmdClean.ExecuteNonQueryAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task DpcQueue_StandardDpcGroup_AcceptsRequestAndDecrementsAvailable()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-std-dpc";
+        string groupId = "DISC-DPC-01"; // Штатна група РПО з міграції 002 та 007 (dpc_sandbox_enabled = true)
+        Guid? createdRequestId = null;
+
+        await using (var conn = await TestEnvironment.OpenConnectionAsync())
+        {
+            await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
+            cmdClean.Parameters.AddWithValue("id", studentId);
+            await cmdClean.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+
+            int initialAvailable;
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+                cmdGrp.Parameters.AddWithValue("grpId", groupId);
+                initialAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            }
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            var postContent = new StringContent(
+                JsonSerializer.Serialize(new { student_id = studentId, group_id = groupId }),
+                Encoding.UTF8,
+                "application/json");
+
+            var response = await client.PostAsync("/v1/enrollment-requests", postContent);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.NotNull(response.Headers.Location);
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            string reqIdStr = doc.RootElement.GetProperty("id").GetString()!;
+            createdRequestId = Guid.Parse(reqIdStr);
+
+            // Очікуємо переходу заявки у кінцевий статус
+            await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+
+            // Перевіряємо статус заявки
+            var statusResp = await client.GetAsync($"/v1/enrollment-requests/{createdRequestId.Value}");
+            statusResp.EnsureSuccessStatusCode();
+            var statusJson = await statusResp.Content.ReadAsStringAsync();
+            using var statusDoc = JsonDocument.Parse(statusJson);
+            Assert.Equal("done", statusDoc.RootElement.GetProperty("status").GetString());
+
+            // Перевіряємо базу даних: запис у decanate_roster з'явився, available зменшився на 1
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = @reqId;", conn);
+                cmdRoster.Parameters.AddWithValue("reqId", createdRequestId.Value);
+                int rosterCount = (int)(await cmdRoster.ExecuteScalarAsync())!;
+                Assert.Equal(1, rosterCount);
+
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+                cmdGrp.Parameters.AddWithValue("grpId", groupId);
+                int currentAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
+                Assert.Equal(initialAvailable - 1, currentAvailable);
+            }
+        }
+        finally
+        {
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            if (createdRequestId.HasValue)
+            {
+                await using var cmdRosterClean = new NpgsqlCommand(@"
+                    DELETE FROM decanate_roster WHERE request_id = @reqId;
+                    DELETE FROM enrollment_requests WHERE id = @reqId;
+                    UPDATE discipline_group SET available = available + 1 WHERE id = @grpId;", conn);
+                cmdRosterClean.Parameters.AddWithValue("reqId", createdRequestId.Value);
+                cmdRosterClean.Parameters.AddWithValue("grpId", groupId);
+                await cmdRosterClean.ExecuteNonQueryAsync();
+            }
+
             await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
             cmdClean.Parameters.AddWithValue("id", studentId);
             await cmdClean.ExecuteNonQueryAsync();
