@@ -117,7 +117,10 @@ public sealed class TestEnvironmentSafetyTests
             Database = "postgres"
         };
 
-        // 1. Заздалегідь перевіряємо, чи має поточний користувач права суперкористувача або CREATEROLE
+        // 1. Гарантовано очищаємо можливу тестову БД перед початком операцій
+        await TestEnvironment.DropDatabaseIfExistsAsync(targetDb);
+
+        // 2. Перевіряємо права суперкористувача або CREATEROLE в адміністративному підключенні
         await using (var adminConn = new NpgsqlConnection(adminBuilder.ConnectionString))
         {
             await adminConn.OpenAsync();
@@ -131,26 +134,34 @@ public sealed class TestEnvironmentSafetyTests
                     "[TEST CONFIGURATION ERROR]: Поточний тестовий користувач PostgreSQL не має прав суперкористувача або CREATEROLE, " +
                     "необхідних для налаштування тестової ролі без прав CREATEDB.");
             }
-
-            // Очищення перед створенням без порожніх catch
-            await using var preCleanCmd = new NpgsqlCommand($@"
-                DO $$ BEGIN
-                    IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{unprivilegedUser}') THEN
-                        EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE postgres FROM ""{unprivilegedUser}""';
-                        EXECUTE 'DROP ROLE ""{unprivilegedUser}""';
-                    END IF;
-                END $$;", adminConn);
-            await preCleanCmd.ExecuteNonQueryAsync();
-
-            // Створення тимчасової ролі без CREATEDB
-            await using var createRoleCmd = new NpgsqlCommand($@"
-                CREATE ROLE ""{unprivilegedUser}"" WITH LOGIN PASSWORD '{unprivilegedPass}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
-                GRANT CONNECT ON DATABASE postgres TO ""{unprivilegedUser}"";", adminConn);
-            await createRoleCmd.ExecuteNonQueryAsync();
         }
+
+        bool roleCreated = false;
 
         try
         {
+            // 3. Створення ролі та GRANT всередині загальної структури try/finally
+            await using (var adminConn = new NpgsqlConnection(adminBuilder.ConnectionString))
+            {
+                await adminConn.OpenAsync();
+
+                // Попереднє очищення ролі без порожніх catch
+                await using var preCleanCmd = new NpgsqlCommand($@"
+                    DO $$ BEGIN
+                        IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{unprivilegedUser}') THEN
+                            EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE postgres FROM ""{unprivilegedUser}""';
+                            EXECUTE 'DROP ROLE ""{unprivilegedUser}""';
+                        END IF;
+                    END $$;", adminConn);
+                await preCleanCmd.ExecuteNonQueryAsync();
+
+                await using var createRoleCmd = new NpgsqlCommand($@"
+                    CREATE ROLE ""{unprivilegedUser}"" WITH LOGIN PASSWORD '{unprivilegedPass}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+                    GRANT CONNECT ON DATABASE postgres TO ""{unprivilegedUser}"";", adminConn);
+                await createRoleCmd.ExecuteNonQueryAsync();
+                roleCreated = true;
+            }
+
             var unprivilegedBuilder = new NpgsqlConnectionStringBuilder(TestEnvironment.ConnectionString)
             {
                 Database = targetDb,
@@ -159,11 +170,11 @@ public sealed class TestEnvironmentSafetyTests
                 Timeout = 5
             };
 
-            // 2. Спроба створити тестову БД через користувача без прав CREATEDB
+            // 4. Спроба створити тестову БД через користувача без прав CREATEDB
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 TestEnvironment.EnsureDatabaseCreatedAsync(unprivilegedBuilder.ConnectionString));
 
-            // 3. Перевіряємо зрозуміле повідомлення та точний SQLSTATE 42501
+            // 5. Перевіряємо зрозуміле повідомлення та точний SQLSTATE 42501
             Assert.Contains("DATABASE PERMISSION ERROR", ex.Message);
             Assert.Contains("CREATEDB", ex.Message);
 
@@ -172,7 +183,7 @@ public sealed class TestEnvironmentSafetyTests
         }
         finally
         {
-            // 4. Гарантоване очищення ресурсів без порожніх catch
+            // 6. Гарантоване очищення ресурсів без приховування помилок
             var cleanupErrors = new List<Exception>();
 
             try
@@ -185,24 +196,27 @@ public sealed class TestEnvironmentSafetyTests
                 cleanupErrors.Add(new InvalidOperationException($"Помилка видалення тимчасової БД '{targetDb}': {ex.Message}", ex));
             }
 
-            try
+            if (roleCreated)
             {
-                await using var adminConn = new NpgsqlConnection(adminBuilder.ConnectionString);
-                await adminConn.OpenAsync();
+                try
+                {
+                    await using var adminConn = new NpgsqlConnection(adminBuilder.ConnectionString);
+                    await adminConn.OpenAsync();
 
-                await using var dropRoleCmd = new NpgsqlCommand($@"
-                    DO $$ BEGIN
-                        IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{unprivilegedUser}') THEN
-                            EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE postgres FROM ""{unprivilegedUser}""';
-                            EXECUTE 'DROP ROLE ""{unprivilegedUser}""';
-                        END IF;
-                    END $$;", adminConn);
-                await dropRoleCmd.ExecuteNonQueryAsync();
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[Test Cleanup Error]: Помилка видалення тимчасової ролі '{unprivilegedUser}': {ex}");
-                cleanupErrors.Add(new InvalidOperationException($"Помилка видалення тимчасової ролі '{unprivilegedUser}': {ex.Message}", ex));
+                    await using var dropRoleCmd = new NpgsqlCommand($@"
+                        DO $$ BEGIN
+                            IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{unprivilegedUser}') THEN
+                                EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE postgres FROM ""{unprivilegedUser}""';
+                                EXECUTE 'DROP ROLE ""{unprivilegedUser}""';
+                            END IF;
+                        END $$;", adminConn);
+                    await dropRoleCmd.ExecuteNonQueryAsync();
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Test Cleanup Error]: Помилка видалення тимчасової ролі '{unprivilegedUser}': {ex}");
+                    cleanupErrors.Add(new InvalidOperationException($"Помилка видалення тимчасової ролі '{unprivilegedUser}': {ex.Message}", ex));
+                }
             }
 
             if (cleanupErrors.Count > 0)
@@ -212,10 +226,9 @@ public sealed class TestEnvironmentSafetyTests
         }
     }
 
-    // 6. IsDatabaseAvailableAsync() не пропускає етап створення БД і не глушить помилки безпеки
-    //    Зберігає та відновлює ВСІ змінні середовища CI (CI, GITHUB_ACTIONS, GITLAB_CI, TF_BUILD)
+    // 6a. Перевірка конфігурації: TEST_ALLOW_UNSAFE_DB_OVERRIDE без CI-перемінних блокується до звернення до БД
     [Fact]
-    public async Task IsDatabaseAvailableAsync_DoesNotSkipCreationPhaseAndPropagatesSafetyErrors()
+    public async Task IsDatabaseAvailableAsync_WhenUnsafeOverrideWithoutCi_ThrowsCriticalSafetyError()
     {
         string? originalOverride = Environment.GetEnvironmentVariable("TEST_ALLOW_UNSAFE_DB_OVERRIDE");
         string? originalDb = Environment.GetEnvironmentVariable("TEST_DB_CONNECTION_STRING");
@@ -232,7 +245,8 @@ public sealed class TestEnvironmentSafetyTests
             Environment.SetEnvironmentVariable("GITLAB_CI", null);
             Environment.SetEnvironmentVariable("TF_BUILD", null);
 
-            await Assert.ThrowsAsync<InvalidOperationException>(() => TestEnvironment.IsDatabaseAvailableAsync());
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => TestEnvironment.IsDatabaseAvailableAsync());
+            Assert.Contains("CRITICAL SAFETY ERROR", ex.Message);
         }
         finally
         {
@@ -245,7 +259,34 @@ public sealed class TestEnvironmentSafetyTests
         }
     }
 
-    // 7. IsDatabaseAvailableAsync() обов'язково виконує етап створення БД перед перевіркою доступності
+    // 6b. IsDatabaseAvailableAsync() обов'язково виконує етап створення/підготовки БД і прокидає помилки безпеки
+    [Fact]
+    public async Task IsDatabaseAvailableAsync_DoesNotSkipCreationPhaseAndPropagatesSafetyErrors()
+    {
+        bool creationPhaseInvoked = false;
+
+        TestEnvironment.DatabaseReadyActionOverride = async () =>
+        {
+            creationPhaseInvoked = true;
+            await Task.FromException(new InvalidOperationException("[CRITICAL SAFETY ERROR]: Підготовчий етап створення БД зазнав помилки безпеки"));
+        };
+
+        try
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                TestEnvironment.IsDatabaseAvailableAsync());
+
+            Assert.True(creationPhaseInvoked, "Етап створення БД повинен обов'язково викликатися");
+            Assert.Contains("CRITICAL SAFETY ERROR", ex.Message);
+        }
+        finally
+        {
+            TestEnvironment.DatabaseReadyActionOverride = null;
+        }
+    }
+
+    // 7. IsDatabaseAvailableAsync() доводить строгий порядок: спочатку підготовка БД, потім відкриття/перевірка з'єднання
+    //    Повністю ізольований від реального PostgreSQL
     [Fact]
     public async Task IsDatabaseAvailableAsync_ExecutesCreationPhaseBeforeConnectionCheck()
     {
@@ -253,8 +294,15 @@ public sealed class TestEnvironmentSafetyTests
 
         TestEnvironment.DatabaseReadyActionOverride = async () =>
         {
-            callLog.Add("ensure_database_ready_called");
+            callLog.Add("1_preparation_phase");
             await Task.CompletedTask;
+        };
+
+        TestEnvironment.ConnectionCheckActionOverride = async (connStr) =>
+        {
+            callLog.Add("2_connection_check");
+            await Task.CompletedTask;
+            return true;
         };
 
         try
@@ -262,12 +310,14 @@ public sealed class TestEnvironmentSafetyTests
             bool isAvailable = await TestEnvironment.IsDatabaseAvailableAsync();
             Assert.True(isAvailable);
 
-            Assert.Contains("ensure_database_ready_called", callLog);
-            Assert.Single(callLog);
+            Assert.Equal(2, callLog.Count);
+            Assert.Equal("1_preparation_phase", callLog[0]);
+            Assert.Equal("2_connection_check", callLog[1]);
         }
         finally
         {
             TestEnvironment.DatabaseReadyActionOverride = null;
+            TestEnvironment.ConnectionCheckActionOverride = null;
         }
     }
 
@@ -296,24 +346,43 @@ public sealed class TestEnvironmentSafetyTests
     [Fact]
     public async Task IsDatabaseAvailableAsync_WhenHostOrPortUnreachable_ReturnsFalseWithoutThrowingSafetyError()
     {
-        string? originalDb = Environment.GetEnvironmentVariable("TEST_DB_CONNECTION_STRING");
+        string unreachablePortConnStr = "Host=localhost;Port=5433;Database=dpc_c10_test;Username=dpc_user;Password=dpc_password;Timeout=1";
 
-        try
-        {
-            // Вказуємо валідний локальний хост та валідне ім'я тестової БД, але недоступний порт (5433)
-            Environment.SetEnvironmentVariable("TEST_DB_CONNECTION_STRING",
-                "Host=localhost;Port=5433;Database=dpc_c10_test;Username=dpc_user;Password=dpc_password;Timeout=1");
-
-            bool isAvailable = await TestEnvironment.IsDatabaseAvailableAsync();
-            Assert.False(isAvailable);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("TEST_DB_CONNECTION_STRING", originalDb);
-        }
+        bool isAvailable = await TestEnvironment.IsDatabaseAvailableAsync(unreachablePortConnStr);
+        Assert.False(isAvailable);
     }
 
-    // 10. Прямий виклик EnsureDatabaseCreatedAsync() з основною БД dpc_c10 суворо блокується
+    // 10. IsDatabaseAvailableAsync() при невірному паролі (SQLSTATE 28P01) прокидає помилку і не перетворює її на false/Skip
+    [SkippableFact]
+    public async Task IsDatabaseAvailableAsync_WhenAuthenticationFailsWith28P01_ThrowsExplicitExceptionInsteadOfReturningFalse()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string badPasswordConnStr = "Host=localhost;Port=5432;Database=dpc_c10_test;Username=dpc_user;Password=wrong_invalid_password_c10;Timeout=2";
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            TestEnvironment.IsDatabaseAvailableAsync(badPasswordConnStr));
+
+        Assert.Contains("DATABASE AUTHENTICATION ERROR", ex.Message);
+        Assert.Contains("28P01", ex.Message);
+    }
+
+    // 11. IsDatabaseAvailableAsync() при неіснуючому користувачі прокидає явний виняток і не перетворює на false
+    [SkippableFact]
+    public async Task IsDatabaseAvailableAsync_WhenUserDoesNotExist_ThrowsExplicitExceptionInsteadOfReturningFalse()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string badUserConnStr = "Host=localhost;Port=5432;Database=dpc_c10_test;Username=nonexistent_test_user_xyz;Password=some_pass;Timeout=2";
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            TestEnvironment.IsDatabaseAvailableAsync(badUserConnStr));
+
+        Assert.Contains("DATABASE AUTHENTICATION ERROR", ex.Message);
+        Assert.Contains("28P01", ex.Message);
+    }
+
+    // 12. Прямий виклик EnsureDatabaseCreatedAsync() з основною БД dpc_c10 суворо блокується
     [Fact]
     public async Task EnsureDatabaseCreatedAsync_TargetingMainAppDatabase_ThrowsCriticalSafetyError()
     {
@@ -326,7 +395,7 @@ public sealed class TestEnvironmentSafetyTests
         Assert.Contains("dpc_c10", ex.Message);
     }
 
-    // 11. Прямий виклик EnsureDatabaseCreatedAsync() з довільним ім'ям бази (у т.ч. що містить 'test') блокується
+    // 13. Прямий виклик EnsureDatabaseCreatedAsync() з довільним ім'ям бази (у т.ч. що містить 'test') блокується
     [Theory]
     [InlineData("Host=localhost;Port=5432;Database=arbitrary_db;Username=dpc_user;Password=dpc_password")]
     [InlineData("Host=localhost;Port=5432;Database=custom_test_catalog;Username=dpc_user;Password=dpc_password")]
@@ -340,7 +409,7 @@ public sealed class TestEnvironmentSafetyTests
         Assert.Contains("CRITICAL SAFETY ERROR", ex.Message);
     }
 
-    // 12. Прямий виклик EnsureDatabaseCreatedAsync() з віддаленим хостом суворо блокується
+    // 14. Прямий виклик EnsureDatabaseCreatedAsync() з віддаленим хостом суворо блокується
     [Fact]
     public async Task EnsureDatabaseCreatedAsync_TargetingRemoteHost_ThrowsCriticalSafetyError()
     {

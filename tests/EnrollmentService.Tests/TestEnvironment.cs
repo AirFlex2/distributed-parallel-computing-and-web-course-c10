@@ -11,6 +11,7 @@ public static class TestEnvironment
     private static readonly Lazy<Task> DatabaseReadyTask = new(InitializeTestDatabaseAsync);
 
     internal static Func<Task>? DatabaseReadyActionOverride { get; set; }
+    internal static Func<string, Task<bool>>? ConnectionCheckActionOverride { get; set; }
 
     public static string ConnectionString => ResolveConnectionString();
     public static string ApiAuthToken => ResolveApiToken();
@@ -215,10 +216,20 @@ public static class TestEnvironment
                         await using var createCmd = new NpgsqlCommand(createSql, conn);
                         await createCmd.ExecuteNonQueryAsync();
                     }
-                    catch (PostgresException pgEx) when (pgEx.SqlState == "42501") // insufficient_privilege
+                    catch (PostgresException pgEx)
                     {
+                        if (pgEx.SqlState == "42501") // insufficient_privilege
+                        {
+                            throw new InvalidOperationException(
+                                $"[DATABASE PERMISSION ERROR]: Користувач '{ownerUser}' не має дозволу (CREATEDB) на створення тестової бази даних '{targetDb}' через службову БД '{mDb}': {pgEx.Message} (SQLSTATE: {pgEx.SqlState})", pgEx);
+                        }
+                        if (pgEx.SqlState == "28P01") // invalid_password / authentication failure
+                        {
+                            throw new InvalidOperationException(
+                                $"[DATABASE AUTHENTICATION ERROR]: Помилка автентифікації користувача '{ownerUser}' через службову БД '{mDb}': {pgEx.Message} (SQLSTATE: {pgEx.SqlState})", pgEx);
+                        }
                         throw new InvalidOperationException(
-                            $"[DATABASE PERMISSION ERROR]: Користувач '{ownerUser}' не має дозволу (CREATEDB) на створення тестової бази даних '{targetDb}' через службову БД '{mDb}': {pgEx.Message} (SQLSTATE: {pgEx.SqlState})", pgEx);
+                            $"[DATABASE ERROR]: Помилка PostgreSQL під час підготовки бази '{targetDb}' через службову БД '{mDb}': {pgEx.Message} (SQLSTATE: {pgEx.SqlState})", pgEx);
                     }
                 }
 
@@ -283,10 +294,11 @@ public static class TestEnvironment
         }
     }
 
-    public static async Task<bool> IsDatabaseAvailableAsync()
+    public static async Task<bool> IsDatabaseAvailableAsync(string? connectionString = null)
     {
         // 1. Валідація connection string (викине InvalidOperationException при порушенні формату dpc_c10_test)
-        string connStr = ConnectionString;
+        string connStr = connectionString ?? ConnectionString;
+        ValidateTestConnectionString(connStr);
 
         try
         {
@@ -294,6 +306,11 @@ public static class TestEnvironment
             await EnsureTestDatabaseReadyAsync();
 
             // 3. ПОТІМ відкриваємо з'єднання та перевіряємо доступність
+            if (ConnectionCheckActionOverride != null)
+            {
+                return await ConnectionCheckActionOverride(connStr);
+            }
+
             await using var conn = new NpgsqlConnection(connStr);
             await conn.OpenAsync();
 
@@ -304,31 +321,49 @@ public static class TestEnvironment
         }
         catch (InvalidOperationException ex)
         {
-            // Помилки валідації безпеки та відсутності прав на створення БД НЕ повинні глушитися
-            // і повертати false (що призвело б до помилкового пропуску тесту через Skip.If) — вони мають явно завершувати тест помилкою!
+            // Помилки валідації безпеки, прав доступу, автентифікації та інші помилки PostgreSQL суворо прокидаються як помилки тесту
             if (ex.Message.Contains("CRITICAL SAFETY ERROR") ||
                 ex.Message.Contains("DATABASE PERMISSION ERROR") ||
-                (ex.InnerException is PostgresException pg && pg.SqlState == "42501"))
+                ex.Message.Contains("DATABASE AUTHENTICATION ERROR") ||
+                ex.Message.Contains("DATABASE ERROR") ||
+                (ex.InnerException is PostgresException))
             {
                 throw;
             }
 
-            // Якщо помилка викликана виключно звичайною мережевою недоступністю PostgreSQL (сервер не запущений / порт закритий / таймаут),
+            // Тільки якщо помилка підтверджено є мережевою недоступністю PostgreSQL (сервер вимкнено / порт закритий / таймаут),
             // метод повертає false відповідно до свого призначення для коректної роботи Skip.If
-            if (IsNetworkUnavailabilityException(ex))
+            if (IsConfirmedNetworkError(ex))
             {
                 return false;
             }
 
             throw;
         }
+        catch (PostgresException pgEx)
+        {
+            // Сервер PostgreSQL відповів помилкою — це НЕ мережева помилка, вона НЕ повинна маскуватися під false!
+            if (pgEx.SqlState == "42501")
+            {
+                throw new InvalidOperationException(
+                    $"[DATABASE PERMISSION ERROR]: Відсутні права доступу: {pgEx.Message} (SQLSTATE: 42501)", pgEx);
+            }
+            if (pgEx.SqlState == "28P01")
+            {
+                throw new InvalidOperationException(
+                    $"[DATABASE AUTHENTICATION ERROR]: Помилка автентифікації користувача: {pgEx.Message} (SQLSTATE: 28P01)", pgEx);
+            }
+            throw new InvalidOperationException(
+                $"[DATABASE ERROR]: Помилка PostgreSQL: {pgEx.Message} (SQLSTATE: {pgEx.SqlState})", pgEx);
+        }
         catch (NpgsqlException ex)
         {
-            if (ex is PostgresException pg && pg.SqlState == "42501")
+            // Повертаємо false ТІЛЬКИ для підтверджених мережевих помилок
+            if (IsConfirmedNetworkError(ex))
             {
-                throw new InvalidOperationException($"[DATABASE PERMISSION ERROR]: {ex.Message} (SQLSTATE: 42501)", ex);
+                return false;
             }
-            return false;
+            throw;
         }
         catch (System.IO.IOException)
         {
@@ -344,9 +379,12 @@ public static class TestEnvironment
         }
     }
 
-    private static bool IsNetworkUnavailabilityException(Exception? ex)
+    private static bool IsConfirmedNetworkError(Exception? ex)
     {
         if (ex == null) return false;
+
+        // Будь-який PostgresException означає, що клієнт підключився до сервера і сервер повернув помилку
+        if (ex is PostgresException) return false;
 
         if (ex is System.Net.Sockets.SocketException ||
             ex is TimeoutException ||
@@ -357,17 +395,21 @@ public static class TestEnvironment
 
         if (ex is NpgsqlException npgEx)
         {
+            if (npgEx.InnerException != null)
+            {
+                return IsConfirmedNetworkError(npgEx.InnerException);
+            }
             return npgEx is not PostgresException;
         }
 
         if (ex is AggregateException agg)
         {
-            return agg.InnerExceptions.Count > 0 && agg.InnerExceptions.All(IsNetworkUnavailabilityException);
+            return agg.InnerExceptions.Count > 0 && agg.InnerExceptions.All(IsConfirmedNetworkError);
         }
 
         if (ex.InnerException != null)
         {
-            return IsNetworkUnavailabilityException(ex.InnerException);
+            return IsConfirmedNetworkError(ex.InnerException);
         }
 
         return false;
