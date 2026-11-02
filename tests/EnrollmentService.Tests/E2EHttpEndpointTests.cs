@@ -1117,20 +1117,43 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         finally
         {
             await using var conn = await TestEnvironment.OpenConnectionAsync();
-            if (createdRequestId.HasValue)
+            await using var tx = await conn.BeginTransactionAsync();
+            try
             {
-                await using var cmdRosterClean = new NpgsqlCommand(@"
-                    DELETE FROM decanate_roster WHERE request_id = @reqId;
-                    DELETE FROM enrollment_requests WHERE id = @reqId;
-                    UPDATE discipline_group SET available = available + 1 WHERE id = @grpId;", conn);
-                cmdRosterClean.Parameters.AddWithValue("reqId", createdRequestId.Value);
-                cmdRosterClean.Parameters.AddWithValue("grpId", groupId);
-                await cmdRosterClean.ExecuteNonQueryAsync();
-            }
+                if (createdRequestId.HasValue)
+                {
+                    await using var cmdRosterClean = new NpgsqlCommand(@"
+                        WITH removed AS (
+                            DELETE FROM decanate_roster
+                            WHERE request_id = @reqId
+                            RETURNING group_id
+                        ),
+                        restored AS (
+                            SELECT group_id, COUNT(*) AS amount
+                            FROM removed
+                            GROUP BY group_id
+                        )
+                        UPDATE discipline_group AS dg
+                        SET available = LEAST(dg.seats, dg.available + restored.amount)
+                        FROM restored
+                        WHERE dg.id = restored.group_id;
 
-            await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
-            cmdClean.Parameters.AddWithValue("id", studentId);
-            await cmdClean.ExecuteNonQueryAsync();
+                        DELETE FROM enrollment_requests WHERE id = @reqId;", conn, tx);
+                    cmdRosterClean.Parameters.AddWithValue("reqId", createdRequestId.Value);
+                    await cmdRosterClean.ExecuteNonQueryAsync();
+                }
+
+                await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn, tx);
+                cmdClean.Parameters.AddWithValue("id", studentId);
+                await cmdClean.ExecuteNonQueryAsync();
+
+                await tx.CommitAsync();
+            }
+            catch
+            {
+                await tx.RollbackAsync();
+                throw;
+            }
         }
     }
 }
