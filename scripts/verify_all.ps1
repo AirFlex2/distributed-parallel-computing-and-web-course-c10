@@ -436,7 +436,7 @@ try {
     Write-Header "4. ПУНКТ О1.2 (РПО): Обмежена черга QUEUE_CAPACITY=100, перевантаження 429 та p95 /health під навантаженням"
     $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
 
-    Write-Info "Створення стійкого фонового навантаження (50 паралельних клієнтів, тривалість ~8 с) та паралельний замір /health-app-a..."
+    Write-Info "Створення стійкого фонового навантаження (50 паралельних клієнтів, тривалість ~8 с) та паралельний замір /health і /health-app-a..."
 
     $concurrentClients = 50
     $loadDurationSec = 8
@@ -477,19 +477,32 @@ try {
         }
     } -ThrottleLimit $concurrentClients -AsJob
 
-    # Паралельні заміри затримки /health-app-a через Nginx під час насиченої черги (200 вимірювань)
+    # Паралельні заміри затримки /health (через балансувальник least_conn) та /health-app-a (прямий маршрут) під навантаженням черги
     $healthLatencies = [System.Collections.Generic.List[double]]::new()
+    $healthAppALatencies = [System.Collections.Generic.List[double]]::new()
     $healthSw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($healthLatencies.Count -lt 200 -and $healthSw.Elapsed.TotalSeconds -lt ($loadDurationSec + 2)) {
+    while ($healthLatencies.Count -lt 150 -and $healthSw.Elapsed.TotalSeconds -lt ($loadDurationSec + 2)) {
+        # Замір /health (Nginx least_conn балансування між app-a та app-b)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         try {
-            $hResp = $httpClient.GetAsync("$BaseUrl/health-app-a").GetAwaiter().GetResult()
+            $hResp = $httpClient.GetAsync("$BaseUrl/health").GetAwaiter().GetResult()
             $sw.Stop()
             if ($hResp.IsSuccessStatusCode) {
                 $healthLatencies.Add($sw.Elapsed.TotalMilliseconds)
             }
         } catch { }
-        [System.Threading.Thread]::Sleep(20)
+
+        # Замір /health-app-a (прямий маршрут на навантажений вузол черги app-a)
+        $swA = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $hRespA = $httpClient.GetAsync("$BaseUrl/health-app-a").GetAwaiter().GetResult()
+            $swA.Stop()
+            if ($hRespA.IsSuccessStatusCode) {
+                $healthAppALatencies.Add($swA.Elapsed.TotalMilliseconds)
+            }
+        } catch { }
+
+        [System.Threading.Thread]::Sleep(15)
     }
 
     $null = Wait-Job $loadJob
@@ -510,8 +523,16 @@ try {
     $p50Health = [Math]::Round($sortedHealth[$p50Index], 2)
     $p95Health = [Math]::Round($sortedHealth[$p95Index], 2)
 
+    $sortedHealthA = $healthAppALatencies | Sort-Object
+    $p50IndexA = [Math]::Max(0, [Math]::Ceiling($sortedHealthA.Count * 0.50) - 1)
+    $p95IndexA = [Math]::Max(0, [Math]::Ceiling($sortedHealthA.Count * 0.95) - 1)
+    $p50HealthA = [Math]::Round($sortedHealthA[$p50IndexA], 2)
+    $p95HealthA = [Math]::Round($sortedHealthA[$p95IndexA], 2)
+
     Write-Info "Параметри досліду О1.2: QUEUE_CAPACITY=100, WORKERS=3, одночасних клієнтів=$concurrentClients, тривалість=$loadDurationSec с"
-    Write-Info "Результати заміру: 202 Accepted=$totalAcceptedLoad, 429 TooManyRequests=$total429Load (з Retry-After: $hasRetryAfterCount), замірів /health-app-a=$($healthLatencies.Count)"
+    Write-Info "Результати заміру: 202 Accepted=$totalAcceptedLoad, 429 TooManyRequests=$total429Load (з Retry-After: $hasRetryAfterCount)"
+    Write-Info "Заміри /health (Nginx least_conn): $($healthLatencies.Count) вимірювань, p50 = $p50Health мс, p95 = $p95Health мс"
+    Write-Info "Заміри /health-app-a (прямий на app-a): $($healthAppALatencies.Count) вимірювань, p50 = $p50HealthA мс, p95 = $p95HealthA мс"
     Write-Info "Метрики черги: max_queue_length_observed=$maxObservedQueue, queue_is_bounded=$queueBounded"
 
     if ($total429Load -gt 0 -and $hasRetryAfterCount -eq $total429Load -and $maxObservedQueue -ge 95 -and $queueBounded -eq $true) {
@@ -522,9 +543,15 @@ try {
     }
 
     if ($p95Health -le 100.0) {
-        Write-Pass "Затримка виділеного маршруту /health-app-a через Nginx під навантаженням (О1.2): p50 = $p50Health мс, p95 = $p95Health мс (норматив <= 100 мс ВИКОНАНО)"
+        Write-Pass "Затримка балансованого маршруту /health через Nginx під навантаженням (О1.2): p50 = $p50Health мс, p95 = $p95Health мс (норматив <= 100 мс ВИКОНАНО)"
     } else {
-        Write-Fail "Помилка /health-app-a під навантаженням: p95 = $p95Health мс"
+        Write-Fail "Помилка /health під навантаженням: p95 = $p95Health мс (перевищує 100 мс)"
+    }
+
+    if ($p95HealthA -le 100.0) {
+        Write-Pass "Затримка прямого маршруту /health-app-a під навантаженням черги (О1.2): p50 = $p50HealthA мс, p95 = $p95HealthA мс (норматив <= 100 мс ВИКОНАНО)"
+    } else {
+        Write-Fail "Помилка /health-app-a під навантаженням: p95 = $p95HealthA мс (перевищує 100 мс)"
     }
 
     # --------------------------------------------------------------------------

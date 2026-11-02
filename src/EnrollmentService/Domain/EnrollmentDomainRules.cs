@@ -18,7 +18,7 @@ public static partial class EnrollmentDomainRules
     }
 
     // Д1.5: Чиста функція перевірки точного ліміту кредитів ЄКТС за семестр (decimal / numeric(3,1)).
-    // Сума 30.0 включно дозволена (true), 30.5 відхиляється (false -> 409 Conflict).
+    // Сума 30.0 включно дозволена (true), 30.5 відхиляється (false -> 422 Unprocessable Content).
     public static bool CanEnrollWithEcts(decimal currentActiveEcts, decimal disciplineEcts, decimal maxEcts = MaxSemesterEcts)
     {
         return currentActiveEcts >= 0.0m

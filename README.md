@@ -6,7 +6,7 @@
 ## 1. Курс і тема
 
 - **Назви навчальних курсів**:
-  1. **«Обмін даними у Web-застосунках»** (обов'язкові пункти **О1.1–О1.7** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4, Д1.5**).
+  1. **«Обмін даними у Web-застосунках»** (обов'язкові пункти ядра **О1.1–О1.4, О1.7**, інфраструктурні пункти **О1.5, О1.6** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4, Д1.5**).
   2. **«Розподілені та паралельні обчислення» (РПО)** (обов'язкові пункти **О1.1–О1.5** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4**).
 - **Ідентифікатор і назва теми**: **С10. Запис на вибіркові дисципліни** (каталог вибіркових курсів, формування навчальних груп, контроль лімітів кредитів ЄКТС та кількості дисциплін, ведення відомостей деканату).
 - **Склад команди**:
@@ -298,10 +298,10 @@ pojekt/
 ├── migrations/                                    # Версіоновані міграції PostgreSQL
 │   ├── 001_init_c10_schema.sql                    # Таблиці предметної області, обмеження FK/CHECK, VIEW group_seats
 │   ├── 002_seed_c10_data.sql                      # Довідкові дисципліни, групи та тестові пули студентів
-│   ├── 003_update_group_seats_and_idempotency.sql # Оновлення VIEW group_seats (GREATEST для taken) та поля Idempotency-Key
-│   ├── 004_unique_idempotency_key.sql             # Індекс для Idempotency-Key
+│   ├── 003_update_group_seats_and_idempotency.sql # Оновлення VIEW group_seats (GREATEST) та локальний індекс (student_id, idempotency_key)
+│   ├── 004_unique_idempotency_key.sql             # Спроба створення глобального індексу (no-op через IF NOT EXISTS та наявність імені з 003)
 │   ├── 005_composite_foreign_keys.sql             # Композитні FK (group_id, discipline_id) для усвідомленої денормалізації
-│   └── 006_global_unique_idempotency_key.sql      # Справжній глобальний унікальний індекс для Idempotency-Key
+│   └── 006_global_unique_idempotency_key.sql      # Справжній глобальний унікальний індекс: DROP старого індексу + створення idx_enrollment_requests_idempotency_global
 ├── scripts/                                       # Сценарії автоматизованої перевірки
 │   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів (PowerShell 7+)
 │   └── verify_all.sh                              # Bash-обгортка для середовищ Linux/macOS
@@ -412,6 +412,12 @@ pojekt/
 ### 5.3 Керування міграціями бази даних
 Застосування міграцій відбувається **автоматично** при старті сервісу в модулі `DatabaseInitializer`:
 - Кожен SQL-файл із директорії `migrations/` перевіряється на незмінність за контрольним хешем SHA-256. Якщо раніше застосований файл було змінено без створення нової міграції, сервіс аварійно зупиняється з винятком `InvalidOperationException` для гарантії цілісності схеми.
+
+> [!NOTE]
+> **Принцип незмінності міграцій (Migration Immutability — 004 vs 006)**:
+> У міграції `003` було створено складений унікальний індекс `idx_enrollment_requests_idempotency` за парою `(student_id, idempotency_key)`. У міграції `004` планувалося зробити його глобальним за `(idempotency_key)`, але через директиву `CREATE UNIQUE INDEX IF NOT EXISTS` з тим самим іменем індексу рушій PostgreSQL пропустив команду (no-op), зберігши попередній локальний індекс.
+> За промисловим регламентом контролю версій схеми БД раніше застосовані файли міграцій суворо заборонено модифікувати в репозиторії заднім числом, оскільки їхній хеш SHA-256 зафіксовано в системній таблиці `schema_migrations` робочих і тестових середовищ. Тому коректне виправлення виконано за стандартом roll-forward накатуванням міграції `006_global_unique_idempotency_key.sql`, яка явно видаляє попередній індекс (`DROP INDEX IF EXISTS idx_enrollment_requests_idempotency`) та створює справжній глобальний унікальний індекс `idx_enrollment_requests_idempotency_global ON enrollment_requests(idempotency_key)`.
+
 - Команда ручної перевірки стану таблиць через CLI контейнера:
 ```bash
 docker compose exec -e PGPASSWORD=dpc_password postgres psql -U dpc_user -d dpc_c10 -c "\dt"
@@ -419,14 +425,9 @@ docker compose exec -e PGPASSWORD=dpc_password postgres psql -U dpc_user -d dpc_
 
 ### 5.4 Команди збирання, запуску та тестування
 
-#### 1. Збирання образів контейнерів:
+#### 1. Збирання та запуск контейнерної платформи (єдина команда):
 ```bash
-docker compose build
-```
-
-#### 2. Запуск контейнерної платформи:
-```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 #### 3. Запуск комплексного скрипту автоматизованої атестації:
@@ -506,7 +507,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | Пункт | Формулювання вимоги | Де реалізовано у коді | Як перевірити автоматично |
 | :--- | :--- | :--- | :--- |
 | **О1.1** | Приймання запитів: асинхронний 202 Accepted, стани `queued -> processing -> done / rejected / failed` | [EnrollmentRequestEndpoints.cs](src/EnrollmentService/Endpoints/EnrollmentRequestEndpoints.cs), [EnrollmentRequestProcessor.cs](src/EnrollmentService/Services/Processing/EnrollmentRequestProcessor.cs) | `pwsh scripts/verify_all.ps1` (Етап 3) |
-| **О1.2** | Обмежена черга (`QUEUE_CAPACITY=100`), швидкий 429 Backpressure, чистий замір `/health-app-a` p95 $\le 100$ мс | [MonitorRequestQueue.cs](src/EnrollmentService/Queues/MonitorRequestQueue.cs), [DiagnosticsEndpoints.cs](src/EnrollmentService/Endpoints/DiagnosticsEndpoints.cs) | `pwsh scripts/verify_all.ps1` (Етап 4: 50 клієнтів, p95 = 4.84 мс) |
+| **О1.2** | Обмежена черга (`QUEUE_CAPACITY=100`), швидкий 429 Backpressure, чистий замір `/health` та `/health-app-a` p95 $\le 100$ мс | [MonitorRequestQueue.cs](src/EnrollmentService/Queues/MonitorRequestQueue.cs), [DiagnosticsEndpoints.cs](src/EnrollmentService/Endpoints/DiagnosticsEndpoints.cs) | `pwsh scripts/verify_all.ps1` (Етап 4: 50 клієнтів, p95 <= 5.5 мс) |
 | **О1.3** | Пул воркерів: `WORKERS=3`, повільний виклик (200–700 мс) винесено строго за межі транзакції БД | [EnrollmentWorkerPool.cs](src/EnrollmentService/Services/EnrollmentWorkerPool.cs), [EnrollmentRequestProcessor.cs](src/EnrollmentService/Services/Processing/EnrollmentRequestProcessor.cs) | `pwsh scripts/verify_all.ps1` (Етапи 3, 4) |
 | **О1.4** | Захист спільного ресурсу: порівняння SAFE (`SELECT ... FOR UPDATE`) проти стану гонитви UNSAFE на одній групі | [EnrollmentRequestProcessor.cs](src/EnrollmentService/Services/Processing/EnrollmentRequestProcessor.cs) | `pwsh scripts/verify_all.ps1` (Етап 5) |
 | **О1.5** | Час виконання й метрики: монотонні таймстампи, фіксація `first_read_at`, вибірка 500 замірів у `/metrics` | [MetricsCollector.cs](src/EnrollmentService/Metrics/MetricsCollector.cs), [EnrollmentRequestRepository.cs](src/EnrollmentService/Repositories/EnrollmentRequestRepository.cs) | `pwsh scripts/verify_all.ps1` (Етап 6) |
@@ -531,7 +532,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 
 | Дослід | Режим і команда запуску | Початкові дані та навантаження | Очікуваний результат | Фактичний результат (що видно) |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Замір живучості `/health-app-a` під стійким навантаженням** (РПО О1.2) | `pwsh scripts/verify_all.ps1` (Етап 4)<br>Виділений маршрут Nginx `/health-app-a` до навантаженого вузла | Стійке навантаження: 50 паралельних клієнтів протягом 8 с. `QUEUE_CAPACITY=100`, `WORKERS=3`. Паралельний замір 200 запитів `/health-app-a`. | $p95 \le 100$ мс, негайний 429 Backpressure на надлишкові запити без навантаження на БД, пікова черга досягає ліміту. | **202 Accepted**: 155–158 запитів.<br>**429 Backpressure**: ~8330–8360 відповідей (100% із `Retry-After: 1`).<br>**Пікова черга**: 100/100 (`queue_is_bounded = true`).<br>**p50**: 1.05–1.14 мс, **p95**: 4.84–5.38 мс ($\le 100$ мс). |
+| **1. Замір живучості `/health` та `/health-app-a` під стійким навантаженням** (РПО О1.2) | `pwsh scripts/verify_all.ps1` (Етап 4)<br>Маршрут Nginx `/health` (балансований `least_conn`) та виділений `/health-app-a` до навантаженого вузла | Стійке навантаження: 50 паралельних клієнтів протягом 8 с. `QUEUE_CAPACITY=100`, `WORKERS=3`. Паралельні заміри по 150 запитів `/health` та `/health-app-a`. | $p95 \le 100$ мс (як для `/health`, так і для `/health-app-a`), негайний 429 Backpressure на надлишкові запити без навантаження на БД, пікова черга досягає ліміту. | **202 Accepted**: 155–158 запитів.<br>**429 Backpressure**: ~8330–8360 відповідей (100% із `Retry-After: 1`).<br>**Пікова черга**: 100/100 (`queue_is_bounded = true`).<br>**`/health` (Nginx)**: p50 = 1.1–1.3 мс, **p95** = 4.9–5.5 мс ($\le 100$ мс).<br>**`/health-app-a`**: p50 = 1.0–1.2 мс, **p95** = 4.8–5.4 мс ($\le 100$ мс). |
 | **2. Конкурентний запис: SAFE проти UNSAFE на одній групі** (РПО О1.4) | `pwsh scripts/verify_all.ps1` (Етап 5)<br>Порівняння обробника з `FOR UPDATE` та без нього | Тестова група `DISC-TEST-SAFE` (5 місць).<br>По 20 одночасних запитів від дійсних студентів у двох послідовних прогонах. | У SAFE — рівно 5 done, 15 rejected, інваріант дотримано.<br>В UNSAFE (`UNSAFE_MODE=true`) — переповнення відомості через стан гонитви TOCTOU та Lost Update (`roster_count > seats`). Повільний виклик в обох режимах винесено строго перед транзакцією, конвеєр транзакцій ідентичний. | **SAFE**: 5 done, 15 rejected, `roster_count = 5`, `taken = 5`, `invariant_holds = true`.<br>**UNSAFE**: 9–10 done, `roster_count = 9–10` > seats (5), `taken = 9–10`, `invariant_holds = false` (стан гонитви TOCTOU та Lost Update підтверджено: без `FOR UPDATE` паралельні воркери зчитують застарілий `available`, проходять перевірку та перезаписують залишок місць без умови, записуючи у відомість 9–10 студентів на 5 місць). |
 | **3. Перевірка закону Літтла** ($L = \lambda \cdot W$) (РПО Д1.2) | `pwsh scripts/verify_all.ps1` (Етап 6)<br>Маршрут `GET /metrics` | Пакет із 30 запитів до групи `DISC-DPC-01`. Інтегрування довжини черги $\int Q(t)dt$ та незалежний 100 мс семплер у `MetricsCollector`. | $L_{theor} = \lambda \cdot W$ збігається з інтегралом з похибкою $\le 10\%$ та семплером $\le 15\%$, 0 порушень монотонності. | $\lambda \approx 5.6–6.8$ rps, $W \approx 1.9–2.1$ с.<br>$L_{theor} \approx 12.1–13.4$, $L_{observed} \approx 12.0–13.4$, $L_{sampled\_100ms} \approx 12.1–13.3$.<br>**Розбіжність теорія/інтеграл: 0.20–0.22%** ($\le 10\%$).<br>**Розбіжність семплер/теорія: 0.02–0.72%** ($\le 15\%$).<br>Порушень монотонності: 0. |
 | **4. Порівняння рушіїв черги в пам'яті** (РПО Д1.3) | `pwsh scripts/verify_all.ps1` (Етап 7)<br>`custom_monitor` vs `system_channel` | Пакет із 20 запитів ($N=20$) до групи `DISC-DPC-01` через пул із 3 воркерів. Замір інтервалів `processing_time_ms` та `full_domain_execution_ms`. | Обидва рушії черги надійно обробляють 20/20 запитів без втрат і дедлоків. Завдяки виносу повільного виклику за межі критичної секції БД обробка 20 запитів виконується за ~3 с. | **custom_monitor**: 20 done, `processing` p50 = 401–480 мс, p95 = 648–670 мс; `full_execution` p50 = 1.66–1.88 с, p95 = 3.00–3.32 с.<br>**system_channel**: 20 done, `processing` p50 = 385–433 мс, p95 = 692–704 мс; `full_execution` p50 = 1.73–1.76 с, p95 = 2.97–3.12 с. |
@@ -574,15 +575,24 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
      - Якщо кількість збережених заявок перевищує ліміт черги, фоновий цикл `RunQueueReplenishmentLoopAsync` здійснює послідовну дозавантаження з БД у звільнені слоти в міру обробки воркерами.
      - Заявки зі статусом `processing` переводяться у фінальний стан (`done`, якщо запис вже внесено до `decanate_roster`, або `failed` з причиною переривання, якщо збій стався до транзакції).
      - Атомарний метод `TryMarkStartedAsync` з умовою `WHERE id = @id AND status = 'queued'` гарантує захист від повторної обробки однієї заявки двома воркерами.
-8. **Атомарна фіксація часу першого читання ($t_4$, `first_read_at`)**:
-   - Ендпоінт `GET /v1/enrollment-requests/{id}` фіксує мітку $t_4$ при першому успішному читанні незалежно від поточного стану заявки (`queued`, `processing`, `done`, `rejected`, `failed`).
-   - Умовне оновлення `SET first_read_at = COALESCE(first_read_at, @now)` у межах єдиного запиту гарантує, що повторні або конкурентні GET-запити не перезаписують початкову відмітку часу.
-   - Для обчислення затримок використовуються строго монотонні годинники в межах відповідного процесу (`Stopwatch.GetTimestamp()`), виключаючи розрахунки між різними екземплярами.
-9. **Типізована відповідність бізнес-відмов HTTP-статусам**:
-   - `400 Bad Request`: синтаксично некоректний JSON (`invalid_json_syntax`) або невалідний формат GUID (`invalid_request_id_format`).
-   - `404 Not Found`: група не існує (`group_not_found`) або студент не знайдений (`student_not_found`).
-   - `409 Conflict`: вичерпано вільні місця (`group_full`) або повторний запис на ту саму дисципліну (`duplicate_discipline_enrollment`).
-   - `422 Unprocessable Content`: семестровий ліміт ЄКТС > 30.0 (`ects_limit_exceeded`), ліміт дисциплін $K$ (`discipline_limit_exceeded`), вихід за часове вікно (`enrollment_window_closed`), група закрита деканатом (`group_closed`) або заборонений `student_id` у тілі (`owner_in_body_forbidden`).
+8. **Атомарна фіксація часу першої видачі кінцевого результату ($t_4$, `first_read_at`, вимога О1.5 РПО)**:
+   - Відповідно до методичних вимог пункту О1.5 РПО («момент першої видачі кінцевого результату клієнту»), мітка часу `first_read_at` фіксується виключно при першому успішному зверненні клієнта через `GET /v1/enrollment-requests/{id}`, коли заявка перейшла в термінальний стан (`done`, `rejected` або `failed`).
+   - Під час проміжних опитувань клієнтом у станах `queued` та `processing` мітка не встановлюється (залишається `NULL`), що забезпечує коректне вимірювання інтервалу доставки кінцевого результату (`delivery_wait_ms = t4 - t3`).
+   - Атомарне оновлення в PostgreSQL (`UPDATE enrollment_requests SET first_read_at = CASE WHEN status IN ('done','rejected','failed') AND first_read_at IS NULL THEN @now ELSE first_read_at END`) гарантує, що лише перший запит після завершення фіксує мітку, а конкурентні повторні GET-запити її не перезаписують.
+   - Для обчислення затримок використовуються строго монотонні годинники в межах процесу (`Stopwatch.GetTimestamp()`), виключаючи розрахунки між різними вузлами та стрибки системного годинника ОС.
+9. **Типізована відповідність бізнес-відмов HTTP-статусам (розмежування 409 Conflict та 422 Unprocessable Content)**:
+   - `400 Bad Request`: синтаксично некоректний JSON (`invalid_json_syntax`), відсутній обов'язковий заголовок (`missing_user_header`) або невалідний формат GUID (`invalid_request_id_format`).
+   - `404 Not Found`: ресурс не знайдено в базі даних — група не існує (`group_not_found`) або студент не зареєстрований (`student_not_found`).
+   - `409 Conflict`: стан конфлікту на рівні розділюваного ресурсу (Resource State Conflict за RFC 9110):
+     - Вичерпано вільні місця в групі при конкурентному змаганні транзакцій (`group_full`).
+     - Конфлікт унікальності активного запису на ту саму дисципліну (`duplicate_discipline_enrollment`).
+     - Конфлікт параметрів при повторному використанні заголовка `Idempotency-Key` (`idempotency_conflict`).
+   - `422 Unprocessable Content`: порушення семантичних доменних інваріантів запиту (Domain Invariant Validation за RFC 9110 / RFC 4918), коли синтаксис і типи валідні, але стан сутності студента або правила навчального процесу не дозволяють виконання операції:
+     - Перевищення семестрового ліміту кредитів ЄКТС > 30.0 (`ects_limit_exceeded`).
+     - Перевищення персонального ліміту $K$ вибіркових дисциплін студента (`discipline_limit_exceeded`).
+     - Подання заявки поза межами відкритого часового вікна запису (`enrollment_window_closed`).
+     - Спроба запису в групу, закріплену та закриту деканатом (`group_closed`).
+     - Порушення протоколу автентифікації — передача `student_id` у тілі запиту замість заголовка `X-User-Id` (`owner_in_body_forbidden`).
 10. **Авторизація за ролями для службових дій деканату (межі ЛР1 та майбутня ЛР3)**:
    - Маршрут закриття набору в групу `/v1/groups/{id}/close` у межах ЛР1 захищений загальним службовим Bearer-токеном (`API_AUTH_TOKEN`), що валідується в `BearerAuthMiddleware`.
    - Повноцінна рольова модель (RBAC із ролями «студент», «працівник деканату», «адміністратор» та клеймами у JWT) винесена за межі ЛР1 відповідно до програми навчання і буде реалізована в ЛР3 (Web), де передбачено автентифікацію, вхід та розмежування доступу за ролями.

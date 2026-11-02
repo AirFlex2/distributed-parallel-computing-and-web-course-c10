@@ -66,35 +66,9 @@ public static class EnrollmentRequestEndpoints
             string groupId = dto!.GroupId!.Trim();
             string payloadFingerprint = $"{studentId}:{groupId}";
 
-            // Перевірка ідемпотентності до резервування слота черги
-            if (!string.IsNullOrWhiteSpace(idempotencyKey))
-            {
-                await using var conn = await connectionFactory.OpenConnectionAsync(httpContext.RequestAborted);
-                var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, conn, httpContext.RequestAborted);
-                if (existing != null)
-                {
-                    if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                        !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
-                        !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
-                    {
-                        return ProblemDetailsMapper.CreateProblemResult(
-                            httpContext, opts,
-                            StatusCodes.Status409Conflict,
-                            "Конфлікт даних ідемпотентного запиту",
-                            $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id або group_id.",
-                            "idempotency_conflict");
-                    }
-
-                    return Results.Accepted($"/v1/enrollment-requests/{existing.Id}", new EnrollmentAcceptedResponseDto(
-                        existing.Id,
-                        existing.StudentId,
-                        existing.GroupId,
-                        existing.Status,
-                        existing.CreatedAt));
-                }
-            }
-
             // Швидка перевірка переповнення черги БЕЗ навантаження бази даних (О1.2)
+            // Виконується строго до звернення до БД (зокрема, до перевірки Idempotency-Key),
+            // забезпечуючи надійний захист PostgreSQL від перевантаження (Backpressure).
             if (!queue.TryReserveSlot())
             {
                 if (workerPool.IsShuttingDown)
@@ -122,6 +96,34 @@ public static class EnrollmentRequestEndpoints
 
             try
             {
+                // Перевірка ідемпотентності (якщо слот успішно зарезервовано).
+                // У разі виявлення існуючої заявки зарезервований слот автоматично звільняється в блоці finally.
+                if (!string.IsNullOrWhiteSpace(idempotencyKey))
+                {
+                    await using var connCheck = await connectionFactory.OpenConnectionAsync(httpContext.RequestAborted);
+                    var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, connCheck, httpContext.RequestAborted);
+                    if (existing != null)
+                    {
+                        if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                            !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
+                            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+                        {
+                            return ProblemDetailsMapper.CreateProblemResult(
+                                httpContext, opts,
+                                StatusCodes.Status409Conflict,
+                                "Конфлікт даних ідемпотентного запиту",
+                                $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id або group_id.",
+                                "idempotency_conflict");
+                        }
+
+                        return Results.Accepted($"/v1/enrollment-requests/{existing.Id}", new EnrollmentAcceptedResponseDto(
+                            existing.Id,
+                            existing.StudentId,
+                            existing.GroupId,
+                            existing.Status,
+                            existing.CreatedAt));
+                    }
+                }
                 var group = await groupRepo.GetGroupByIdAsync(groupId, httpContext.RequestAborted);
                 if (group == null)
                 {
