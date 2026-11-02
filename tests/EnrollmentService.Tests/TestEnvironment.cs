@@ -10,10 +10,21 @@ public static class TestEnvironment
 {
     private static readonly Lazy<Task> DatabaseReadyTask = new(InitializeTestDatabaseAsync);
 
+    internal static Func<Task>? DatabaseReadyActionOverride { get; set; }
+
     public static string ConnectionString => ResolveConnectionString();
     public static string ApiAuthToken => ResolveApiToken();
 
-    public static Task EnsureTestDatabaseReadyAsync() => DatabaseReadyTask.Value;
+    public static async Task EnsureTestDatabaseReadyAsync()
+    {
+        if (DatabaseReadyActionOverride != null)
+        {
+            await DatabaseReadyActionOverride();
+            return;
+        }
+
+        await DatabaseReadyTask.Value;
+    }
 
     private static string ResolveConnectionString()
     {
@@ -291,14 +302,32 @@ public static class TestEnvironment
 
             return true;
         }
-        catch (InvalidOperationException)
+        catch (InvalidOperationException ex)
         {
             // Помилки валідації безпеки та відсутності прав на створення БД НЕ повинні глушитися
-            // і повертати false (що призвело б до пропуску тесту через Skip.If) — вони мають явно завершувати тест помилкою!
+            // і повертати false (що призвело б до помилкового пропуску тесту через Skip.If) — вони мають явно завершувати тест помилкою!
+            if (ex.Message.Contains("CRITICAL SAFETY ERROR") ||
+                ex.Message.Contains("DATABASE PERMISSION ERROR") ||
+                (ex.InnerException is PostgresException pg && pg.SqlState == "42501"))
+            {
+                throw;
+            }
+
+            // Якщо помилка викликана виключно звичайною мережевою недоступністю PostgreSQL (сервер не запущений / порт закритий / таймаут),
+            // метод повертає false відповідно до свого призначення для коректної роботи Skip.If
+            if (IsNetworkUnavailabilityException(ex))
+            {
+                return false;
+            }
+
             throw;
         }
-        catch (NpgsqlException)
+        catch (NpgsqlException ex)
         {
+            if (ex is PostgresException pg && pg.SqlState == "42501")
+            {
+                throw new InvalidOperationException($"[DATABASE PERMISSION ERROR]: {ex.Message} (SQLSTATE: 42501)", ex);
+            }
             return false;
         }
         catch (System.IO.IOException)
@@ -313,6 +342,35 @@ public static class TestEnvironment
         {
             return false;
         }
+    }
+
+    private static bool IsNetworkUnavailabilityException(Exception? ex)
+    {
+        if (ex == null) return false;
+
+        if (ex is System.Net.Sockets.SocketException ||
+            ex is TimeoutException ||
+            ex is System.IO.IOException)
+        {
+            return true;
+        }
+
+        if (ex is NpgsqlException npgEx)
+        {
+            return npgEx is not PostgresException;
+        }
+
+        if (ex is AggregateException agg)
+        {
+            return agg.InnerExceptions.Count > 0 && agg.InnerExceptions.All(IsNetworkUnavailabilityException);
+        }
+
+        if (ex.InnerException != null)
+        {
+            return IsNetworkUnavailabilityException(ex.InnerException);
+        }
+
+        return false;
     }
 
     public static async Task<NpgsqlConnection> OpenConnectionAsync(CancellationToken cancellationToken = default)
