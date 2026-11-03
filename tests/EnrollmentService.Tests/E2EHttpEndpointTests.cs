@@ -983,29 +983,13 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             // Створюємо студента
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
 
-            // Фіксуємо початковий стан групи DISC-WEB-01
+            // Фіксуємо початковий стан групи DISC-WEB-01 (без зміни даних штатної групи)
             int initialAvailable;
             await using (var conn = await TestEnvironment.OpenConnectionAsync())
             {
-                await using var cmdGrp = new NpgsqlCommand("SELECT available, seats FROM discipline_group WHERE id = @grpId;", conn);
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
                 cmdGrp.Parameters.AddWithValue("grpId", groupId);
-                await using (var reader = await cmdGrp.ExecuteReaderAsync())
-                {
-                    Assert.True(await reader.ReadAsync());
-                    initialAvailable = reader.GetInt32(0);
-                    int seats = reader.GetInt32(1);
-
-                    // Якщо попередня зупинка тестів або експеримент вичерпали місця, відновлюємо доступність
-                    if (initialAvailable <= 0)
-                    {
-                        initialAvailable = seats;
-                    }
-                }
-
-                await using var cmdEnsureSeats = new NpgsqlCommand("UPDATE discipline_group SET available = @avail WHERE id = @grpId AND available <= 0;", conn);
-                cmdEnsureSeats.Parameters.AddWithValue("avail", initialAvailable);
-                cmdEnsureSeats.Parameters.AddWithValue("grpId", groupId);
-                await cmdEnsureSeats.ExecuteNonQueryAsync();
+                initialAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
             }
 
             var client = _factory.CreateClient();
@@ -1062,48 +1046,29 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
     }
 
     [SkippableFact]
-    public async Task DpcQueue_StandardDpcGroup_AcceptsRequestAndDecrementsAvailable()
+    public async Task DpcQueue_SandboxGroup_AcceptsRequestAndDecrementsAvailable()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        string studentId = "student-e2e-std-dpc";
-        string groupId = "DISC-DPC-01"; // Штатна група РПО з міграції 002 та 007 (dpc_sandbox_enabled = true)
+        string studentId = "student-e2e-sandbox-dpc";
+        string groupId = "GRP-E2E-DPC-01";
+        string discId = "DISC-E2E-DPC";
         Guid? createdRequestId = null;
 
-        await using (var conn = await TestEnvironment.OpenConnectionAsync())
-        {
-            await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn);
-            cmdClean.Parameters.AddWithValue("id", studentId);
-            await cmdClean.ExecuteNonQueryAsync();
-        }
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
 
         try
         {
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
-
-            int initialAvailable;
-            await using (var conn = await TestEnvironment.OpenConnectionAsync())
-            {
-                await using var cmdGrp = new NpgsqlCommand("SELECT available, seats FROM discipline_group WHERE id = @grpId;", conn);
-                cmdGrp.Parameters.AddWithValue("grpId", groupId);
-                await using (var reader = await cmdGrp.ExecuteReaderAsync())
-                {
-                    Assert.True(await reader.ReadAsync());
-                    initialAvailable = reader.GetInt32(0);
-                    int seats = reader.GetInt32(1);
-
-                    // Якщо попередня зупинка тестів або експеримент вичерпали місця, відновлюємо доступність
-                    if (initialAvailable <= 0)
-                    {
-                        initialAvailable = seats;
-                    }
-                }
-
-                await using var cmdEnsureSeats = new NpgsqlCommand("UPDATE discipline_group SET available = @avail WHERE id = @grpId AND available <= 0;", conn);
-                cmdEnsureSeats.Parameters.AddWithValue("avail", initialAvailable);
-                cmdEnsureSeats.Parameters.AddWithValue("grpId", groupId);
-                await cmdEnsureSeats.ExecuteNonQueryAsync();
-            }
+            await EnsureTestGroupAsync(
+                groupId,
+                discId,
+                seats: 10,
+                available: 10,
+                opensAt: DateTimeOffset.UtcNow.AddDays(-1),
+                closesAt: DateTimeOffset.UtcNow.AddDays(1),
+                ects: 3.0m,
+                dpcSandboxEnabled: true);
 
             var client = _factory.CreateClient();
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
@@ -1132,7 +1097,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             using var statusDoc = JsonDocument.Parse(statusJson);
             Assert.Equal("done", statusDoc.RootElement.GetProperty("status").GetString());
 
-            // Перевіряємо базу даних: запис у decanate_roster з'явився, available зменшився на 1
+            // Перевіряємо базу даних: запис у decanate_roster з'явився, available зменшився на 1 (10 -> 9)
             await using (var conn = await TestEnvironment.OpenConnectionAsync())
             {
                 await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = @reqId;", conn);
@@ -1143,49 +1108,42 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
                 await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
                 cmdGrp.Parameters.AddWithValue("grpId", groupId);
                 int currentAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
-                Assert.Equal(initialAvailable - 1, currentAvailable);
+                Assert.Equal(9, currentAvailable);
             }
         }
         finally
         {
-            await using var conn = await TestEnvironment.OpenConnectionAsync();
-            await using var tx = await conn.BeginTransactionAsync();
-            try
-            {
-                if (createdRequestId.HasValue)
-                {
-                    await using var cmdRosterClean = new NpgsqlCommand(@"
-                        WITH removed AS (
-                            DELETE FROM decanate_roster
-                            WHERE request_id = @reqId
-                            RETURNING group_id
-                        ),
-                        restored AS (
-                            SELECT group_id, COUNT(*) AS amount
-                            FROM removed
-                            GROUP BY group_id
-                        )
-                        UPDATE discipline_group AS dg
-                        SET available = LEAST(dg.seats, dg.available + restored.amount)
-                        FROM restored
-                        WHERE dg.id = restored.group_id;
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, createdRequestId);
+        }
+    }
 
-                        DELETE FROM enrollment_requests WHERE id = @reqId;", conn, tx);
-                    cmdRosterClean.Parameters.AddWithValue("reqId", createdRequestId.Value);
-                    await cmdRosterClean.ExecuteNonQueryAsync();
-                }
+    [SkippableFact]
+    public async Task Migration007_DisciplineGroups_DpcSandboxEnabled_FlagConfiguration()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-                await using var cmdClean = new NpgsqlCommand("DELETE FROM student WHERE id = @id;", conn, tx);
-                cmdClean.Parameters.AddWithValue("id", studentId);
-                await cmdClean.ExecuteNonQueryAsync();
+        await using var conn = await TestEnvironment.OpenConnectionAsync();
 
-                await tx.CommitAsync();
-            }
-            catch
-            {
-                await tx.RollbackAsync();
-                throw;
-            }
+        // 1. Штатні групи автономного контуру РПО (міграція 007) мають мати dpc_sandbox_enabled = TRUE
+        string[] dpcAllowedGroups = { "DISC-DPC-01", "DISC-TEST-SAFE" };
+        foreach (var grpId in dpcAllowedGroups)
+        {
+            await using var cmd = new NpgsqlCommand("SELECT dpc_sandbox_enabled FROM discipline_group WHERE id = @id;", conn);
+            cmd.Parameters.AddWithValue("id", grpId);
+            var result = await cmd.ExecuteScalarAsync();
+            Assert.NotNull(result);
+            Assert.True((bool)result, $"Група '{grpId}' повинна мати dpc_sandbox_enabled = TRUE згідно з міграцією 007.");
+        }
+
+        // 2. Штатні групи інтерактивного Web-контуру (міграції 002-005) мають мати dpc_sandbox_enabled = FALSE
+        string[] webOnlyGroups = { "DISC-WEB-01", "DISC-AI-02", "DISC-SEC-03", "DISC-SEC-04", "DISC-DB-01", "DISC-ONE-SEAT", "DISC-WINDOW-TEST", "DISC-ECTS-10-G1", "DISC-ECTS-10-5-G1" };
+        foreach (var grpId in webOnlyGroups)
+        {
+            await using var cmd = new NpgsqlCommand("SELECT dpc_sandbox_enabled FROM discipline_group WHERE id = @id;", conn);
+            cmd.Parameters.AddWithValue("id", grpId);
+            var result = await cmd.ExecuteScalarAsync();
+            Assert.NotNull(result);
+            Assert.False((bool)result, $"Штатна Web-група '{grpId}' повинна мати dpc_sandbox_enabled = FALSE згідно з міграцією 007.");
         }
     }
 }
