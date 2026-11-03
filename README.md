@@ -311,8 +311,9 @@ pojekt/
 │   ├── 002_seed_c10_data.sql                      # Довідкові дисципліни, групи та тестові пули студентів
 │   ├── 003_update_group_seats_and_idempotency.sql # Оновлення VIEW group_seats (GREATEST) та локальний індекс (student_id, idempotency_key)
 │   ├── 004_unique_idempotency_key.sql             # Спроба створення глобального індексу (no-op через IF NOT EXISTS та наявність імені з 003)
-│   ├── 005_composite_foreign_keys.sql             # Композитні FK (group_id, discipline_id) для усвідомленої денормалізації
-│   └── 006_global_unique_idempotency_key.sql      # Справжній глобальний унікальний індекс: DROP старого індексу + створення idx_enrollment_requests_idempotency_global
+│   ├── 005_composite_foreign_keys.sql             # Композитні FK (group_id, discipline_id)
+│   ├── 006_global_unique_idempotency_key.sql      # Глобальний унікальний індекс Idempotency-Key
+│   └── 007_add_dpc_sandbox_enabled.sql            # Розділення автономних DPC-груп і Web-груп
 ├── scripts/                                       # Сценарії автоматизованої перевірки
 │   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів (PowerShell 7+)
 │   └── verify_all.sh                              # Bash-обгортка для середовищ Linux/macOS
@@ -370,7 +371,7 @@ pojekt/
         ├── BusinessErrorStatusTests.cs            # 9 тестів відповідності бізнес-відмов HTTP-статусам (400/404/409/422)
         ├── FirstReadTimeTrackingTests.cs          # 11 тестів атомарної фіксації t4 first_read_at (усі 8 сценаріїв О1.5 DPC + детермінований тест гонки COMMIT/finish + відкат)
         ├── RestartAndRecoveryTests.cs             # 8 тестів відновлення queued/processing із PostgreSQL при старті
-        ├── E2EHttpEndpointTests.cs                # 12 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
+        ├── E2EHttpEndpointTests.cs                # 20 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
         ├── TestEnvironmentSafetyTests.cs          # 23 тести перевірки ізоляції тестового середовища, створення dpc_c10_test, перевірки SQLSTATE 42501/28P01 та блокування dpc_c10
         ├── TestEnvironment.cs                    # Виділена конфігурація тестового середовища (dpc_c10_test) та очищення даних
         ├── TestCollectionOrder.cs                # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])

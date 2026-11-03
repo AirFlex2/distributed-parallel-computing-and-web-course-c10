@@ -135,7 +135,7 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# Підготовка інфраструктури: запуск контейнера PostgreSQL для успішного виконання 39 інтеграційних xUnit-тестів
+# Запуск усіх модульних, інтеграційних та E2E-тестів xUnit.
 Write-Info "Підготовка бази даних: запуск контейнера PostgreSQL..."
 & $DockerExe compose up -d postgres 2>&1 | Out-Null
 for ($waitPg = 0; $waitPg -lt 30; $waitPg++) {
