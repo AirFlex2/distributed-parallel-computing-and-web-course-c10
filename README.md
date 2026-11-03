@@ -97,7 +97,7 @@ stateDiagram-v2
     
     processing --> done: Успішна валідація лімітів та наявність місць<br>(запис у decanate_roster, available - 1)
     processing --> rejected: Відхилення за правилом: група заповнена,<br>вичерпано ліміт K=5 або 30.0 ЄКТС
-    processing --> failed: Системна помилка обробки або скасування
+    processing --> failed: Системна помилка обробки або невідновлювана помилка виконання
     
     done --> [*]
     rejected --> [*]
@@ -141,7 +141,7 @@ stateDiagram-v2
      2. Після підтвердження студентом (`POST /v1/enrollments/{id}/confirm`) Web переводить запис у `confirmed` і публікує подію `EnrollmentConfirmedEvent(enrollment_id, student_id, group_id, request_id)`.
      3. Контур РПО вичитує подію з брокера, здійснює повільну фонову перевірку в деканаті та фіксує результат у `decanate_roster`.
      4. **Критичний інваріант**: у Сценарії Б контур РПО **не виконує повторного декременту `available` і не збільшує статистику студента**, оскільки місце вже списане та враховане контуром Web!
-     5. Автоматизований розподіл за другим вибором (`assignment_type = 'second_choice'`): саме контур РПО здійснює атомарне списання місця та зачислення до резервної групи після закриття основного набору деканатом (заплановано у ЛР6 (координація виконавців та захист спільного ресурсу поколінням)).
+     5. Автоматизований розподіл за другим вибором (`assignment_type = 'second_choice'`): саме контур РПО здійснює атомарне списання місця та зачислення до резервної групи після закриття основного набору деканатом (заплановано у ЛР6 (координація розподілених виконавців та захист спільного ресурсу за допомогою нумерації поколінь — generation fencing)).
 
 3. **Єдине джерело істини та спільний захист від дублікатів (ЛР1)**:
    - На рівні PostgreSQL обидва контури синхронізовані через представлення `VIEW group_seats`, де зайняті місця обчислюються як `taken = GREATEST(seats - available, roster_count)`.
@@ -151,7 +151,7 @@ stateDiagram-v2
 
 > [!NOTE]
 > **Контрольована денормалізація (Controlled Denormalization) та композитні зовнішні ключі**:
-> За канонічною 3НФ атрибут `discipline_id` у таблицях `enrollment` та `decanate_roster` є транзитивно залежним через `group_id -> discipline_group.discipline_id`. Проте рушій PostgreSQL не підтримує міжтабличні умови в обмеженнях цілісності `UNIQUE (...) WHERE ...`. Для апаратного забезпечення інваріанта «студент не може мати два активні записи на одну й ту саму дисципліну» створено частковий індекс:
+> За канонічною 3НФ атрибут `discipline_id` у таблицях `enrollment` та `decanate_roster` є транзитивно залежним через `group_id -> discipline_group.discipline_id`. Проте рушій PostgreSQL не підтримує міжтабличні умови в обмеженнях цілісності `UNIQUE (...) WHERE ...`. Для забезпечення інваріанта «студент не може мати два активні записи на одну й ту саму дисципліну» створено частковий індекс:
 > `CREATE UNIQUE INDEX idx_enrollment_active_student_discipline ON enrollment(student_id, discipline_id) WHERE status IN ('held', 'confirmed');`
 > Щоб унеможливити будь-яку неузгодженість між групою та дисципліною, у міграції `005_composite_foreign_keys.sql` створено унікальний ключ `discipline_group(id, discipline_id)` та композитні зовнішні ключі:
 > `FOREIGN KEY (group_id, discipline_id) REFERENCES discipline_group(id, discipline_id) ON DELETE CASCADE;`
@@ -273,13 +273,13 @@ flowchart TD
    - Приймає персональний вибір студента через браузерний клієнт.
    - Запити розподіляються Nginx за алгоритмом `least_conn` між `app-a` та `app-b`.
    - Ідентифікатор студента визначається виключно із заголовка `X-User-Id` (передача `student_id` у тілі суворо заборонена — повертається `422 Unprocessable Entity`).
-   - Керує станами таблиці `enrollment` (`held -> confirmed | cancelled | expired`), зміною доступних місць `discipline_group.available` та статистикою студента (`enrolled_disciplines_count`, `enrolled_ects`).
+   - Керує станами таблиці `enrollment` (`held -> confirmed | cancelled | expired`), зміною доступних місць `discipline_group.available` та статистикою студента (поля `active_count` та `active_ects` у таблиці `student`).
    - Web-контур **не виконує прямих записів у таблицю `decanate_roster` та таблицю черги `enrollment_requests`** (передача підтвердженого результату вибору до відомості деканату проєктується через асинхронну подійно-орієнтовану інтеграцію ЛР4).
 2. **Асинхронний контур РПО (`/v1/enrollment-requests`, `/metrics`, `/v1/decanate-roster`)**:
    - Поєднує персистентне збереження заявок у PostgreSQL (`enrollment_requests`) з високоефективною обмеженою чергою в пам'яті вузла `app-a` та механізмом Restart Recovery при перезапуску процесу. Прийом заявки повертає негайну відповідь `202 Accepted`.
    - Забезпечує негайний зворотний тиск (Backpressure): якщо в черзі немає вільних слотів (`QUEUE_CAPACITY = 100`), метод `TryReserveSlot()` миттєво повертає `429 Too Many Requests` із заголовком `Retry-After: 1` **без навантаження бази даних**.
    - Пул із 3 паралельних воркерів вилучає заявки, виконує обов'язковий повільний виклик (200–700 мс) строго поза критичною секцією БД, фіксує зарахування у `decanate_roster` та декрементує `discipline_group.available`.
-   - Відповідає за формування офіційної відомості деканату `decanate_roster` (перерозподіл студентів за другим вибором `second_choice` після закриття запису заплановано у ЛР6 (координація виконавців та захист спільного ресурсу поколінням)).
+   - Відповідає за формування офіційної відомості деканату `decanate_roster` (перерозподіл студентів за другим вибором `second_choice` після закриття запису заплановано у ЛР6 (координація розподілених виконавців та захист спільного ресурсу за допомогою нумерації поколінь — generation fencing)).
    - Контур РПО **не здійснює прямих записів у таблицю `enrollment`**.
 3. **Єдине предметне правило для обох контурів (§1.10)**:
    - Перевірка «чи записаний студент уже на цю дисципліну» виконується уніфікованим SQL-запитом, який перевіряє **обидві таблиці одночасно** (`enrollment` у статусах held/confirmed та `decanate_roster`). Студент, зарахований через чергу РПО, не може повторно записатися на ту саму дисципліну через Web, і навпаки.
@@ -442,24 +442,24 @@ docker compose exec -e PGPASSWORD=dpc_password postgres psql -U dpc_user -d dpc_
 docker compose up -d --build
 ```
 
-#### 3. Запуск комплексного скрипту автоматизованої атестації:
+#### 2. Запуск комплексного скрипту автоматизованої атестації:
 ```powershell
 pwsh scripts/verify_all.ps1
 ```
 *(Скрипт перевіряє лінтування контракту, проходження всіх 93 тестових випадків модульних, інтеграційних та E2E-тестів, перевірку параметрів безпеки, Backpressure 429 при стійкому навантаженні 50 клієнтами, захист від гонитви SAFE vs UNSAFE на одній групі, закон Літтла, Graceful Shutdown з кодом 503, курсорне пагінування, життєвий цикл Web та балансування).*
 
-#### 4. Запуск клієнтського вебзастосунку (пункт Д1.2 Web):
+#### 3. Запуск клієнтського вебзастосунку (пункт Д1.2 Web):
 ```powershell
 pwsh client/start_client.ps1
 ```
 Після запуску відкрийте браузер: **`http://localhost:3000`**.
 
-#### 5. Ручний запуск модульних тестів:
+#### 4. Ручний запуск модульних тестів:
 ```bash
 dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj
 ```
 
-#### 6. Перевірка специфікації OpenAPI лінтером Spectral:
+#### 5. Перевірка специфікації OpenAPI лінтером Spectral:
 ```bash
 npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 ```
@@ -494,7 +494,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | `/v1/enrollment-requests/{id}` | `GET` | `dpc` | Опитування стану заявки (`queued -> processing -> done / rejected / failed`) та фіксація `first_read_at` |
 | `/v1/group-seats` | `GET` | `dpc` | Стан спільного ресурсу через SQL-представлення `VIEW group_seats` |
 | `/v1/group-seats/{id}` | `GET` | `dpc` | Стан місць конкретної групи через `VIEW group_seats` |
-| `/v1/decanate-roster` | `GET` | `dpc` | Офіційна відомість деканату `decanate_roster` (перегляд записів основного набору; обробка `second_choice` запланована у ЛР6 (координація виконавців та захист спільного ресурсу поколінням)) |
+| `/v1/decanate-roster` | `GET` | `dpc` | Офіційна відомість деканату `decanate_roster` (перегляд записів основного набору; обробка `second_choice` запланована у ЛР6 (координація розподілених виконавців та захист спільного ресурсу за допомогою нумерації поколінь — generation fencing)) |
 | `/v1/admin/reset` | `POST` | `shared` | Скидання тестового стенду та перемикання UNSAFE-режиму (захищено `ALLOW_TEST_OVERRIDES`) |
 
 #### 6.1.1 Матриця простежуваності вимог курсу «Обмін даними у Web-застосунках»
@@ -519,7 +519,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | Пункт | Формулювання вимоги | Де реалізовано у коді | Як перевірити автоматично |
 | :--- | :--- | :--- | :--- |
 | **О1.1** | Приймання запитів: асинхронний 202 Accepted, стани `queued -> processing -> done / rejected / failed` | [EnrollmentRequestEndpoints.cs](src/EnrollmentService/Endpoints/EnrollmentRequestEndpoints.cs), [EnrollmentRequestProcessor.cs](src/EnrollmentService/Services/Processing/EnrollmentRequestProcessor.cs) | `pwsh scripts/verify_all.ps1` (Етап 3) |
-| **О1.2** | Обмежена черга (`QUEUE_CAPACITY=100`), швидкий 429 Backpressure, чистий замір `/health` та `/health-app-a` p95 $\le 100$ мс | [MonitorRequestQueue.cs](src/EnrollmentService/Queues/MonitorRequestQueue.cs), [DiagnosticsEndpoints.cs](src/EnrollmentService/Endpoints/DiagnosticsEndpoints.cs) | `pwsh scripts/verify_all.ps1` (Етап 4: 50 клієнтів, p95 <= 5.5 мс) |
+| **О1.2** | Обмежена черга (`QUEUE_CAPACITY=100`), швидкий 429 Backpressure, чистий замір `/health` та `/health-app-a` p95 $\le 100$ мс | [MonitorRequestQueue.cs](src/EnrollmentService/Queues/MonitorRequestQueue.cs), [DiagnosticsEndpoints.cs](src/EnrollmentService/Endpoints/DiagnosticsEndpoints.cs) | `pwsh scripts/verify_all.ps1` (Етап 4: 50 клієнтів, норматив p95 $\le 100$ мс, факт: 4.8–6.7 мс для `/health` та 2.0–2.7 мс для `/health-app-a`) |
 | **О1.3** | Пул воркерів: `WORKERS=3`, повільний виклик (200–700 мс) винесено строго за межі транзакції БД | [EnrollmentWorkerPool.cs](src/EnrollmentService/Services/EnrollmentWorkerPool.cs), [EnrollmentRequestProcessor.cs](src/EnrollmentService/Services/Processing/EnrollmentRequestProcessor.cs) | `pwsh scripts/verify_all.ps1` (Етапи 3, 4) |
 | **О1.4** | Захист спільного ресурсу: порівняння SAFE (`SELECT ... FOR UPDATE`) проти стану гонитви UNSAFE на одній групі | [EnrollmentRequestProcessor.cs](src/EnrollmentService/Services/Processing/EnrollmentRequestProcessor.cs) | `pwsh scripts/verify_all.ps1` (Етап 5) |
 | **О1.5** | Час виконання й метрики: монотонні таймстампи, фіксація `first_read_at`, вибірка 500 замірів у `/metrics` | [MetricsCollector.cs](src/EnrollmentService/Metrics/MetricsCollector.cs), [EnrollmentRequestRepository.cs](src/EnrollmentService/Repositories/EnrollmentRequestRepository.cs) | `pwsh scripts/verify_all.ps1` (Етап 6) |
@@ -532,7 +532,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 Синхронізація доступу до внутрішньої колекції `Queue<QueuedRequestItem>` у класі `MonitorRequestQueue` реалізована за допомогою низькорівневих примітивів CLR:
 1. **Критична секція**: Захищена об'єктом `lock (_syncRoot)` (під капотом викликаються системні методи `Monitor.Enter` / `Monitor.Exit`), що унеможливлює конкурентне пошкодження покажчиків черги.
 2. **Пасивне очікування на порожню чергу без Busy-Waiting (Timeout-Free)**:
-   - **У моделі виділених потоків (`dedicated_threads`)**: коли потік виявляє, що черга порожня (`_queue.Count == 0`), він викликає `Monitor.Wait(_syncRoot)` без штучних періодичних таймаутів. Під час цього виклику потік **атомарно відпускає об'єкт блокування** `_syncRoot` і переводиться планувальником ОС у стан `WaitSleepJoin`, споживаючи **0% процесорного часу**. При надходженні заявки метод `EnqueueReserved` викликає `Monitor.Pulse(_syncRoot)`, що пробуджує рівно один очікуючий потік. При зупинці сервісу викликається `Monitor.PulseAll(_syncRoot)`, гарантуючи вихід усіх потоків.
+   - **У моделі виділених потоків (`dedicated_threads`)**: коли потік виявляє, що черга порожня (`_queue.Count == 0`), він викликає `Monitor.Wait(_syncRoot)` без штучних періодичних таймаутів. Під час цього виклику потік **атомарно відпускає об'єкт блокування** `_syncRoot` і переводиться планувальником ОС у стан `WaitSleepJoin`, реалізуючи пасивне очікування без Busy-Waiting, яке не навантажує процесор активним опитуванням черги. При надходженні заявки метод `EnqueueReserved` викликає `Monitor.Pulse(_syncRoot)`, що пробуджує рівно один очікуючий потік. При зупинці сервісу викликається `Monitor.PulseAll(_syncRoot)`, гарантуючи вихід усіх потоків.
    - **У моделі асинхронних задач (`async_tasks`)**: очікування реалізовано через чергу `Queue<TaskCompletionSource<bool>> _asyncPulseWaiters` під тим самим м'ютексом `_syncRoot`. Якщо черга порожня, створюється `TaskCompletionSource`, а потік ThreadPool звільняється для обслуговування інших задач. Метод `EnqueueReserved` завершує TCS через `TrySetResult(true)`, що пробуджує асинхронний воркер.
    - Під час зупинки сервісу викликається `Monitor.PulseAll(_syncRoot)` та масовий `TrySetResult(true)` для всіх очікуючих асинхронних TCS, гарантуючи коректне завершення воркерів.
 
@@ -634,13 +634,13 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
      - Організація автоматизованого накатування міграцій із контролем незмінності за хешами SHA-256.
      - Створення фонового сервісу періодичного звільнення прострочених held-записів (`HeldEnrollmentExpirationBackgroundService`), що усуває блокування гарячих GET-запитів.
   3. **Розробка контуру паралельної обробки (РПО)**:
-     - Реалізація обмеженої черги в пам'яті (`MonitorRequestQueue`) на базі примітивів блокування CLR `lock (_syncRoot)` та пасивного очікування `Monitor.Wait` / `Monitor.PulseAll` (споживання 0% CPU під час простою черги).
+     - Реалізація обмеженої черги в пам'яті (`MonitorRequestQueue`) на базі примітивів блокування CLR `lock (_syncRoot)` та пасивного очікування `Monitor.Wait` / `Monitor.PulseAll` (пасивне очікування без Busy-Waiting, що усуває холосте навантаження CPU під час простою черги).
      - Створення альтернативного рушія черги на основі `System.Threading.Channels` (`ChannelRequestQueue`).
      - Побудова пулу воркерів з підтримкою двох моделей виконання: асинхронні задачі (`async_tasks`) та виділені системні потоки (`dedicated_threads`).
      - Забезпечення надійного захисту спільного ресурсу за допомогою транзакцій `SELECT ... FOR UPDATE` у канонічному порядку `student -> discipline_group -> enrollment`.
      - Надійна ізоляція винятків у воркерах: гарантоване доведення кожної прийнятої заявки до кінцевого стану (`done | rejected | failed`) без падіння потоків чи процесу.
   4. **Проведення та аналіз стендових досліджень**:
-     - Організація методологічно чистого заміру затримок як балансованого ендпоінта `/health` через Nginx ($p95 = 5.12$ мс), так і виділеного маршруту `/health-app-a` ($p95 = 4.84$ мс) під піковим навантаженням 50 паралельними клієнтами (норматив $\le 100$ мс виконано з великим запасом).
+     - Організація методологічно чистого заміру затримок як балансованого ендпоінта `/health` через Nginx ($p95 = 4.8–6.7$ мс), так і виділеного маршруту `/health-app-a` ($p95 = 2.0–2.7$ мс) під піковим навантаженням 50 паралельними клієнтами (норматив $\le 100$ мс виконано з 15–50-кратним запасом).
      - Постановка порівняльного досліду конкурентності на одній і тій самій групі `DISC-TEST-SAFE` між безпечним режимом (SAFE) та штучним станом гонитви TOCTOU (UNSAFE).
      - Експериментальна верифікація закону Літтла ($L = \lambda \cdot W$) на реальному пакеті з 30 запитів (розбіжність із інтегралом 0.21%, із дискретним семплером 0.02–0.72%).
      - Реалізація та перевірка алгоритму коректного завершення (Graceful Shutdown) на сигнал `SIGTERM` із поверненням HTTP 503 із `X-Request-ID` на нові запити та вивантаженням черги за 1.75 с.
