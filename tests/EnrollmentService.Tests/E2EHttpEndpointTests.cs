@@ -987,9 +987,25 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             int initialAvailable;
             await using (var conn = await TestEnvironment.OpenConnectionAsync())
             {
-                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+                await using var cmdGrp = new NpgsqlCommand("SELECT available, seats FROM discipline_group WHERE id = @grpId;", conn);
                 cmdGrp.Parameters.AddWithValue("grpId", groupId);
-                initialAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
+                await using (var reader = await cmdGrp.ExecuteReaderAsync())
+                {
+                    Assert.True(await reader.ReadAsync());
+                    initialAvailable = reader.GetInt32(0);
+                    int seats = reader.GetInt32(1);
+
+                    // Якщо попередня зупинка тестів або експеримент вичерпали місця, відновлюємо доступність
+                    if (initialAvailable <= 0)
+                    {
+                        initialAvailable = seats;
+                    }
+                }
+
+                await using var cmdEnsureSeats = new NpgsqlCommand("UPDATE discipline_group SET available = @avail WHERE id = @grpId AND available <= 0;", conn);
+                cmdEnsureSeats.Parameters.AddWithValue("avail", initialAvailable);
+                cmdEnsureSeats.Parameters.AddWithValue("grpId", groupId);
+                await cmdEnsureSeats.ExecuteNonQueryAsync();
             }
 
             var client = _factory.CreateClient();
@@ -1068,9 +1084,25 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             int initialAvailable;
             await using (var conn = await TestEnvironment.OpenConnectionAsync())
             {
-                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @grpId;", conn);
+                await using var cmdGrp = new NpgsqlCommand("SELECT available, seats FROM discipline_group WHERE id = @grpId;", conn);
                 cmdGrp.Parameters.AddWithValue("grpId", groupId);
-                initialAvailable = (int)(await cmdGrp.ExecuteScalarAsync())!;
+                await using (var reader = await cmdGrp.ExecuteReaderAsync())
+                {
+                    Assert.True(await reader.ReadAsync());
+                    initialAvailable = reader.GetInt32(0);
+                    int seats = reader.GetInt32(1);
+
+                    // Якщо попередня зупинка тестів або експеримент вичерпали місця, відновлюємо доступність
+                    if (initialAvailable <= 0)
+                    {
+                        initialAvailable = seats;
+                    }
+                }
+
+                await using var cmdEnsureSeats = new NpgsqlCommand("UPDATE discipline_group SET available = @avail WHERE id = @grpId AND available <= 0;", conn);
+                cmdEnsureSeats.Parameters.AddWithValue("avail", initialAvailable);
+                cmdEnsureSeats.Parameters.AddWithValue("grpId", groupId);
+                await cmdEnsureSeats.ExecuteNonQueryAsync();
             }
 
             var client = _factory.CreateClient();

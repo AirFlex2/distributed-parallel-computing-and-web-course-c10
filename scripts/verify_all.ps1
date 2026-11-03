@@ -127,6 +127,25 @@ function Restart-AppWithConfig([string]$engine, [string]$model) {
 Write-Header "СТАРТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1 (Тема С10: Web + РПО)"
 Write-Info "Цільовий сервіс (через балансувальник Nginx): $BaseUrl"
 
+# Перевірка доступності демона Docker
+$dockerInfo = (& $DockerExe info 2>&1) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    Write-Fail "Docker daemon не запущений! Будь ласка, запустіть Docker Desktop у Windows (дочекайтеся статусу 'Engine running') та перезапустіть скрипт.`nПомилка: $dockerInfo"
+    Pop-Location
+    exit 1
+}
+
+# Підготовка інфраструктури: запуск контейнера PostgreSQL для успішного виконання 39 інтеграційних xUnit-тестів
+Write-Info "Підготовка бази даних: запуск контейнера PostgreSQL..."
+& $DockerExe compose up -d postgres 2>&1 | Out-Null
+for ($waitPg = 0; $waitPg -lt 30; $waitPg++) {
+    Start-Sleep -Milliseconds 400
+    try {
+        $null = & $DockerExe compose exec -T postgres pg_isready -U dpc_user -d dpc_c10 2>&1
+        if ($LASTEXITCODE -eq 0) { break }
+    } catch { }
+}
+
 # ------------------------------------------------------------------------------
 # 0. Статична перевірка OpenAPI 3.1 (Spectral), модульні тести та schema_migrations
 # ------------------------------------------------------------------------------
