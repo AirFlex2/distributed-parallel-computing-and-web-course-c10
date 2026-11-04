@@ -52,6 +52,7 @@ public static class ServiceCollectionExtensions
         bool migrateOnly)
     {
         services.AddSingleton<EnrollmentRequestProcessor>();
+        services.AddSingleton<IEnrollmentRequestProcessor>(sp => sp.GetRequiredService<EnrollmentRequestProcessor>());
         services.AddSingleton<EnrollmentWorkerPool>();
 
         if (!migrateOnly)

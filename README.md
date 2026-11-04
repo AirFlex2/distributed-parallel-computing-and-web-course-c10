@@ -313,7 +313,8 @@ pojekt/
 │   ├── 004_unique_idempotency_key.sql             # Спроба створення глобального індексу (no-op через IF NOT EXISTS та наявність імені з 003)
 │   ├── 005_composite_foreign_keys.sql             # Композитні FK (group_id, discipline_id)
 │   ├── 006_global_unique_idempotency_key.sql      # Глобальний унікальний індекс Idempotency-Key
-│   └── 007_add_dpc_sandbox_enabled.sql            # Розділення автономних DPC-груп і Web-груп
+│   ├── 007_add_dpc_sandbox_enabled.sql            # Розділення автономних DPC-груп і Web-груп
+│   └── 008_idempotency_and_joint_enrollment.sql   # Ідемпотентність Web-записів та зв'язок enrollment_id у заявках РПО
 ├── scripts/                                       # Сценарії автоматизованої перевірки
 │   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів (PowerShell 7+)
 │   └── verify_all.sh                              # Bash-обгортка для середовищ Linux/macOS
@@ -470,21 +471,21 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 - **Розділ `web:`**:
   - `openapi`: `openapi.yaml` (єдиний спільний контракт OpenAPI 3.1);
   - `base`: `http://localhost:8080` (вхідна точка через Nginx);
-  - `items`: вибрані пункти ЛР1 поза ядром (`О1.5`, `О1.6`, `Д1.1`, `Д1.4`, `Д1.5`);
+  - `items`: підтверджені пункти ЛР1 Web поза ядром (`О1.5`, `О1.6`, `Д1.4`);
   - `instances`: опубліковані прямі порти екземплярів Kestrel (`app-a: http://localhost:8001`, `app-b: http://localhost:8002`);
   - `services`: співставлення контейнерів у `compose.yaml` (`nginx`, `app-a`, `app-b`, `postgres`);
   - `log_fields`: поля однорядкового журналу JSON (`time`, `instance`, `route`, `status`, `duration`).
 - **Розділ `dpc:`**:
   - `openapi`: `openapi.yaml`;
   - `base`: `http://localhost:8000` (альтернативний порт Nginx для контуру РПО);
-  - `items`: вибрані пункти ЛР1 (`О1.5`, `Д1.4`);
+  - `items`: підтверджені пункти ЛР1 РПО (`О1.5`, `Д1.4`);
   - `services`: `{api: app-a, postgres: postgres}`;
   - `load_s`: `10` (тривалість фонового навантаження);
-  - `resource`: тестовий ресурс `path: /v1/group-seats/DISC-TEST-SAFE`, поле інваріанта `ok_field: invariant_ok`;
+  - `resource`: тестовий ресурс `path: /v1/group-seats/DISC-DPC-01`, поле інваріанта `ok_field: invariant_ok` (суворе узгодження з прикладом `normal` у `receiver`);
   - `metrics`: імена показників у `/metrics` (`queue_length`, `in_flight`, `rejected`).
 - **Розділ `scenario:`**:
-  - Наскрізний ланцюжок дій: створення попереднього запису через Web (`POST /v1/enrollments`), постановка фонової задачі в чергу РПО (`POST /v1/enrollment-requests`), опитування статусу черги (`GET /v1/enrollment-requests/{request}`) та перевірка стану через Web (`GET /v1/enrollments/{enrollment}`).
-- **Сумісність з автономними засобами**: Усі ключі також продубльовано на кореневому рівні словника `checks.yaml` для безпомилкового читання як спільним, так і автономними чекерами кожної окремої дисципліни.
+  - Логічно зв'язаний наскрізний ланцюжок дій (тема C10, `joint/README.md`): створення попереднього запису через Web (`POST /v1/enrollments` зі збереженням `{enrollment}`), передача ідентифікатора в асинхронну заявку РПО (`POST /v1/enrollment-requests` з полем `enrollment_id: "{enrollment}"`), очікування завершення обробки (`GET /v1/enrollment-requests/{request}` статус `done`), перевірка переведення статусу Web-запису у `confirmed` (`GET /v1/enrollments/{enrollment}`).
+- **Структура конфігурації**: Файл `checks.yaml` суворо відповідає формату `joint/checks-template.yaml` (секції `web:`, `dpc:` та `scenario:`), без зайвих непідтверджених кореневих дублювань.
 
 ---
 
@@ -503,6 +504,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | `/v1/enrollments` | `POST` | `main` | **Головна операція Web**: атомарна транзакція запису на групу (`201 Created` + `Location`, стан `held`); іменовані приклади `normal`, `scarce` (`x-capacity: 1`), `missing` |
 | `/v1/enrollments` | `GET` | `list` | Список власних записів студента (`X-User-Id`) із курсорним пагінуванням `(created_at, id)` |
 | `/v1/enrollments/{id}` | `GET` | `object` | Отримання конкретного запису студента за рядковим UUID |
+| `/v1/enrollments/{id}/confirm` | `POST` | `update` | Підтвердження попереднього запису студентом (`held -> confirmed`, зміна стану об'єкта) |
 | `/v1/enrollments/{id}/cancel` | `POST` | `cancel` | Скасування власного запису студентом із поверненням місця в групі |
 | `/v1/groups/{id}/close` | `POST` | `staff-action` | Закриття набору в групу працівником деканату (`closed = true`; у ЛР1 захищено Bearer-токеном) |
 | `/v1/enrollment-requests` | `POST` | `receiver` | **Приймач черги РПО**: прийом заявки в чергу (`202 Accepted`, відсікання `429 Too Many Requests`); приклад `normal` із `{uuid}` |

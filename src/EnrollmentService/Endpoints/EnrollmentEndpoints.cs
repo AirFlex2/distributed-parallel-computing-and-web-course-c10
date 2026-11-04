@@ -62,7 +62,7 @@ public static class EnrollmentEndpoints
             return Results.Ok(result.Value);
         });
 
-        // Головна операція POST /v1/enrollments (Web О1.4, Д1.1, Д1.5)
+        // Головна операція POST /v1/enrollments (Web О1.4, О2.2, Д1.1, Д1.5)
         app.MapPost("/v1/enrollments", async (
             HttpContext ctx,
             EnrollmentService.Services.EnrollmentService enrollmentService,
@@ -73,13 +73,28 @@ public static class EnrollmentEndpoints
                 return userHeaderProblem!;
             }
 
+            string? idempotencyKey = null;
+            if (ctx.Request.Headers.TryGetValue("Idempotency-Key", out var ikHeader) && !string.IsNullOrWhiteSpace(ikHeader))
+            {
+                idempotencyKey = ikHeader.ToString().Trim();
+                if (idempotencyKey.Length > 128)
+                {
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        ctx, opts,
+                        StatusCodes.Status400BadRequest,
+                        "Некоректний заголовок Idempotency-Key",
+                        "Довжина ключа Idempotency-Key не може перевищувати 128 символів.",
+                        "invalid_idempotency_key");
+                }
+            }
+
             var (dto, problemResult) = await HttpPayloadHelper.ReadAndValidateAsync<CreateWebEnrollmentDto>(ctx, opts);
             if (problemResult != null)
             {
                 return problemResult;
             }
 
-            var result = await enrollmentService.CreateEnrollmentAsync(studentId, dto!, ctx.RequestAborted);
+            var result = await enrollmentService.CreateEnrollmentAsync(studentId, dto!, idempotencyKey, ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);
@@ -125,8 +140,8 @@ public static class EnrollmentEndpoints
                 }
             }
 
-            string? cursorRaw = ctx.Request.Query["after"].FirstOrDefault()
-                ?? ctx.Request.Query["cursor"].FirstOrDefault();
+            string? cursorRaw = ctx.Request.Query["cursor"].FirstOrDefault()
+                ?? ctx.Request.Query["after"].FirstOrDefault();
 
             var result = await enrollmentService.GetStudentEnrollmentsAsync(studentId, limit, cursorRaw, ctx.RequestAborted);
             if (!result.IsSuccess)

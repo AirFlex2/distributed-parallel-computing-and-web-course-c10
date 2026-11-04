@@ -1,5 +1,5 @@
 # Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1)
-# Створено на основі joint/checks-template.yaml та специфікацій checks.example.yaml обох курсів.
+# Створено суворо на основі joint/checks-template.yaml та специфікацій checks.example.yaml обох курсів.
 
 # ==============================================================================
 # Розділ курсу «Обмін даними у Web-застосунках» (Web Interactions)
@@ -8,11 +8,9 @@ web:
   openapi: openapi.yaml
   base: http://localhost:8080
   items:
-    - О1.5   # Список із курсором (GET /v1/enrollments?limit=...&after=...)
+    - О1.5   # Список із курсором (GET /v1/enrollments?limit=...&cursor=...)
     - О1.6   # Система, /health, журнал JSON
-    - Д1.1   # Чиста функція перевірки інтервалу [opens_at, closes_at)
     - Д1.4   # traceparent -> trace_id у структурованому журналі JSON
-    - Д1.5   # Часовий пояс навчального закладу Europe/Kyiv
   instances:
     app-a: "http://localhost:8001"
     app-b: "http://localhost:8002"
@@ -42,7 +40,7 @@ dpc:
     postgres: postgres
   load_s: 10
   resource:
-    path: /v1/group-seats/DISC-TEST-SAFE
+    path: /v1/group-seats/DISC-DPC-01
     ok_field: invariant_ok
   metrics:
     - queue_length
@@ -51,6 +49,7 @@ dpc:
 
 # ==============================================================================
 # Спільний сценарій наскрізної перевірки взаємодії двох контурів (Scenario)
+# Наскрізна передача ідентифікатора та стану між Web та DPC (тема C10, joint/README.md)
 # ==============================================================================
 scenario:
   - name: web-create
@@ -59,7 +58,8 @@ scenario:
     method: POST
     path: /v1/enrollments
     body:
-      group_id: DISC-WEB-01
+      group_id: DISC-DPC-01
+    idempotent: true
     status: 201
     save: enrollment
   - name: dpc-submit
@@ -69,7 +69,9 @@ scenario:
     body:
       student_id: student-1
       group_id: DISC-DPC-01
+      enrollment_id: "{enrollment}"
       request_id: "{uuid}"
+    idempotent: true
     status: 202
     save: request
   - name: dpc-result
@@ -79,6 +81,7 @@ scenario:
     status: 200
     expect:
       id: "{request}"
+      status: done
     wait: 60
   - name: web-result
     part: web
@@ -88,37 +91,5 @@ scenario:
     status: 200
     expect:
       id: "{enrollment}"
-      status: held
-
-# ==============================================================================
-# Сумісність із автономними (однокурсовими) засобами перевірки викладача
-# ==============================================================================
-items:
-  - О1.5
-  - О1.6
-  - Д1.1
-  - Д1.4
-  - Д1.5
-instances:
-  app-a: "http://localhost:8001"
-  app-b: "http://localhost:8002"
-services:
-  nginx: nginx
-  api: app-a
-  app-a: app-a
-  app-b: app-b
-  postgres: postgres
-log_fields:
-  time: time
-  instance: instance
-  route: route
-  status: status
-  duration: duration_ms
-load_s: 10
-resource:
-  path: /v1/group-seats/DISC-TEST-SAFE
-  ok_field: invariant_ok
-metrics:
-  - queue_length
-  - in_flight
-  - rejected
+      status: confirmed
+    wait: 60

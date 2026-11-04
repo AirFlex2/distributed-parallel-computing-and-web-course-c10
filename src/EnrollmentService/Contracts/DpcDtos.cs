@@ -12,6 +12,9 @@ public sealed class CreateEnrollmentRequestDto
 
     [JsonPropertyName("request_id")]
     public Guid? RequestId { get; set; }
+
+    [JsonPropertyName("enrollment_id")]
+    public Guid? EnrollmentId { get; set; }
 }
 
 public sealed record EnrollmentAcceptedResponseDto(
@@ -76,6 +79,7 @@ public sealed class QueuedRequestItem
     public required Guid Id { get; init; }
     public required string StudentId { get; init; }
     public required string GroupId { get; init; }
+    public Guid? EnrollmentId { get; init; }
     public required DateTimeOffset CreatedAtUtc { get; init; }
     public string? IdempotencyKey { get; init; }
     public string? RequestPayloadHash { get; init; }

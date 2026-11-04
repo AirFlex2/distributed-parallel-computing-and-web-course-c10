@@ -201,9 +201,9 @@ public sealed class EnrollmentRequestRepository
         {
             await using var insertCmd = new NpgsqlCommand(@"
                 INSERT INTO enrollment_requests (
-                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash
+                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash, enrollment_id
                 ) VALUES (
-                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash
+                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash, @enrollmentId
                 )
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id;", conn);
@@ -218,6 +218,10 @@ public sealed class EnrollmentRequestRepository
             insertCmd.Parameters.Add(new NpgsqlParameter("payloadHash", NpgsqlTypes.NpgsqlDbType.Text)
             {
                 Value = (object?)item.RequestPayloadHash ?? DBNull.Value
+            });
+            insertCmd.Parameters.Add(new NpgsqlParameter("enrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
+            {
+                Value = (object?)item.EnrollmentId ?? DBNull.Value
             });
 
             var result = await insertCmd.ExecuteScalarAsync(cancellationToken);
@@ -247,7 +251,7 @@ public sealed class EnrollmentRequestRepository
     {
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
-            SELECT id, student_id, group_id, created_at, idempotency_key, request_payload_hash
+            SELECT id, student_id, group_id, created_at, idempotency_key, request_payload_hash, enrollment_id
             FROM enrollment_requests
             WHERE status = 'queued'
             ORDER BY created_at ASC, id ASC
@@ -266,6 +270,7 @@ public sealed class EnrollmentRequestRepository
                 CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(3),
                 IdempotencyKey = reader.IsDBNull(4) ? null : reader.GetString(4),
                 RequestPayloadHash = reader.IsDBNull(5) ? null : reader.GetString(5),
+                EnrollmentId = reader.IsDBNull(6) ? null : reader.GetGuid(6),
                 EnqueueTimestamp = System.Diagnostics.Stopwatch.GetTimestamp()
             });
         }

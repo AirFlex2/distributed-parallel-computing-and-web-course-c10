@@ -1146,4 +1146,165 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Assert.False((bool)result, $"Штатна Web-група '{grpId}' повинна мати dpc_sandbox_enabled = FALSE згідно з міграцією 007.");
         }
     }
+
+    [SkippableFact]
+    public async Task Web_O22_IdempotencyKey_SamePayload_ReturnsSavedResultAndDoesNotDeductSeats()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-idem-1";
+        string groupId = "GRP-E2E-IDEM-G1";
+        string discId = "DISC-E2E-IDEM-1";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(
+                groupId,
+                discId,
+                seats: 5,
+                available: 5,
+                opensAt: DateTimeOffset.UtcNow.AddDays(-1),
+                closesAt: DateTimeOffset.UtcNow.AddDays(1),
+                ects: 5.0m);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-web-01");
+
+            var content1 = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
+            var response1 = await client.PostAsync("/v1/enrollments", content1);
+
+            Assert.Equal(HttpStatusCode.Created, response1.StatusCode);
+            var loc1 = response1.Headers.Location?.ToString();
+            Assert.NotNull(loc1);
+            var json1 = await response1.Content.ReadAsStringAsync();
+            using var doc1 = JsonDocument.Parse(json1);
+            var root1 = doc1.RootElement;
+            string id1 = root1.GetProperty("id").GetString()!;
+
+            // Повторний запит із тим самим Idempotency-Key та тим самим тілом
+            var content2 = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
+            var response2 = await client.PostAsync("/v1/enrollments", content2);
+
+            Assert.Equal(HttpStatusCode.Created, response2.StatusCode);
+            var loc2 = response2.Headers.Location?.ToString();
+            Assert.Equal(loc1, loc2);
+            var json2 = await response2.Content.ReadAsStringAsync();
+            using var doc2 = JsonDocument.Parse(json2);
+            var root2 = doc2.RootElement;
+            string id2 = root2.GetProperty("id").GetString()!;
+            Assert.Equal(id1, id2);
+
+            // Перевіряємо стан БД: списано рівно одне місце (available = 4, записів = 1)
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @id;", conn);
+            cmdGrp.Parameters.AddWithValue("id", groupId);
+            int available = (int)(await cmdGrp.ExecuteScalarAsync())!;
+            Assert.Equal(4, available);
+
+            await using var cmdCnt = new NpgsqlCommand("SELECT COUNT(*) FROM enrollment WHERE student_id = @sid;", conn);
+            cmdCnt.Parameters.AddWithValue("sid", studentId);
+            long cnt = (long)(await cmdCnt.ExecuteScalarAsync())!;
+            Assert.Equal(1L, cnt);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Web_O22_IdempotencyKey_DifferentPayload_Returns409Conflict()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-idem-2";
+        string groupId1 = "GRP-E2E-IDEM-G2A";
+        string groupId2 = "GRP-E2E-IDEM-G2B";
+        string discId1 = "DISC-E2E-IDEM-2A";
+        string discId2 = "DISC-E2E-IDEM-2B";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId1, discId1);
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId2, discId2);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(
+                groupId1,
+                discId1,
+                seats: 5,
+                available: 5,
+                opensAt: DateTimeOffset.UtcNow.AddDays(-1),
+                closesAt: DateTimeOffset.UtcNow.AddDays(1),
+                ects: 4.0m);
+
+            await EnsureTestGroupAsync(
+                groupId2,
+                discId2,
+                seats: 5,
+                available: 5,
+                opensAt: DateTimeOffset.UtcNow.AddDays(-1),
+                closesAt: DateTimeOffset.UtcNow.AddDays(1),
+                ects: 4.0m);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", "test-conflict-idem-key");
+
+            // Перший запит
+            var content1 = new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json");
+            var response1 = await client.PostAsync("/v1/enrollments", content1);
+            Assert.Equal(HttpStatusCode.Created, response1.StatusCode);
+
+            // Другий запит із тим самим ключем, але іншою групою -> 409 Conflict
+            var content2 = new StringContent($"{{\"group_id\": \"{groupId2}\"}}", Encoding.UTF8, "application/json");
+            var response2 = await client.PostAsync("/v1/enrollments", content2);
+            Assert.Equal(HttpStatusCode.Conflict, response2.StatusCode);
+
+            var json2 = await response2.Content.ReadAsStringAsync();
+            using var doc2 = JsonDocument.Parse(json2);
+            var root2 = doc2.RootElement;
+            Assert.Equal("idempotency_key_conflict", root2.GetProperty("error_code").GetString());
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId1, discId1);
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId2, discId2);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Migration008_Schema_EnrollmentIdempotencyAndJointSupport()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        await using var conn = await TestEnvironment.OpenConnectionAsync();
+
+        // 1. Перевіряємо наявність колонок idempotency_key та request_payload_hash у таблиці enrollment
+        await using var cmd1 = new NpgsqlCommand(@"
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'enrollment' AND column_name IN ('idempotency_key', 'request_payload_hash');", conn);
+        var cols1 = new HashSet<string>();
+        await using (var rdr = await cmd1.ExecuteReaderAsync())
+        {
+            while (await rdr.ReadAsync())
+            {
+                cols1.Add(rdr.GetString(0));
+            }
+        }
+        Assert.Contains("idempotency_key", cols1);
+        Assert.Contains("request_payload_hash", cols1);
+
+        // 2. Перевіряємо наявність колонки enrollment_id у таблиці enrollment_requests
+        await using var cmd2 = new NpgsqlCommand(@"
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'enrollment_requests' AND column_name = 'enrollment_id';", conn);
+        var res2 = await cmd2.ExecuteScalarAsync();
+        Assert.NotNull(res2);
+        Assert.Equal("enrollment_id", (string)res2);
+    }
 }

@@ -75,8 +75,8 @@ components:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
-      required: false
-      description: Унікальний ключ ідемпотентності клієнта (максимум 128 символів)
+      required: true
+      description: Обов'язковий ключ ідемпотентності клієнта (О1.4, О2.2 Web). Повтор із тим самим ключем повертає збережений результат
       schema:
         type: string
         maxLength: 128
@@ -332,6 +332,9 @@ components:
           type: string
         request_id:
           type: string
+        enrollment_id:
+          type: string
+          format: uuid
 
     DpcEnrollmentAcceptedResponse:
       type: object
@@ -844,10 +847,16 @@ paths:
             minimum: 1
             maximum: 50
             default: 10
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозорий курсор next_cursor із попередньої відповіді (офіційний параметр перевірки Web)
+          schema:
+            type: string
         - name: after
           in: query
           required: false
-          description: Непрозорий курсор next_cursor із попередньої відповіді
+          description: Псевдонім параметра cursor (для зворотної сумісності)
           schema:
             type: string
       responses:
@@ -950,6 +959,7 @@ paths:
       tags: [Web]
       summary: "Підтвердження попереднього запису студентом (Web О1.1: held -> confirmed)"
       description: Переводить запис студента у стан `confirmed` (остаточне зарахування).
+      x-course: update
       parameters:
         - name: id
           in: path
@@ -1396,15 +1406,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/GroupSeatsResponse"
               example:
-                group_id: "DISC-TEST-SAFE"
-                discipline_title: "Ізольований стенд перевірки конкурентності (О1.4 РПО)"
-                seats: 5
-                taken: 5
-                free_seats: 0
+                group_id: "DISC-DPC-01"
+                discipline_title: "Розподілені паралельні обчислення"
+                seats: 30
+                taken: 0
+                free_seats: 30
                 invariant_holds: true
                 invariant_ok: true
-                capacity: 5
-                used: 5
+                capacity: 30
+                used: 0
         "401":
           description: Відсутній або недійсний Bearer-токен
           content:

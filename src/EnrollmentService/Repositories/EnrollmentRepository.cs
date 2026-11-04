@@ -410,6 +410,34 @@ public sealed class EnrollmentRepository
         return MapEnrollment(reader);
     }
 
+    public async Task<(WebEnrollmentResponseDto Enrollment, string? RequestPayloadHash, string StudentId)?> GetEnrollmentByIdempotencyKeyAsync(
+        string idempotencyKey,
+        NpgsqlConnection conn,
+        NpgsqlTransaction? tx = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT e.id, e.student_id, e.group_id, e.discipline_id, d.title, d.ects,
+                   e.status, e.version, e.created_at, e.expires_at, g.university_tz,
+                   e.request_payload_hash
+            FROM enrollment e
+            JOIN discipline d ON d.id = e.discipline_id
+            JOIN discipline_group g ON g.id = e.group_id
+            WHERE e.idempotency_key = @idempotencyKey;", conn, tx);
+        cmd.Parameters.AddWithValue("idempotencyKey", idempotencyKey);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var dto = MapEnrollment(reader);
+        string? hash = reader.IsDBNull(11) ? null : reader.GetString(11);
+        string sId = reader.GetString(1);
+        return (dto, hash, sId);
+    }
+
     public async Task CreateEnrollmentAsync(
         Guid id,
         string studentId,
@@ -419,13 +447,20 @@ public sealed class EnrollmentRepository
         int version,
         DateTimeOffset createdAt,
         DateTimeOffset expiresAt,
+        string? idempotencyKey,
+        string? requestPayloadHash,
         NpgsqlConnection conn,
         NpgsqlTransaction tx,
         CancellationToken cancellationToken = default)
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO enrollment (id, student_id, group_id, discipline_id, status, version, created_at, expires_at)
-            VALUES (@id, @studentId, @groupId, @disciplineId, @status, @version, @createdAt, @expiresAt);", conn, tx);
+            INSERT INTO enrollment (
+                id, student_id, group_id, discipline_id, status, version, created_at, expires_at,
+                idempotency_key, request_payload_hash
+            ) VALUES (
+                @id, @studentId, @groupId, @disciplineId, @status, @version, @createdAt, @expiresAt,
+                @idempotencyKey, @payloadHash
+            );", conn, tx);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("studentId", studentId);
         cmd.Parameters.AddWithValue("groupId", groupId);
@@ -434,6 +469,14 @@ public sealed class EnrollmentRepository
         cmd.Parameters.AddWithValue("version", version);
         cmd.Parameters.AddWithValue("createdAt", createdAt);
         cmd.Parameters.AddWithValue("expiresAt", expiresAt);
+        cmd.Parameters.Add(new NpgsqlParameter("idempotencyKey", NpgsqlTypes.NpgsqlDbType.Text)
+        {
+            Value = (object?)idempotencyKey ?? DBNull.Value
+        });
+        cmd.Parameters.Add(new NpgsqlParameter("payloadHash", NpgsqlTypes.NpgsqlDbType.Text)
+        {
+            Value = (object?)requestPayloadHash ?? DBNull.Value
+        });
 
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }

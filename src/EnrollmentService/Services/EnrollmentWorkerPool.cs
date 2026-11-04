@@ -16,8 +16,8 @@ namespace EnrollmentService.Services;
 public sealed class EnrollmentWorkerPool : IHostedService
 {
     private readonly IBoundedRequestQueue _queue;
-    private readonly EnrollmentRequestProcessor _processor;
-    private readonly EnrollmentRequestRepository _requestRepo;
+    private readonly IEnrollmentRequestProcessor? _processor;
+    private readonly EnrollmentRequestRepository? _requestRepo;
     private readonly ServiceOptions _options;
     private readonly MetricsCollector _metrics;
     private readonly IHostApplicationLifetime _lifetime;
@@ -38,8 +38,8 @@ public sealed class EnrollmentWorkerPool : IHostedService
 
     public EnrollmentWorkerPool(
         IBoundedRequestQueue queue,
-        EnrollmentRequestProcessor processor,
-        EnrollmentRequestRepository requestRepo,
+        IEnrollmentRequestProcessor? processor,
+        EnrollmentRequestRepository? requestRepo,
         ServiceOptions options,
         MetricsCollector metrics,
         IHostApplicationLifetime lifetime)
@@ -67,44 +67,47 @@ public sealed class EnrollmentWorkerPool : IHostedService
         }
 
         // 1. Відновлення заявок у стані processing (визначення фінального стану done/failed)
-        try
+        if (_requestRepo != null)
         {
-            int recovered = await _requestRepo.RecoverStuckProcessingRequestsAsync(cancellationToken);
-            if (recovered > 0)
+            try
             {
-                StructuredJsonLogger.LogEvent(_options.InstanceId, "recovered_stuck_requests", new Dictionary<string, object?>
+                int recovered = await _requestRepo.RecoverStuckProcessingRequestsAsync(cancellationToken);
+                if (recovered > 0)
                 {
-                    ["recovered_count"] = recovered
+                    StructuredJsonLogger.LogEvent(_options.InstanceId, "recovered_stuck_requests", new Dictionary<string, object?>
+                    {
+                        ["recovered_count"] = recovered
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "recover_stuck_requests_failed", new Dictionary<string, object?>
+                {
+                    ["error"] = ex.Message
                 });
             }
-        }
-        catch (Exception ex)
-        {
-            StructuredJsonLogger.LogEvent(_options.InstanceId, "recover_stuck_requests_failed", new Dictionary<string, object?>
-            {
-                ["error"] = ex.Message
-            });
-        }
 
-        // 2. Відновлення збережених заявок у стані queued із PostgreSQL до оперативної черги
-        try
-        {
-            int recoveredQueued = await ReplenishQueueFromDatabaseAsync(cancellationToken);
-            if (recoveredQueued > 0)
+            // 2. Відновлення збережених заявок у стані queued із PostgreSQL до оперативної черги
+            try
             {
-                StructuredJsonLogger.LogEvent(_options.InstanceId, "recovered_queued_requests", new Dictionary<string, object?>
+                int recoveredQueued = await ReplenishQueueFromDatabaseAsync(cancellationToken);
+                if (recoveredQueued > 0)
                 {
-                    ["recovered_count"] = recoveredQueued,
-                    ["current_queue_length"] = _queue.Count
+                    StructuredJsonLogger.LogEvent(_options.InstanceId, "recovered_queued_requests", new Dictionary<string, object?>
+                    {
+                        ["recovered_count"] = recoveredQueued,
+                        ["current_queue_length"] = _queue.Count
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "recover_queued_requests_failed", new Dictionary<string, object?>
+                {
+                    ["error"] = ex.Message
                 });
             }
-        }
-        catch (Exception ex)
-        {
-            StructuredJsonLogger.LogEvent(_options.InstanceId, "recover_queued_requests_failed", new Dictionary<string, object?>
-            {
-                ["error"] = ex.Message
-            });
         }
 
         _lifetime.ApplicationStopping.Register(() => InitiateShutdown());
@@ -116,7 +119,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
     // Послідовна дозавантаження заявок зі статусом queued із PostgreSQL у вільні слоти черги
     public async Task<int> ReplenishQueueFromDatabaseAsync(CancellationToken cancellationToken = default)
     {
-        if (_isShuttingDown) return 0;
+        if (_isShuttingDown || _requestRepo == null) return 0;
 
         int enqueuedCount = 0;
         while (!_isShuttingDown && !cancellationToken.IsCancellationRequested)
@@ -380,7 +383,10 @@ public sealed class EnrollmentWorkerPool : IHostedService
 
             try
             {
-                await _processor.ProcessItemAsync(workerId, item, isAsyncModel: true, _queue, workerToken);
+                if (_processor != null)
+                {
+                    await _processor.ProcessItemAsync(workerId, item, isAsyncModel: true, _queue, workerToken);
+                }
             }
             catch (OperationCanceledException) when (workerToken.IsCancellationRequested)
             {
@@ -424,7 +430,10 @@ public sealed class EnrollmentWorkerPool : IHostedService
 
             try
             {
-                _processor.ProcessItemAsync(workerId, item, isAsyncModel: false, _queue, workerToken).GetAwaiter().GetResult();
+                if (_processor != null)
+                {
+                    _processor.ProcessItemAsync(workerId, item, isAsyncModel: false, _queue, workerToken).GetAwaiter().GetResult();
+                }
             }
             catch (OperationCanceledException) when (workerToken.IsCancellationRequested)
             {

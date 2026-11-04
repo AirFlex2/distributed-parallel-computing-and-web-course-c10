@@ -5,7 +5,7 @@ using EnrollmentService.Repositories;
 
 namespace EnrollmentService.Services.Processing;
 
-public sealed class EnrollmentRequestProcessor
+public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 {
     private readonly EnrollmentRequestRepository _requestRepo;
     private readonly GroupRepository _groupRepo;
@@ -271,6 +271,49 @@ public sealed class EnrollmentRequestProcessor
 
             if (!isUnsafe)
             {
+                // Спільний наскрізний сценарій Web + DPC (тема C10, §2.6.4):
+                // Якщо передано enrollment_id, місце вже зарезервовано Web-контуром (held).
+                // Воркер РПО підтверджує запис (held -> confirmed) та вносить його до відомості decanate_roster
+                // без повторного списання available або кредитів студента (Сценарій Б).
+                if (item.EnrollmentId.HasValue)
+                {
+                    await _enrollmentRepo.ConfirmEnrollmentHeldAsync(item.EnrollmentId.Value, conn, tx, cancellationToken);
+
+                    var finishedAtUtcJoint = _metrics.MarkProcessingFinished(item);
+
+                    await _decanateRepo.InsertRosterEntryAsync(
+                        item.Id,
+                        item.StudentId,
+                        item.GroupId,
+                        disciplineId,
+                        disciplineEcts,
+                        item.EnrollmentId.Value,
+                        "joint_web_enrollment",
+                        finishedAtUtcJoint,
+                        conn,
+                        tx,
+                        cancellationToken);
+
+                    await _requestRepo.UpdateStatusAsync(
+                        item.Id,
+                        "done",
+                        null,
+                        item.GroupId,
+                        finishedAtUtcJoint,
+                        conn,
+                        tx,
+                        cancellationToken);
+
+                    await tx.CommitAsync(cancellationToken);
+
+                    if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
+                    {
+                        await TestHookAfterCommitAsync(item);
+                    }
+
+                    return ("done", null);
+                }
+
                 // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
                 // Пряма паралельна обробка заявок черги з атомарним декрементом available під FOR UPDATE.
                 // (У цільовому Сценарії Б за подіями Web на ЛР4 первинне списання здійснює Web, а РПО веде відомість, а перерозподіл second_choice заплановано у ЛР6 (координація виконавців та захист спільного ресурсу поколінням)).

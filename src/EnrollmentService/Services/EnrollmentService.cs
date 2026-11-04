@@ -28,6 +28,7 @@ public sealed class EnrollmentService
     public async Task<ServiceResult<WebEnrollmentResponseDto>> CreateEnrollmentAsync(
         string studentId,
         CreateWebEnrollmentDto dto,
+        string? idempotencyKey = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(dto.GroupId) || dto.GroupId.Trim().Length > 64 || dto.GroupId.Contains(' '))
@@ -40,8 +41,30 @@ public sealed class EnrollmentService
         }
 
         string groupId = dto.GroupId.Trim();
+        string payloadFingerprint = $"{studentId}:{groupId}";
 
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+
+        // О2.2 / О1.4 Web: перевірка повторного надсилання з тим самим Idempotency-Key
+        if (!string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            var existing = await _enrollmentRepo.GetEnrollmentByIdempotencyKeyAsync(idempotencyKey, conn, null, cancellationToken);
+            if (existing != null)
+            {
+                if (!string.Equals(existing.Value.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                    !string.Equals(existing.Value.StudentId, studentId, StringComparison.Ordinal))
+                {
+                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                        StatusCodes.Status409Conflict,
+                        "idempotency_key_conflict",
+                        "Конфлікт ключа ідемпотентності",
+                        "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
+                }
+
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(existing.Value.Enrollment);
+            }
+        }
+
         await using var tx = await conn.BeginTransactionAsync(cancellationToken);
 
         try
@@ -114,6 +137,8 @@ public sealed class EnrollmentService
                 1,
                 nowUtc,
                 expiresAtUtc,
+                idempotencyKey,
+                payloadFingerprint,
                 conn,
                 tx,
                 cancellationToken);
@@ -137,6 +162,26 @@ public sealed class EnrollmentService
                 _options.InstanceId);
 
             return ServiceResult<WebEnrollmentResponseDto>.Ok(responseDto);
+        }
+        catch (PostgresException pex) when (pex.SqlState == "23505" && !string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            await tx.RollbackAsync(cancellationToken);
+            var existing = await _enrollmentRepo.GetEnrollmentByIdempotencyKeyAsync(idempotencyKey, conn, null, cancellationToken);
+            if (existing != null)
+            {
+                if (!string.Equals(existing.Value.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                    !string.Equals(existing.Value.StudentId, studentId, StringComparison.Ordinal))
+                {
+                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                        StatusCodes.Status409Conflict,
+                        "idempotency_key_conflict",
+                        "Конфлікт ключа ідемпотентності",
+                        "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
+                }
+
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(existing.Value.Enrollment);
+            }
+            throw;
         }
         catch
         {
