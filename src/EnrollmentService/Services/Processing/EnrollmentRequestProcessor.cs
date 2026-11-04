@@ -34,6 +34,13 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     }
 
     /// <summary>
+    /// Тестова точка перехоплення, що викликається детерміновано безпосередньо перед початком обробки заявки воркером
+    /// (до переходу в стан processing або до взяття транзакційного блокування).
+    /// Дозволяє тестам безпечно моделювати стани черги та синхронізовано змінювати дані до початку обробки.
+    /// </summary>
+    public Func<QueuedRequestItem, Task>? TestHookBeforeProcessingAsync { get; set; }
+
+    /// <summary>
     /// Тестова точка перехоплення, що викликається детерміновано одразу після COMMIT бізнес-транзакції,
     /// але до виходу з методу обробки (для перевірки відсутності гонки публікації FinishProcessingTimestamp).
     /// </summary>
@@ -46,6 +53,11 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         IBoundedRequestQueue queue,
         CancellationToken cancellationToken = default)
     {
+        if (TestHookBeforeProcessingAsync != null)
+        {
+            await TestHookBeforeProcessingAsync(item);
+        }
+
         var startedAtUtc = DateTimeOffset.UtcNow;
         bool started = false;
 

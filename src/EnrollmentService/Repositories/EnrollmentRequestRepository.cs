@@ -197,6 +197,8 @@ public sealed class EnrollmentRequestRepository
         NpgsqlConnection conn,
         CancellationToken cancellationToken = default)
     {
+        Guid? effectiveRequestedEnrollmentId = item.RequestedEnrollmentId ?? item.EnrollmentId;
+
         try
         {
             await using var insertCmd = new NpgsqlCommand(@"
@@ -225,7 +227,7 @@ public sealed class EnrollmentRequestRepository
             });
             insertCmd.Parameters.Add(new NpgsqlParameter("requestedEnrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
             {
-                Value = (object?)item.RequestedEnrollmentId ?? DBNull.Value
+                Value = (object?)effectiveRequestedEnrollmentId ?? DBNull.Value
             });
 
             var result = await insertCmd.ExecuteScalarAsync(cancellationToken);
@@ -258,7 +260,7 @@ public sealed class EnrollmentRequestRepository
             });
             fallbackCmd.Parameters.Add(new NpgsqlParameter("requestedEnrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
             {
-                Value = (object?)item.RequestedEnrollmentId ?? DBNull.Value
+                Value = (object?)effectiveRequestedEnrollmentId ?? DBNull.Value
             });
 
             var res = await fallbackCmd.ExecuteScalarAsync(cancellationToken);
