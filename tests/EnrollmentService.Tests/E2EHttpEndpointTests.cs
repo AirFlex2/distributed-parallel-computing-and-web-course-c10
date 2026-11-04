@@ -1984,16 +1984,6 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             await allowProcessingToProceed.Task;
         });
 
-        // Забезпечуємо зворотну сумісність із публічною точкою перехоплення TestHookBeforeProcessingAsync
-        processor.TestHookBeforeProcessingAsync = async (item) =>
-        {
-            if (item.Id == testRequestId)
-            {
-                requestReachedWorker.TrySetResult(true);
-                await allowProcessingToProceed.Task;
-            }
-        };
-
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
         try
         {
@@ -2095,7 +2085,6 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         {
             // Гарантуємо негайне звільнення фонового воркера навіть при виключеннях або збоях Assert
             allowProcessingToProceed.TrySetResult(true);
-            processor.TestHookBeforeProcessingAsync = null;
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
         }
     }
@@ -2302,12 +2291,22 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithEnrollmentId);
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithNullEnrollmentId);
+
+        // Відкриваємо виділене непопульоване (Pooling=false) з'єднання для тесту міграції.
+        // Це гарантує, що змінений search_path фізично закриється разом із сокетом
+        // і ніколи не потрапить у пул з'єднань інших тестів або компонентів сервісу.
+        var nonPooledBuilder = new NpgsqlConnectionStringBuilder(TestEnvironment.ConnectionString)
+        {
+            Pooling = false
+        };
+        await using var conn = new NpgsqlConnection(nonPooledBuilder.ConnectionString);
+        await conn.OpenAsync();
+
+        Exception? testException = null;
         try
         {
             await EnsureTestStudentAsync(studentId, 5, 0, 0.0m);
             await EnsureTestGroupAsync(groupId, discId, 5, 5, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
-
-            await using var conn = await TestEnvironment.OpenConnectionAsync();
 
             // 1. Створюємо ізольовану тимчасову схему та розгортаємо таблицю enrollment_requests
             //    у стані ДО застосування міграції 009 (стовпчик enrollment_id існує, а requested_enrollment_id ВІДСУТНІЙ).
@@ -2446,63 +2445,148 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
                 Assert.Equal(heldEnrollmentId, rdrReplay.GetGuid(0));
                 Assert.Equal(heldEnrollmentId, rdrReplay.GetGuid(1));
             }
+
+            // Скидаємо search_path перед штатним закриттям
+            await using var resetCmd = new NpgsqlCommand("RESET search_path;", conn);
+            await resetCmd.ExecuteNonQueryAsync();
+        }
+        catch (Exception ex)
+        {
+            testException = ex;
+            throw;
         }
         finally
         {
+            Exception? cleanupException = null;
+
+            // Гарантоване видалення тимчасової схеми на окремому непопульованому з'єднанні
             try
             {
-                await using var connCleanup = await TestEnvironment.OpenConnectionAsync();
+                var cleanupBuilder = new NpgsqlConnectionStringBuilder(TestEnvironment.ConnectionString)
+                {
+                    Pooling = false
+                };
+                await using var connCleanup = new NpgsqlConnection(cleanupBuilder.ConnectionString);
+                await connCleanup.OpenAsync();
                 await using var dropCmd = new NpgsqlCommand($@"
                     RESET search_path;
                     DROP SCHEMA IF EXISTS ""{tempSchema}"" CASCADE;", connCleanup);
                 await dropCmd.ExecuteNonQueryAsync();
             }
-            catch
+            catch (Exception ex)
             {
-                // Поглинаємо помилки очищення тимчасової схеми
+                cleanupException = ex;
             }
 
-            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithEnrollmentId);
-            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithNullEnrollmentId);
+            try
+            {
+                await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithEnrollmentId);
+                await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithNullEnrollmentId);
+            }
+            catch (Exception ex)
+            {
+                cleanupException = cleanupException == null ? ex : new AggregateException(cleanupException, ex);
+            }
+
+            // Якщо очищення завершилося з помилкою, не маскуємо первинне виключення тесту
+            if (cleanupException != null)
+            {
+                if (testException != null)
+                {
+                    throw new AggregateException(
+                        $"Помилка під час виконання тесту міграції та очищення тимчасової схеми '{tempSchema}'.",
+                        testException, cleanupException);
+                }
+                throw new InvalidOperationException(
+                    $"Очищення тимчасової схеми міграції '{tempSchema}' завершилося з помилкою.", cleanupException);
+            }
         }
     }
 
     [Fact]
-    public async Task RegisterPreProcessingHook_OnlyTriggersForMatchingRequestId_IgnoresOtherRequests()
+    public async Task RegisterPreProcessingHook_FullLifecycle_TriggersOnlyForTargetAndUnregistersOnDispose()
     {
         var processor = _factory.Services.GetRequiredService<EnrollmentRequestProcessor>();
         Guid targetRequestId = Guid.NewGuid();
         Guid otherRequestId = Guid.NewGuid();
-        bool targetHookInvoked = false;
-        bool otherHookInvoked = false;
+        int targetHookCallCount = 0;
+        int otherHookCallCount = 0;
 
-        using (var hookReg = processor.RegisterPreProcessingHook(targetRequestId, item =>
+        var fakeQueue = new MonitorRequestQueue(10);
+        var otherItem = new QueuedRequestItem
+        {
+            Id = otherRequestId,
+            StudentId = "student-hook-lifecycle-other",
+            GroupId = "GRP-HOOK-LIFECYCLE",
+            CreatedAtUtc = DateTimeOffset.UtcNow
+        };
+        var targetItem = new QueuedRequestItem
+        {
+            Id = targetRequestId,
+            StudentId = "student-hook-lifecycle-target",
+            GroupId = "GRP-HOOK-LIFECYCLE",
+            CreatedAtUtc = DateTimeOffset.UtcNow
+        };
+
+        // 1. Зареєструвати hook для targetRequestId
+        var hookReg = processor.RegisterPreProcessingHook(targetRequestId, item =>
         {
             if (item.Id == targetRequestId)
             {
-                targetHookInvoked = true;
+                Interlocked.Increment(ref targetHookCallCount);
             }
             else
             {
-                otherHookInvoked = true;
+                Interlocked.Increment(ref otherHookCallCount);
             }
             return Task.CompletedTask;
-        }))
-        {
-            var fakeQueue = new MonitorRequestQueue(10);
-            var otherItem = new QueuedRequestItem
-            {
-                Id = otherRequestId,
-                StudentId = "student-hook-test",
-                GroupId = "GRP-1",
-                CreatedAtUtc = DateTimeOffset.UtcNow
-            };
+        });
 
+        try
+        {
+            // 2. Передати в ProcessItemAsync запит з іншим ID
             await processor.ProcessItemAsync(1, otherItem, isAsyncModel: false, fakeQueue, CancellationToken.None);
 
-            Assert.False(targetHookInvoked, "Хук для targetRequestId не повинен викликатися для сторонніх запитів.");
-            Assert.False(otherHookInvoked, "Хук не повинен отримувати сторонні елементи черги.");
+            // 3. Перевірити, що hook не викликаний
+            Assert.Equal(0, targetHookCallCount);
+            Assert.Equal(0, otherHookCallCount);
+
+            // 4. Передати запит з targetRequestId
+            await processor.ProcessItemAsync(1, targetItem, isAsyncModel: false, fakeQueue, CancellationToken.None);
+
+            // 5. Перевірити, що hook викликано ровно один раз
+            Assert.Equal(1, targetHookCallCount);
+            Assert.Equal(0, otherHookCallCount);
+
+            // 6. Звільнити реєстрацію через Dispose
+            hookReg.Dispose();
+
+            // 7. Повторно обробити запит з targetRequestId
+            await processor.ProcessItemAsync(1, targetItem, isAsyncModel: false, fakeQueue, CancellationToken.None);
+
+            // 8. Перевірити, що hook більше не викликається (лічильник залишився 1)
+            Assert.Equal(1, targetHookCallCount);
+            Assert.Equal(0, otherHookCallCount);
         }
+        finally
+        {
+            hookReg.Dispose();
+        }
+    }
+
+    [Fact]
+    public void RegisterPreProcessingHook_DuplicateRegistrationForSameId_ThrowsInvalidOperationException()
+    {
+        var processor = _factory.Services.GetRequiredService<EnrollmentRequestProcessor>();
+        Guid requestId = Guid.NewGuid();
+
+        using var reg1 = processor.RegisterPreProcessingHook(requestId, _ => Task.CompletedTask);
+
+        // Спроба повторної реєстрації для того самого requestId повинна викликати InvalidOperationException (захист від перезапису)
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            processor.RegisterPreProcessingHook(requestId, _ => Task.CompletedTask));
+
+        Assert.Contains(requestId.ToString(), ex.Message);
     }
 
     private static string FindMigrationFile(string fileName)

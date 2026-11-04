@@ -37,21 +37,24 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
 
     /// <summary>
-    /// Тестова точка перехоплення, що викликається детерміновано безпосередньо перед початком обробки заявки воркером
-    /// (до переходу в стан processing або до взяття транзакційного блокування).
-    /// Дозволяє тестам безпечно моделювати стани черги та синхронізовано змінювати дані до початку обробки.
-    /// </summary>
-    public Func<QueuedRequestItem, Task>? TestHookBeforeProcessingAsync { get; set; }
-
-    /// <summary>
     /// Реєструє тестову точку перехоплення, ізольовану виключно для конкретного ідентифікатора заявки (requestId).
     /// Запобігає взаємному впливу тестів та гарантує, що інші запити черги оброблятимуться без перешкод.
+    /// Використовує TryAdd для запобігання непомітному перезапису та безпечне видалення за парою ключ-значення при Dispose.
     /// Повертає IDisposable для надійного автоматичного видалення реєстрації.
     /// </summary>
     public IDisposable RegisterPreProcessingHook(Guid requestId, Func<QueuedRequestItem, Task> hook)
     {
-        _scopedPreProcessingHooks[requestId] = hook;
-        return new ScopedHookRegistration(() => _scopedPreProcessingHooks.TryRemove(requestId, out _));
+        ArgumentNullException.ThrowIfNull(hook);
+
+        if (!_scopedPreProcessingHooks.TryAdd(requestId, hook))
+        {
+            throw new InvalidOperationException($"Хук перехоплення для requestId '{requestId}' вже зареєстровано.");
+        }
+
+        return new ScopedHookRegistration(() =>
+        {
+            _scopedPreProcessingHooks.TryRemove(new KeyValuePair<Guid, Func<QueuedRequestItem, Task>>(requestId, hook));
+        });
     }
 
     private sealed class ScopedHookRegistration : IDisposable
@@ -93,30 +96,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     ["request_id"] = item.Id,
                     ["error"] = ex.Message
                 });
-            }
-        }
-        else
-        {
-            var globalHook = TestHookBeforeProcessingAsync;
-            if (globalHook != null)
-            {
-                try
-                {
-                    await globalHook(item);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_global_hook_failed", new Dictionary<string, object?>
-                    {
-                        ["worker_id"] = workerId,
-                        ["request_id"] = item.Id,
-                        ["error"] = ex.Message
-                    });
-                }
             }
         }
 
