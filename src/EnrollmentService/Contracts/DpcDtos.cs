@@ -47,7 +47,17 @@ public sealed record GroupSeatsResponseDto(
     [property: JsonPropertyName("free_seats")] int FreeSeats,
     [property: JsonPropertyName("invariant_holds")] bool InvariantHolds,
     [property: JsonPropertyName("roster_count")] int RosterCount = 0
-);
+)
+{
+    [JsonPropertyName("invariant_ok")]
+    public bool InvariantOk => InvariantHolds;
+
+    [JsonPropertyName("capacity")]
+    public int Capacity => Seats;
+
+    [JsonPropertyName("used")]
+    public int Used => Taken;
+}
 
 public sealed record DecanateRosterEntryDto(
     [property: JsonPropertyName("request_id")] Guid RequestId,

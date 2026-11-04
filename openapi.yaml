@@ -18,7 +18,9 @@ info:
 
 servers:
   - url: http://localhost:8080
-    description: Вхідна точка через балансувальник навантаження Nginx (least_conn між app-a та app-b)
+    description: Вхідна точка через балансувальник навантаження Nginx (порт 8080)
+  - url: http://localhost:8000
+    description: Альтернативна стандартна вхідна точка Nginx (порт 8000)
 
 tags:
   - name: Shared
@@ -70,6 +72,15 @@ components:
       schema:
         type: string
       example: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Унікальний ключ ідемпотентності клієнта (максимум 128 символів)
+      schema:
+        type: string
+        maxLength: 128
+      example: "idem-req-user-12345"
 
   headers:
     XRequestIdResponseHeader:
@@ -321,7 +332,6 @@ components:
           type: string
         request_id:
           type: string
-          format: uuid
 
     DpcEnrollmentAcceptedResponse:
       type: object
@@ -398,6 +408,12 @@ components:
           type: integer
         invariant_holds:
           type: boolean
+        invariant_ok:
+          type: boolean
+        capacity:
+          type: integer
+        used:
+          type: integer
 
     DecanateRosterEntry:
       type: object
@@ -467,7 +483,11 @@ components:
           type: object
         queue_length:
           type: integer
+        in_flight:
+          type: integer
         in_processing:
+          type: integer
+        rejected:
           type: integer
         counters:
           type: object
@@ -492,7 +512,6 @@ paths:
       tags: [Shared]
       summary: Кореневий опис сервісу та перелік основних маршрутів API
       description: Повертає метадані екземпляра API та перелік доступних маршрутів. Окремий вебклієнт запускається поза Docker Compose (§1.2).
-      x-course: shared
       responses:
         "200":
           description: Опис сервісу та маршрутів
@@ -509,7 +528,6 @@ paths:
       tags: [Shared]
       summary: Перевірка живучості сервісу (О1.6 Web та О1.2 РПО)
       description: Миттєво відповідає з пам'яті процесу без звернення до бази даних (p95 <= 100 мс під піковим навантаженням).
-      x-course: shared
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
@@ -539,7 +557,6 @@ paths:
       tags: [Shared]
       summary: Пряма перевірка живучості навантаженого екземпляра app-a (О1.2 РПО)
       description: Маршрутизується Nginx виключно на головний обчислювальний вузол `dpc_backend` (app-a), виключаючи ненавантажений app-b для чистоти вимірювання перцентиля затримки p95.
-      x-course: shared
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
@@ -569,7 +586,6 @@ paths:
       tags: [Shared]
       summary: Пряма перевірка живучості екземпляра app-b (О1.6 Web)
       description: Маршрутизується Nginx виключно на обчислювальний вузол `app-b` за балансувальником для ізольованої перевірки його стану та конфігурації.
-      x-course: shared
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
@@ -599,7 +615,6 @@ paths:
       tags: [Web]
       summary: Довідник наперед створених студентів у БД для вибору X-User-Id до введення автентифікації в ЛР3
       description: Повертає перелік тестових і робочих профілів студентів із поточними лічильниками активних дисциплін та кредитів ЄКТС.
-      x-course: web
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
@@ -626,7 +641,6 @@ paths:
       tags: [Web]
       summary: Список вибіркових дисциплін із групами, часовими вікнами та актуальним залишком місць (О1.3, О1.5 Web)
       description: Читає каталог дисциплін і груп із єдиного спільного ресурсу discipline_group з підтримкою курсорної пагінації за id.
-      x-course: web
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/XUserIdOptionalHeader"
@@ -695,10 +709,11 @@ paths:
         Виконує перевірку інваріантів (вікно `[opens_at, closes_at)`, ліміт K дисциплін, ліміт `30.0` ЄКТС, наявність вільних місць),
         зменшення `discipline_group.available` та створення запису `enrollment` в одній транзакції PostgreSQL.
         Власник визначається виключно із заголовка `X-User-Id` (передача `student_id` у тілі повертає `422`).
-      x-course: web
+      x-course: main
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/XUserIdRequiredHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/TraceparentHeader"
       requestBody:
         required: true
@@ -707,10 +722,19 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateWebEnrollmentRequest"
             examples:
-              standard_enrollment:
-                summary: Успішний запис у відкриту групу
+              normal:
+                summary: Звичайний запис у відкриту групу
                 value:
                   group_id: "DISC-WEB-01"
+              scarce:
+                summary: Запис у групу з одним вільним місцем (перевірка race condition)
+                x-capacity: 1
+                value:
+                  group_id: "DISC-ONE-SEAT"
+              missing:
+                summary: Спроба запису у неіснуючу групу (очікується 404 Not Found)
+                value:
+                  group_id: "DISC-NON-EXISTENT"
       responses:
         "201":
           description: Запис успішно створено після COMMIT транзакції БД
@@ -806,7 +830,7 @@ paths:
       tags: [Web]
       summary: Список записів студента з курсорним пагінуванням за парою (created_at DESC, id DESC) (О1.5 Web)
       description: Повертає сторінку записів виключно для користувача із заголовка `X-User-Id` із непрозорим курсором `next_cursor`.
-      x-course: web
+      x-course: list
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/XUserIdRequiredHeader"
@@ -875,7 +899,7 @@ paths:
       tags: [Web]
       summary: Отримання конкретного запису студента за ідентифікатором із перевіркою власника X-User-Id (С10 Web)
       description: Повертає запис студента за рядковим UUID, якщо він належить поточному користувачу `X-User-Id`.
-      x-course: web
+      x-course: object
       parameters:
         - name: id
           in: path
@@ -926,7 +950,6 @@ paths:
       tags: [Web]
       summary: "Підтвердження попереднього запису студентом (Web О1.1: held -> confirmed)"
       description: Переводить запис студента у стан `confirmed` (остаточне зарахування).
-      x-course: web
       parameters:
         - name: id
           in: path
@@ -969,7 +992,7 @@ paths:
       tags: [Web]
       summary: Скасування запису студентом із поверненням вільного місця в групі (С10 Web)
       description: Переводить власний запис користувача `X-User-Id` у стан `cancelled` і повертає місце в `discipline_group` у канонічному порядку блокувань (`student -> discipline_group -> enrollment`).
-      x-course: web
+      x-course: cancel
       parameters:
         - name: id
           in: path
@@ -1034,7 +1057,7 @@ paths:
       tags: [Web]
       summary: Закриття запису на навчальну групу працівником деканату (С10 Web)
       description: "Встановлює прапорець closed = true для групи дисципліни в discipline_group, після чого як синхронні Web-записи, так і асинхронні заявки РПО відхиляються. У межах ЛР1 операція захищена Bearer-токеном (API_AUTH_TOKEN), а повноцінне розмежування прав за ролями (RBAC: деканат проти студента) реалізується в ЛР3."
-      x-course: web
+      x-course: staff-action
       security:
         - bearerAuth: []
       parameters:
@@ -1099,7 +1122,6 @@ paths:
       tags: [DPC]
       summary: Перегляд відомості деканату за ключем request_id, group_id або student_id (С10 п. 2, 6 РПО)
       description: Повертає записи відомості деканату (`decanate_roster`), сформовані воркерами РПО під час обробки заявок (`primary_roster`) та після закриття запису (`second_choice`).
-      x-course: dpc
       security:
         - bearerAuth: []
       parameters:
@@ -1172,7 +1194,7 @@ paths:
         Повторний запит із тим самим ключем і незмінними параметрами повертає статус раніше збереженої заявки (202 Accepted) навіть за умови повного заповнення черги.
         Якщо ключ повторюється з іншими параметрами student_id або group_id, повертається помилка 409 Conflict.
         Нові заявки за умови переповнення черги негайно отримують 429 Too Many Requests із заголовком Retry-After.
-      x-course: dpc
+      x-course: receiver
       security:
         - bearerAuth: []
       parameters:
@@ -1191,11 +1213,12 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateDpcEnrollmentRequest"
             examples:
-              dpc_enqueue:
+              normal:
                 summary: Постановка заявки в чергу РПО
                 value:
                   student_id: "student-1"
                   group_id: "DISC-DPC-01"
+                  request_id: "{uuid}"
       responses:
         "202":
           description: Заявку збережено в БД зі статусом queued і поставлено у внутрішню чергу (або повернено збережену заявку при повторі Idempotency-Key, у тому числі при заповненій черзі)
@@ -1271,7 +1294,7 @@ paths:
       tags: [DPC]
       summary: Отримання стану заявки в черзі РПО та фіксація часу першої видачі first_read_at (О1.1, О1.5 РПО)
       description: Повертає поточний статус заявки (`queued | processing | done | rejected | failed`) та часові інтервали `queue_wait_ms`, `processing_time_ms`, `delivery_wait_ms`.
-      x-course: dpc
+      x-course: request-state
       security:
         - bearerAuth: []
       parameters:
@@ -1321,7 +1344,6 @@ paths:
       tags: [DPC]
       summary: Стан усіх навчальних груп через представлення VIEW group_seats поверх єдиного ресурсу discipline_group (О1.1, О1.4 РПО)
       description: Відображає актуальний баланс місць (`seats`, `taken`, `free_seats`, `invariant_holds`) для всіх груп.
-      x-course: dpc
       security:
         - bearerAuth: []
       responses:
@@ -1340,6 +1362,9 @@ paths:
                   taken: 1
                   free_seats: 29
                   invariant_holds: true
+                  invariant_ok: true
+                  capacity: 30
+                  used: 1
         "401":
           description: Відсутній або недійсний Bearer-токен
           content:
@@ -1353,7 +1378,7 @@ paths:
       tags: [DPC]
       summary: Стан місць конкретної навчальної групи та перевірка інваріанта taken <= seats (О1.1, О1.4 РПО)
       description: Повертає `seats`, `taken = seats - available`, `free_seats` та булевий прапорець дотримання інваріанта `invariant_holds` із представлення `VIEW group_seats`.
-      x-course: dpc
+      x-course: resource-state
       security:
         - bearerAuth: []
       parameters:
@@ -1377,6 +1402,9 @@ paths:
                 taken: 5
                 free_seats: 0
                 invariant_holds: true
+                invariant_ok: true
+                capacity: 5
+                used: 5
         "401":
           description: Відсутній або недійсний Bearer-токен
           content:
@@ -1396,7 +1424,6 @@ paths:
       tags: [Shared]
       summary: Стендове скидання даних та перемикання режимів дослідів (лише при ALLOW_TEST_OVERRIDES=true)
       description: Очищує заявки й записи, відновлює `discipline_group.available = seats` та скидає метрики. У штатному режимі (`ALLOW_TEST_OVERRIDES=false`) повертає `403 Forbidden`.
-      x-course: shared
       security:
         - bearerAuth: []
       parameters:
@@ -1442,7 +1469,6 @@ paths:
       tags: [DPC]
       summary: Метрики черги, перцентилі p50/p95/p99 та перевірка закону Літтла L = lambda * W (О1.5, Д1.2 РПО)
       description: Повертає детальний JSON-звіт метрик черги та часу обробки.
-      x-course: dpc
       security:
         - bearerAuth: []
       responses:
@@ -1465,7 +1491,9 @@ paths:
                   allow_test_overrides: false
                   is_shutting_down: false
                 queue_length: 0
+                in_flight: 0
                 in_processing: 0
+                rejected: 5
                 counters:
                   total_accepted: 100
                   total_done: 95

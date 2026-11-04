@@ -494,7 +494,9 @@ public sealed class MetricsCollector
                 is_shutting_down = isShuttingDown
             },
             queue_length = currentQueueLength,
+            in_flight = Interlocked.Read(ref _inProcessingCount),
             in_processing = Interlocked.Read(ref _inProcessingCount),
+            rejected = Interlocked.Read(ref _totalRejected),
             counters = new
             {
                 total_accepted = Interlocked.Read(ref _totalAccepted),

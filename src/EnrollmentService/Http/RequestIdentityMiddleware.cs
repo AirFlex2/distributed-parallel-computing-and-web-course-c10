@@ -130,9 +130,11 @@ public sealed class RequestIdentityMiddleware
                 ?? "/";
             string? userId = context.Request.Headers["X-User-Id"].FirstOrDefault();
 
+            string timestampIso = DateTimeOffset.UtcNow.ToString("O");
             var logEntry = new Dictionary<string, object?>
             {
-                ["ts"] = DateTimeOffset.UtcNow.ToString("O"),
+                ["ts"] = timestampIso,
+                ["time"] = timestampIso,
                 ["event"] = "http_request",
                 ["instance"] = _options.InstanceId,
                 ["method"] = context.Request.Method,
@@ -140,6 +142,7 @@ public sealed class RequestIdentityMiddleware
                 ["path"] = context.Request.Path.Value ?? "/",
                 ["status"] = context.Response.StatusCode,
                 ["duration_ms"] = durationMs,
+                ["duration"] = durationMs,
                 ["request_id"] = requestId
             };
 

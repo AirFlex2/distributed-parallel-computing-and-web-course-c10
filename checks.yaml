@@ -1,0 +1,124 @@
+# Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1)
+# Створено на основі joint/checks-template.yaml та специфікацій checks.example.yaml обох курсів.
+
+# ==============================================================================
+# Розділ курсу «Обмін даними у Web-застосунках» (Web Interactions)
+# ==============================================================================
+web:
+  openapi: openapi.yaml
+  base: http://localhost:8080
+  items:
+    - О1.5   # Список із курсором (GET /v1/enrollments?limit=...&after=...)
+    - О1.6   # Система, /health, журнал JSON
+    - Д1.1   # Чиста функція перевірки інтервалу [opens_at, closes_at)
+    - Д1.4   # traceparent -> trace_id у структурованому журналі JSON
+    - Д1.5   # Часовий пояс навчального закладу Europe/Kyiv
+  instances:
+    app-a: "http://localhost:8001"
+    app-b: "http://localhost:8002"
+  services:
+    nginx: nginx
+    app-a: app-a
+    app-b: app-b
+    postgres: postgres
+  log_fields:
+    time: time
+    instance: instance
+    route: route
+    status: status
+    duration: duration_ms
+
+# ==============================================================================
+# Розділ курсу «Розподілені та паралельні обчислення» (Distributed Parallel Computing)
+# ==============================================================================
+dpc:
+  openapi: openapi.yaml
+  base: http://localhost:8000
+  items:
+    - О1.5   # Час виконання, перцентилі p50/p95/p99 та метрики черги Літтла
+    - Д1.4   # Graceful Shutdown (SIGTERM) із вивантаженням повної черги
+  services:
+    api: app-a
+    postgres: postgres
+  load_s: 10
+  resource:
+    path: /v1/group-seats/DISC-TEST-SAFE
+    ok_field: invariant_ok
+  metrics:
+    - queue_length
+    - in_flight
+    - rejected
+
+# ==============================================================================
+# Спільний сценарій наскрізної перевірки взаємодії двох контурів (Scenario)
+# ==============================================================================
+scenario:
+  - name: web-create
+    part: web
+    user: student-1
+    method: POST
+    path: /v1/enrollments
+    body:
+      group_id: DISC-WEB-01
+    status: 201
+    save: enrollment
+  - name: dpc-submit
+    part: dpc
+    method: POST
+    path: /v1/enrollment-requests
+    body:
+      student_id: student-1
+      group_id: DISC-DPC-01
+      request_id: "{uuid}"
+    status: 202
+    save: request
+  - name: dpc-result
+    part: dpc
+    method: GET
+    path: "/v1/enrollment-requests/{request}"
+    status: 200
+    expect:
+      id: "{request}"
+    wait: 60
+  - name: web-result
+    part: web
+    user: student-1
+    method: GET
+    path: "/v1/enrollments/{enrollment}"
+    status: 200
+    expect:
+      id: "{enrollment}"
+      status: held
+
+# ==============================================================================
+# Сумісність із автономними (однокурсовими) засобами перевірки викладача
+# ==============================================================================
+items:
+  - О1.5
+  - О1.6
+  - Д1.1
+  - Д1.4
+  - Д1.5
+instances:
+  app-a: "http://localhost:8001"
+  app-b: "http://localhost:8002"
+services:
+  nginx: nginx
+  api: app-a
+  app-a: app-a
+  app-b: app-b
+  postgres: postgres
+log_fields:
+  time: time
+  instance: instance
+  route: route
+  status: status
+  duration: duration_ms
+load_s: 10
+resource:
+  path: /v1/group-seats/DISC-TEST-SAFE
+  ok_field: invariant_ok
+metrics:
+  - queue_length
+  - in_flight
+  - rejected

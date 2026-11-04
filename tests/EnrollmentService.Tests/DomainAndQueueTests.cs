@@ -1,6 +1,10 @@
+using System.Collections.Generic;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using EnrollmentService;
 using EnrollmentService.Http;
+using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Services;
 using Microsoft.AspNetCore.Http;
@@ -506,5 +510,112 @@ public sealed class DomainAndQueueTests
         ctx5.Request.Path = "/health";
         await middleware.InvokeAsync(ctx5);
         Assert.True(nextCalled);
+    }
+
+    // РПО Д1.4: Тестування сценарію Graceful Shutdown (SIGTERM) при повністю заповненій черзі:
+    // 1) нові запити відхиляються з кодом 503 Service Unavailable (service_shutting_down),
+    // 2) усі раніше прийняті заявки вивантажуються з черги без втрат,
+    // 3) після спустошення черги DequeueAsync повертає null, сигналізуючи коректне завершення воркерів.
+    [Fact]
+    public async Task Dpc_D14_GracefulShutdown_FullQueue_RejectsNewRequestsWith503_AndDrainsAllQueuedRequests()
+    {
+        const int capacity = 3;
+        var queue = new MonitorRequestQueue(capacity);
+        var options = new ServiceOptions
+        {
+            InstanceId = "test-graceful-node",
+            ExecutionModel = "async_tasks",
+            QueueCapacity = capacity,
+            EnableWorkers = false
+        };
+        var metrics = new MetricsCollector();
+        var lifetime = new TestHostLifetime();
+        var pool = new EnrollmentWorkerPool(queue, null!, null!, options, metrics, lifetime);
+
+        // 1. Заповнюємо чергу до максимальної місткості
+        var queuedItems = new List<QueuedRequestItem>();
+        for (int i = 1; i <= capacity; i++)
+        {
+            var item = new QueuedRequestItem
+            {
+                Id = Guid.NewGuid(),
+                StudentId = $"student-{i}",
+                GroupId = "DISC-DPC-01",
+                CreatedAtUtc = DateTimeOffset.UtcNow
+            };
+            queuedItems.Add(item);
+            bool enqueued = queue.TryEnqueue(item);
+            Assert.True(enqueued, $"Item {i} should be successfully enqueued.");
+        }
+        Assert.Equal(capacity, queue.Count);
+
+        // 2. Ініціюємо Graceful Shutdown (імітація сигналу SIGTERM Д1.4)
+        pool.InitiateShutdown();
+        Assert.True(pool.IsShuttingDown);
+
+        // 3. Перевіряємо роботу GracefulShutdownMiddleware:
+        // Змінюючий POST запит повинен отримати HTTP 503 "service_shutting_down"
+        bool nextCalled = false;
+        var middleware = new GracefulShutdownMiddleware(
+            _ => { nextCalled = true; return Task.CompletedTask; },
+            options,
+            pool);
+
+        var postContext = new DefaultHttpContext();
+        postContext.Request.Method = HttpMethods.Post;
+        postContext.Request.Path = "/v1/enrollment-requests";
+        postContext.Response.Body = new MemoryStream();
+
+        await middleware.InvokeAsync(postContext);
+        Assert.False(nextCalled);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, postContext.Response.StatusCode);
+
+        // Перевіряємо, що черга більше не приймає нових елементів після завершення
+        var overflowItem = new QueuedRequestItem
+        {
+            Id = Guid.NewGuid(),
+            StudentId = "overflow-student",
+            GroupId = "DISC-DPC-01",
+            CreatedAtUtc = DateTimeOffset.UtcNow
+        };
+        Assert.False(queue.TryEnqueue(overflowItem));
+
+        // 4. Перевіряємо, що читаючий GET запит (перевірка стану) не блокується middleware
+        nextCalled = false;
+        var getContext = new DefaultHttpContext();
+        getContext.Request.Method = HttpMethods.Get;
+        getContext.Request.Path = "/v1/enrollment-requests/" + queuedItems[0].Id;
+        await middleware.InvokeAsync(getContext);
+        Assert.True(nextCalled);
+
+        // 5. Перевіряємо безперешкодне вивантаження (drain) усіх раніше прийнятих заявок
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var drainedItems = new List<QueuedRequestItem>();
+        for (int i = 0; i < capacity; i++)
+        {
+            var item = await queue.DequeueAsync(cts.Token);
+            Assert.NotNull(item);
+            drainedItems.Add(item!);
+        }
+
+        Assert.Equal(capacity, drainedItems.Count);
+        for (int i = 0; i < capacity; i++)
+        {
+            Assert.Equal(queuedItems[i].Id, drainedItems[i].Id);
+        }
+
+        // 6. Після повного вивантаження наступний DequeueAsync повертає null (воркери безпечно зупиняються)
+        var finishedItem = await queue.DequeueAsync(cts.Token);
+        Assert.Null(finishedItem);
+    }
+
+    private sealed class TestHostLifetime : Microsoft.Extensions.Hosting.IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource _stoppingCts = new();
+        private readonly CancellationTokenSource _stoppedCts = new();
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+        public CancellationToken ApplicationStopping => _stoppingCts.Token;
+        public CancellationToken ApplicationStopped => _stoppedCts.Token;
+        public void StopApplication() => _stoppingCts.Cancel();
     }
 }
