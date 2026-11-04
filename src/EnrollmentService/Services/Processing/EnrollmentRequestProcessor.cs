@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using EnrollmentService.Domain;
 using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
@@ -33,12 +34,32 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         _options = options;
     }
 
+    private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
+
     /// <summary>
     /// Тестова точка перехоплення, що викликається детерміновано безпосередньо перед початком обробки заявки воркером
     /// (до переходу в стан processing або до взяття транзакційного блокування).
     /// Дозволяє тестам безпечно моделювати стани черги та синхронізовано змінювати дані до початку обробки.
     /// </summary>
     public Func<QueuedRequestItem, Task>? TestHookBeforeProcessingAsync { get; set; }
+
+    /// <summary>
+    /// Реєструє тестову точку перехоплення, ізольовану виключно для конкретного ідентифікатора заявки (requestId).
+    /// Запобігає взаємному впливу тестів та гарантує, що інші запити черги оброблятимуться без перешкод.
+    /// Повертає IDisposable для надійного автоматичного видалення реєстрації.
+    /// </summary>
+    public IDisposable RegisterPreProcessingHook(Guid requestId, Func<QueuedRequestItem, Task> hook)
+    {
+        _scopedPreProcessingHooks[requestId] = hook;
+        return new ScopedHookRegistration(() => _scopedPreProcessingHooks.TryRemove(requestId, out _));
+    }
+
+    private sealed class ScopedHookRegistration : IDisposable
+    {
+        private Action? _disposeAction;
+        public ScopedHookRegistration(Action disposeAction) => _disposeAction = disposeAction;
+        public void Dispose() => Interlocked.Exchange(ref _disposeAction, null)?.Invoke();
+    }
 
     /// <summary>
     /// Тестова точка перехоплення, що викликається детерміновано одразу після COMMIT бізнес-транзакції,
@@ -53,9 +74,50 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         IBoundedRequestQueue queue,
         CancellationToken cancellationToken = default)
     {
-        if (TestHookBeforeProcessingAsync != null)
+        // Детермінована ізольована точка перехоплення перед стартом обробки
+        if (_scopedPreProcessingHooks.TryGetValue(item.Id, out var scopedHook))
         {
-            await TestHookBeforeProcessingAsync(item);
+            try
+            {
+                await scopedHook(item);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_scoped_hook_failed", new Dictionary<string, object?>
+                {
+                    ["worker_id"] = workerId,
+                    ["request_id"] = item.Id,
+                    ["error"] = ex.Message
+                });
+            }
+        }
+        else
+        {
+            var globalHook = TestHookBeforeProcessingAsync;
+            if (globalHook != null)
+            {
+                try
+                {
+                    await globalHook(item);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_global_hook_failed", new Dictionary<string, object?>
+                    {
+                        ["worker_id"] = workerId,
+                        ["request_id"] = item.Id,
+                        ["error"] = ex.Message
+                    });
+                }
+            }
         }
 
         var startedAtUtc = DateTimeOffset.UtcNow;
