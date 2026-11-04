@@ -3,7 +3,10 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using EnrollmentService;
 using EnrollmentService.Queues;
+using EnrollmentService.Repositories;
+using EnrollmentService.Services.Processing;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
@@ -1456,10 +1459,176 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             cmdRoster.Parameters.AddWithValue("id", createdRequestId.Value);
             long rosterCount = (long)(await cmdRoster.ExecuteScalarAsync())!;
             Assert.Equal(0L, rosterCount);
+
+            // Перевіряємо, що enrollment_id обнулено (FK violation), а requested_enrollment_id збережено
+            await using var cmdReq = new NpgsqlCommand("SELECT enrollment_id, requested_enrollment_id FROM enrollment_requests WHERE id = @id;", conn);
+            cmdReq.Parameters.AddWithValue("id", createdRequestId.Value);
+            await using var reader = await cmdReq.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.True(reader.IsDBNull(0), "enrollment_id має бути NULL при неіснуючому записі (FK violation)");
+            Assert.Equal(fakeEnrollmentId, reader.GetGuid(1));
+            await reader.CloseAsync();
+
+            // Перевіряємо, що вільні місця в групі не зменшилися
+            await using var cmdSeats = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @id;", conn);
+            cmdSeats.Parameters.AddWithValue("id", groupId);
+            int availableSeats = (int)(await cmdSeats.ExecuteScalarAsync())!;
+            Assert.Equal(5, availableSeats);
         }
         finally
         {
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, createdRequestId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task JointScenario_NonExistentRequestedEnrollmentId_DpcSandboxDisabled_RejectedAndNoRoster()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-joint-dis";
+        string groupId = "GRP-E2E-JOINT-DIS";
+        string discId = "DISC-E2E-JOINT-DIS";
+        Guid fakeEnrollmentId = Guid.NewGuid();
+        Guid? createdRequestId = null;
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: false);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            var content = new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    student_id = studentId,
+                    group_id = groupId,
+                    enrollment_id = fakeEnrollmentId.ToString("D")
+                }),
+                Encoding.UTF8,
+                "application/json");
+
+            var resp = await client.PostAsync("/v1/enrollment-requests", content);
+            Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
+
+            var json = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            createdRequestId = Guid.Parse(doc.RootElement.GetProperty("id").GetString()!);
+
+            await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+
+            var pollResp = await client.GetAsync($"/v1/enrollment-requests/{createdRequestId.Value}");
+            var pollJson = await pollResp.Content.ReadAsStringAsync();
+            using var pollDoc = JsonDocument.Parse(pollJson);
+            Assert.Equal("rejected", pollDoc.RootElement.GetProperty("status").GetString());
+
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE request_id = @id;", conn);
+            cmdRoster.Parameters.AddWithValue("id", createdRequestId.Value);
+            long rosterCount = (long)(await cmdRoster.ExecuteScalarAsync())!;
+            Assert.Equal(0L, rosterCount);
+
+            await using var cmdReq = new NpgsqlCommand("SELECT enrollment_id, requested_enrollment_id FROM enrollment_requests WHERE id = @id;", conn);
+            cmdReq.Parameters.AddWithValue("id", createdRequestId.Value);
+            await using var reader = await cmdReq.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.True(reader.IsDBNull(0), "enrollment_id має бути NULL при неіснуючому записі");
+            Assert.Equal(fakeEnrollmentId, reader.GetGuid(1));
+            await reader.CloseAsync();
+
+            await using var cmdSeats = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @id;", conn);
+            cmdSeats.Parameters.AddWithValue("id", groupId);
+            int availableSeats = (int)(await cmdSeats.ExecuteScalarAsync())!;
+            Assert.Equal(5, availableSeats);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, createdRequestId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task JointScenario_MismatchedGroupId_RejectedAndNoRoster()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-joint-mg";
+        string groupId1 = "GRP-E2E-JOINT-MG1";
+        string discId1 = "DISC-E2E-JOINT-MG1";
+        string groupId2 = "GRP-E2E-JOINT-MG2";
+        string discId2 = "DISC-E2E-JOINT-MG2";
+        Guid? createdRequestId = null;
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId1, discId1);
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId2, discId2);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId1, discId1, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+            await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            // Створюємо Web-запис у групі 1
+            var webClient = _factory.CreateClient();
+            webClient.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            webClient.DefaultRequestHeaders.Add("Idempotency-Key", $"web-idem-{Guid.NewGuid():N}");
+
+            var webResp = await webClient.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, webResp.StatusCode);
+            var webJson = await webResp.Content.ReadAsStringAsync();
+            using var webDoc = JsonDocument.Parse(webJson);
+            Guid heldEnrollmentId = Guid.Parse(webDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Надсилаємо DPC-заявку для групи 2, але вказуємо enrollment_id від групи 1
+            var dpcClient = _factory.CreateClient();
+            dpcClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            var dpcResp = await dpcClient.PostAsync("/v1/enrollment-requests", new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    student_id = studentId,
+                    group_id = groupId2,
+                    enrollment_id = heldEnrollmentId.ToString("D")
+                }),
+                Encoding.UTF8,
+                "application/json"));
+            Assert.Equal(HttpStatusCode.Accepted, dpcResp.StatusCode);
+
+            var dpcJson = await dpcResp.Content.ReadAsStringAsync();
+            using var dpcDoc = JsonDocument.Parse(dpcJson);
+            createdRequestId = Guid.Parse(dpcDoc.RootElement.GetProperty("id").GetString()!);
+
+            await WaitForTerminalStatusAsync(dpcClient, createdRequestId.Value);
+
+            var pollResp = await dpcClient.GetAsync($"/v1/enrollment-requests/{createdRequestId.Value}");
+            var pollJson = await pollResp.Content.ReadAsStringAsync();
+            using var pollDoc = JsonDocument.Parse(pollJson);
+            Assert.Equal("rejected", pollDoc.RootElement.GetProperty("status").GetString());
+
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+            await using var checkReq = new NpgsqlCommand("SELECT rejection_reason FROM enrollment_requests WHERE id = @id;", conn);
+            checkReq.Parameters.AddWithValue("id", createdRequestId.Value);
+            string reason = (string)(await checkReq.ExecuteScalarAsync())!;
+            Assert.Contains(groupId1, reason);
+            Assert.Contains(groupId2, reason);
+
+            await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE request_id = @id;", conn);
+            cmdRoster.Parameters.AddWithValue("id", createdRequestId.Value);
+            long rosterCount = (long)(await cmdRoster.ExecuteScalarAsync())!;
+            Assert.Equal(0L, rosterCount);
+
+            // Перевіряємо, що Web-запис для групи 1 не було підтверджено
+            await using var checkEnr = new NpgsqlCommand("SELECT status FROM enrollment WHERE id = @id;", conn);
+            checkEnr.Parameters.AddWithValue("id", heldEnrollmentId);
+            string enrStatus = (string)(await checkEnr.ExecuteScalarAsync())!;
+            Assert.Equal("held", enrStatus);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId1, discId1, createdRequestId);
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId2, discId2);
         }
     }
 
@@ -1784,6 +1953,201 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
                 checkReq.Parameters.AddWithValue("reqId", testRequestId);
                 var val = await checkReq.ExecuteScalarAsync();
                 Assert.True(val == null || val == DBNull.Value, "Очікувалося обнулення enrollment_id при каскадному ON DELETE SET NULL");
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(testStudent, testGroup, testDisc, testRequestId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task JointScenario_EnrollmentDeletedBeforeProcessing_RejectedByRequestedEnrollmentId()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-e2e-del-before";
+        string groupId = "GRP-E2E-DEL-BEFORE";
+        string discId = "DISC-E2E-DEL-BEFORE";
+        Guid heldEnrollmentId = Guid.NewGuid();
+        Guid testRequestId = Guid.NewGuid();
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 4, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+
+            // 1. Створюємо запис enrollment у стані held
+            await using (var insEnr = new NpgsqlCommand(@"
+                INSERT INTO enrollment (id, student_id, group_id, discipline_id, status, version, created_at, expires_at)
+                VALUES (@id, @sid, @gid, @did, 'held', 1, NOW(), NOW() + INTERVAL '15 minutes');", conn))
+            {
+                insEnr.Parameters.AddWithValue("id", heldEnrollmentId);
+                insEnr.Parameters.AddWithValue("sid", studentId);
+                insEnr.Parameters.AddWithValue("gid", groupId);
+                insEnr.Parameters.AddWithValue("did", discId);
+                await insEnr.ExecuteNonQueryAsync();
+            }
+
+            // 2. Вставляємо заявку enrollment_requests у стані queued із посиланням на heldEnrollmentId
+            await using (var insReq = new NpgsqlCommand(@"
+                INSERT INTO enrollment_requests (id, student_id, group_id, status, created_at, enrollment_id, requested_enrollment_id)
+                VALUES (@reqId, @sid, @gid, 'queued', NOW(), @enrId, @enrId);", conn))
+            {
+                insReq.Parameters.AddWithValue("reqId", testRequestId);
+                insReq.Parameters.AddWithValue("sid", studentId);
+                insReq.Parameters.AddWithValue("gid", groupId);
+                insReq.Parameters.AddWithValue("enrId", heldEnrollmentId);
+                await insReq.ExecuteNonQueryAsync();
+            }
+
+            // 3. Симулюємо видалення Web-запису до того, як воркер завершить обробку
+            await using (var delEnr = new NpgsqlCommand("DELETE FROM enrollment WHERE id = @id;", conn))
+            {
+                delEnr.Parameters.AddWithValue("id", heldEnrollmentId);
+                await delEnr.ExecuteNonQueryAsync();
+            }
+
+            // 4. Перевіряємо, що каскадний FK ON DELETE SET NULL обнулив enrollment_id,
+            // але requested_enrollment_id зберіг первинний GUID клієнта
+            await using (var checkReq = new NpgsqlCommand(@"
+                SELECT enrollment_id, requested_enrollment_id
+                FROM enrollment_requests
+                WHERE id = @reqId;", conn))
+            {
+                checkReq.Parameters.AddWithValue("reqId", testRequestId);
+                await using var reader = await checkReq.ExecuteReaderAsync();
+                Assert.True(await reader.ReadAsync());
+                Assert.True(reader.IsDBNull(0), "enrollment_id мав бути обнулений через ON DELETE SET NULL");
+                Assert.Equal(heldEnrollmentId, reader.GetGuid(1));
+            }
+
+            // 5. Очікуємо завершення обробки фоновим воркером
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+            await WaitForTerminalStatusAsync(client, testRequestId);
+
+            // 6. Перевіряємо, що заявка відхилена, а не пішла в автономну обробку
+            await using (var finalCheck = new NpgsqlCommand(@"
+                SELECT status, rejection_reason
+                FROM enrollment_requests
+                WHERE id = @reqId;", conn))
+            {
+                finalCheck.Parameters.AddWithValue("reqId", testRequestId);
+                await using var reader = await finalCheck.ExecuteReaderAsync();
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal("rejected", reader.GetString(0));
+                Assert.Contains("не знайдено або було видалено", reader.GetString(1));
+            }
+
+            // 7. Перевіряємо, що в decanate_roster нічого не створено
+            await using (var cmdRoster = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE request_id = @id;", conn))
+            {
+                cmdRoster.Parameters.AddWithValue("id", testRequestId);
+                long count = (long)(await cmdRoster.ExecuteScalarAsync())!;
+                Assert.Equal(0L, count);
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Migration009_Schema_RequestedEnrollmentId()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        await using var conn = await TestEnvironment.OpenConnectionAsync();
+
+        // 1. Перевіряємо наявність колонки requested_enrollment_id у таблиці enrollment_requests
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = 'enrollment_requests' AND column_name = 'requested_enrollment_id';", conn);
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            Assert.True(await reader.ReadAsync(), "Колонка requested_enrollment_id відсутня в таблиці enrollment_requests");
+            Assert.Equal("requested_enrollment_id", reader.GetString(0));
+            Assert.Equal("uuid", reader.GetString(1));
+            Assert.Equal("YES", reader.GetString(2));
+        }
+
+        // 2. Перевіряємо, що requested_enrollment_id НЕ має обмеження зовнішнього ключа (FK)
+        await using var cmdFk = new NpgsqlCommand(@"
+            SELECT count(*)
+            FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            WHERE t.relname = 'enrollment_requests' AND c.contype = 'f'
+              AND EXISTS (
+                  SELECT 1 FROM pg_attribute a
+                  WHERE a.attrelid = t.oid AND a.attnum = ANY(c.conkey) AND a.attname = 'requested_enrollment_id'
+              );", conn);
+        long fkCount = (long)(await cmdFk.ExecuteScalarAsync())!;
+        Assert.Equal(0L, fkCount);
+
+        // 3. Перевіряємо поведінку: при наявності enrollment і подальшому DELETE,
+        // enrollment_id стає NULL (каскадно), а requested_enrollment_id залишається незмінним
+        string testStudent = "student-e2e-m009-test";
+        string testGroup = "GRP-E2E-M009-G";
+        string testDisc = "DISC-E2E-M009-D";
+        Guid testEnrollmentId = Guid.NewGuid();
+        Guid testRequestId = Guid.NewGuid();
+
+        await TestEnvironment.CleanupTestDataAsync(testStudent, testGroup, testDisc, testRequestId);
+        try
+        {
+            await EnsureTestStudentAsync(testStudent, 5, 0, 0.0m);
+            await EnsureTestGroupAsync(testGroup, testDisc, 5, 5, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+            // Вставляємо тестовий запис enrollment
+            await using (var insEnr = new NpgsqlCommand(@"
+                INSERT INTO enrollment (id, student_id, group_id, discipline_id, status, version, created_at, expires_at)
+                VALUES (@id, @sid, @gid, @did, 'held', 1, NOW(), NOW() + INTERVAL '15 minutes');", conn))
+            {
+                insEnr.Parameters.AddWithValue("id", testEnrollmentId);
+                insEnr.Parameters.AddWithValue("sid", testStudent);
+                insEnr.Parameters.AddWithValue("gid", testGroup);
+                insEnr.Parameters.AddWithValue("did", testDisc);
+                await insEnr.ExecuteNonQueryAsync();
+            }
+
+            // Вставляємо заявку через репозиторій
+            var reqRepo = _factory.Services.GetRequiredService<EnrollmentRequestRepository>();
+            var queuedItem = new QueuedRequestItem
+            {
+                Id = testRequestId,
+                StudentId = testStudent,
+                GroupId = testGroup,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                EnrollmentId = testEnrollmentId,
+                RequestedEnrollmentId = testEnrollmentId
+            };
+            bool inserted = await reqRepo.TryInsertQueuedRequestAsync(queuedItem, conn);
+            Assert.True(inserted);
+
+            // Видаляємо запис enrollment
+            await using (var delEnr = new NpgsqlCommand("DELETE FROM enrollment WHERE id = @id;", conn))
+            {
+                delEnr.Parameters.AddWithValue("id", testEnrollmentId);
+                await delEnr.ExecuteNonQueryAsync();
+            }
+
+            // Перевіряємо в базі: enrollment_id став NULL, але requested_enrollment_id зберігся
+            await using (var checkReq = new NpgsqlCommand(@"
+                SELECT enrollment_id, requested_enrollment_id
+                FROM enrollment_requests
+                WHERE id = @reqId;", conn))
+            {
+                checkReq.Parameters.AddWithValue("reqId", testRequestId);
+                await using var reader = await checkReq.ExecuteReaderAsync();
+                Assert.True(await reader.ReadAsync());
+                Assert.True(reader.IsDBNull(0), "enrollment_id мав бути обнулений через ON DELETE SET NULL");
+                Assert.Equal(testEnrollmentId, reader.GetGuid(1));
             }
         }
         finally

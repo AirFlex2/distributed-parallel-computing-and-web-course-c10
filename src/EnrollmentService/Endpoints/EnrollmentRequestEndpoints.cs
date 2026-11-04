@@ -199,6 +199,7 @@ public static class EnrollmentRequestEndpoints
                     StudentId = studentId,
                     GroupId = groupId,
                     EnrollmentId = dto.EnrollmentId,
+                    RequestedEnrollmentId = dto.EnrollmentId,
                     CreatedAtUtc = createdAtUtc,
                     IdempotencyKey = idempotencyKey,
                     RequestPayloadHash = payloadFingerprint,

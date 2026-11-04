@@ -218,10 +218,20 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             }
 
             var group = groupWithDisc.Value.Group;
-            if (!group.DpcSandboxEnabled && !item.EnrollmentId.HasValue)
+            Guid? targetEnrollmentId = item.RequestedEnrollmentId ?? item.EnrollmentId;
+
+            if (!group.DpcSandboxEnabled && !targetEnrollmentId.HasValue)
             {
                 await tx.RollbackAsync(cancellationToken);
                 return ("rejected", $"Група '{item.GroupId}' не призначена для автономної обробки РПО (dpc_sandbox_enabled = false).");
+            }
+
+            // У режимі UNSAFE спільний наскрізний сценарій Web + DPC суворо заборонено,
+            // оскільки UNSAFE призначений виключно для лабораторної демонстрації Lost Update на автономному прийомі
+            if (isUnsafe && targetEnrollmentId.HasValue)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ("rejected", "Спільний наскрізний сценарій Web + DPC підтримується виключно в безпечному режимі SAFE (атомарна транзакція з блокуванням FOR UPDATE).");
             }
 
             string disciplineId = group.DisciplineId;
@@ -253,118 +263,117 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 return ("done", null);
             }
 
-            // Спільний наскрізний сценарій Web + DPC (тема C10, §2.6.4):
-            // Якщо передано enrollment_id, місце вже зарезервовано Web-контуром (held).
-            // Воркер РПО перевіряє повну валідність зв'язування, підтверджує запис (held -> confirmed)
-            // та вносить його до відомості decanate_roster без повторного списання available або кредитів студента (Сценарій Б).
-            if (item.EnrollmentId.HasValue)
-            {
-                // 1. Перевіряємо існування та блокуємо запис enrollment FOR UPDATE
-                var heldEnrollment = await _enrollmentRepo.GetEnrollmentForJointVerificationAsync(
-                    item.EnrollmentId.Value, conn, tx, cancellationToken);
-
-                if (!heldEnrollment.HasValue)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Пов'язаний Web-запис '{item.EnrollmentId.Value}' не знайдено в базі даних.");
-                }
-
-                // 2. Перевіряємо відповідність студента
-                if (!string.Equals(heldEnrollment.Value.StudentId, item.StudentId, StringComparison.Ordinal))
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Web-запис '{item.EnrollmentId.Value}' належить іншому студенту ('{heldEnrollment.Value.StudentId}', очікувався '{item.StudentId}').");
-                }
-
-                // 3. Перевіряємо відповідність групи
-                if (!string.Equals(heldEnrollment.Value.GroupId, item.GroupId, StringComparison.Ordinal))
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Web-запис '{item.EnrollmentId.Value}' відноситься до групи '{heldEnrollment.Value.GroupId}', а не '{item.GroupId}'.");
-                }
-
-                // 4. Перевіряємо статус (має бути 'held')
-                if (!string.Equals(heldEnrollment.Value.Status, "held", StringComparison.Ordinal))
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Web-запис '{item.EnrollmentId.Value}' перебуває у неприпустимому для підтвердження стані '{heldEnrollment.Value.Status}'.");
-                }
-
-                // 5. Перевіряємо строк дії резервування (held)
-                if (heldEnrollment.Value.ExpiresAt <= DateTimeOffset.UtcNow)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Термін дії резервування Web-запису '{item.EnrollmentId.Value}' сплив.");
-                }
-
-                // 6. Перевіряємо чи група не закрита деканатом
-                if (group.Closed)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).");
-                }
-
-                // 7. Виконуємо підтвердження через ConfirmEnrollmentHeldAsync з обов'язковою перевіркою результату
-                bool confirmed = await _enrollmentRepo.ConfirmEnrollmentHeldAsync(item.EnrollmentId.Value, conn, tx, cancellationToken);
-                if (!confirmed)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"Не вдалося підтвердити Web-запис '{item.EnrollmentId.Value}' (стан було змінено або запис не у стані held).");
-                }
-
-                var finishedAtUtcJoint = _metrics.MarkProcessingFinished(item);
-
-                await _decanateRepo.InsertRosterEntryAsync(
-                    item.Id,
-                    item.StudentId,
-                    item.GroupId,
-                    disciplineId,
-                    disciplineEcts,
-                    item.EnrollmentId.Value,
-                    "joint_web_enrollment",
-                    finishedAtUtcJoint,
-                    conn,
-                    tx,
-                    cancellationToken);
-
-                await _requestRepo.UpdateStatusAsync(
-                    item.Id,
-                    "done",
-                    null,
-                    item.GroupId,
-                    finishedAtUtcJoint,
-                    conn,
-                    tx,
-                    cancellationToken);
-
-                await tx.CommitAsync(cancellationToken);
-
-                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
-                {
-                    await TestHookAfterCommitAsync(item);
-                }
-
-                return ("done", null);
-            }
-
-            // 4. Перевірка наявності активного запису на дисципліну в обох таблицях (єдине предметне правило §1.10)
-            bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(item.StudentId, disciplineId, conn, tx, cancellationToken);
-
-            var policyResult = EnrollmentPolicy.Check(
-                student,
-                group,
-                disciplineEcts,
-                DateTimeOffset.UtcNow,
-                alreadyEnrolled);
-
-            if (!policyResult.Allowed)
-            {
-                await tx.RollbackAsync(cancellationToken);
-                return ("rejected", policyResult.RejectionReason);
-            }
-
             if (!isUnsafe)
             {
+                // Спільний наскрізний сценарій Web + DPC (тема C10, §2.6.4):
+                // Якщо передано requested_enrollment_id (або enrollment_id), місце вже зарезервовано Web-контуром (held).
+                // Воркер РПО в безпечному режимі (SAFE) перевіряє повну валідність зв'язування, підтверджує запис (held -> confirmed)
+                // та вносить його до відомості decanate_roster без повторного списання available або кредитів студента (Сценарій Б).
+                if (targetEnrollmentId.HasValue)
+                {
+                    // 1. Перевіряємо існування та блокуємо запис enrollment FOR UPDATE
+                    var heldEnrollment = await _enrollmentRepo.GetEnrollmentForJointVerificationAsync(
+                        targetEnrollmentId.Value, conn, tx, cancellationToken);
+
+                    if (!heldEnrollment.HasValue)
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Пов'язаний Web-запис '{targetEnrollmentId.Value}' не знайдено або було видалено з бази даних.");
+                    }
+
+                    // 2. Перевіряємо відповідність студента
+                    if (!string.Equals(heldEnrollment.Value.StudentId, item.StudentId, StringComparison.Ordinal))
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' належить іншому студенту ('{heldEnrollment.Value.StudentId}', очікувався '{item.StudentId}').");
+                    }
+
+                    // 3. Перевіряємо відповідність групи
+                    if (!string.Equals(heldEnrollment.Value.GroupId, item.GroupId, StringComparison.Ordinal))
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' відноситься до групи '{heldEnrollment.Value.GroupId}', а не '{item.GroupId}'.");
+                    }
+
+                    // 4. Перевіряємо статус (має бути 'held')
+                    if (!string.Equals(heldEnrollment.Value.Status, "held", StringComparison.Ordinal))
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' перебуває у неприпустимому для підтвердження стані '{heldEnrollment.Value.Status}'.");
+                    }
+
+                    // 5. Перевіряємо строк дії резервування (held)
+                    if (heldEnrollment.Value.ExpiresAt <= DateTimeOffset.UtcNow)
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Термін дії резервування Web-запису '{targetEnrollmentId.Value}' сплив.");
+                    }
+
+                    // 6. Перевіряємо чи група не закрита деканатом
+                    if (group.Closed)
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).");
+                    }
+
+                    // 7. Виконуємо підтвердження через ConfirmEnrollmentHeldAsync з обов'язковою перевіркою результату
+                    bool confirmed = await _enrollmentRepo.ConfirmEnrollmentHeldAsync(targetEnrollmentId.Value, conn, tx, cancellationToken);
+                    if (!confirmed)
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Не вдалося підтвердити Web-запис '{targetEnrollmentId.Value}' (стан було змінено або запис не у стані held).");
+                    }
+
+                    var finishedAtUtcJoint = _metrics.MarkProcessingFinished(item);
+
+                    await _decanateRepo.InsertRosterEntryAsync(
+                        item.Id,
+                        item.StudentId,
+                        item.GroupId,
+                        disciplineId,
+                        disciplineEcts,
+                        targetEnrollmentId.Value,
+                        "joint_web_enrollment",
+                        finishedAtUtcJoint,
+                        conn,
+                        tx,
+                        cancellationToken);
+
+                    await _requestRepo.UpdateStatusAsync(
+                        item.Id,
+                        "done",
+                        null,
+                        item.GroupId,
+                        finishedAtUtcJoint,
+                        conn,
+                        tx,
+                        cancellationToken);
+
+                    await tx.CommitAsync(cancellationToken);
+
+                    if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
+                    {
+                        await TestHookAfterCommitAsync(item);
+                    }
+
+                    return ("done", null);
+                }
+
+                // 4. Перевірка наявності активного запису на дисципліну в обох таблицях для автономного прийому (єдине предметне правило §1.10)
+                bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(item.StudentId, disciplineId, conn, tx, cancellationToken);
+
+                var policyResult = EnrollmentPolicy.Check(
+                    student,
+                    group,
+                    disciplineEcts,
+                    DateTimeOffset.UtcNow,
+                    alreadyEnrolled);
+
+                if (!policyResult.Allowed)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ("rejected", policyResult.RejectionReason);
+                }
 
                 // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
                 // Пряма паралельна обробка заявок черги з атомарним декрементом available під FOR UPDATE.
@@ -419,7 +428,22 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             }
             else
             {
-                // НЕБЕЗПЕЧНИЙ РЕЖИМ (UNSAFE): відсутність транзакційного блокування FOR UPDATE.
+                // НЕБЕЗПЕЧНИЙ РЕЖИМ (UNSAFE): автономний прийом без транзакційного блокування FOR UPDATE.
+                bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(item.StudentId, disciplineId, conn, tx, cancellationToken);
+
+                var policyResult = EnrollmentPolicy.Check(
+                    student,
+                    group,
+                    disciplineEcts,
+                    DateTimeOffset.UtcNow,
+                    alreadyEnrolled);
+
+                if (!policyResult.Allowed)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ("rejected", policyResult.RejectionReason);
+                }
+
                 // Прочитали available, потім записали available - 1 без умови WHERE available > 0 (Lost Update).
                 int newAvailable = group.Available - 1;
                 await _groupRepo.SetAvailableUnsafeAsync(item.GroupId, newAvailable, conn, tx, cancellationToken);

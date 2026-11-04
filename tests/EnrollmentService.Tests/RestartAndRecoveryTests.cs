@@ -491,4 +491,104 @@ public sealed class RestartAndRecoveryTests
             foreach (var rId in allIds) await CleanupRequestAsync(rId);
         }
     }
+
+    [SkippableFact]
+    public async Task JointScenario_AttemptInUnsafeMode_Rejected()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-unsafe-joint";
+        string groupId = "GRP-UNSAFE-JOINT";
+        string discId = "DISC-UNSAFE-JOINT";
+        Guid fakeEnrollmentId = Guid.NewGuid();
+        Guid testRequestId = Guid.NewGuid();
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+        try
+        {
+            await using var conn = await _factory.OpenConnectionAsync();
+
+            await using var cmdDisc = new NpgsqlCommand(@"
+                INSERT INTO discipline (id, code, title, ects, is_test_only)
+                VALUES (@discId, 'CODE-' || @discId, 'Test Discipline ' || @discId, 3.0, TRUE)
+                ON CONFLICT (id) DO UPDATE SET ects = 3.0;", conn);
+            cmdDisc.Parameters.AddWithValue("discId", discId);
+            await cmdDisc.ExecuteNonQueryAsync();
+
+            await using var cmdGroup = new NpgsqlCommand(@"
+                INSERT INTO discipline_group (id, discipline_id, group_code, seats, available, opens_at, closes_at, university_tz, closed, dpc_sandbox_enabled)
+                VALUES (@groupId, @discId, 'GRP-' || @groupId, 5, 5, NOW() - INTERVAL '1 day', NOW() + INTERVAL '1 day', 'Europe/Kyiv', FALSE, TRUE)
+                ON CONFLICT (id) DO UPDATE SET seats = 5, available = 5, closed = FALSE, dpc_sandbox_enabled = TRUE;", conn);
+            cmdGroup.Parameters.AddWithValue("groupId", groupId);
+            cmdGroup.Parameters.AddWithValue("discId", discId);
+            await cmdGroup.ExecuteNonQueryAsync();
+
+            await using var studentCmd = new NpgsqlCommand(@"
+                INSERT INTO student (id, email, full_name, max_disciplines, active_count, active_ects)
+                VALUES (@studentId, @email, @fullName, 5, 0, 0.0)
+                ON CONFLICT (id) DO NOTHING;", conn);
+            studentCmd.Parameters.AddWithValue("studentId", studentId);
+            studentCmd.Parameters.AddWithValue("email", $"{studentId}@test.univ.ua");
+            studentCmd.Parameters.AddWithValue("fullName", $"Test Student {studentId}");
+            await studentCmd.ExecuteNonQueryAsync();
+
+            await using var insReq = new NpgsqlCommand(@"
+                INSERT INTO enrollment_requests (id, student_id, group_id, status, created_at, requested_enrollment_id)
+                VALUES (@reqId, @sid, @gid, 'queued', NOW(), @reqEnrId);", conn);
+            insReq.Parameters.AddWithValue("reqId", testRequestId);
+            insReq.Parameters.AddWithValue("sid", studentId);
+            insReq.Parameters.AddWithValue("gid", groupId);
+            insReq.Parameters.AddWithValue("reqEnrId", fakeEnrollmentId);
+            await insReq.ExecuteNonQueryAsync();
+
+            var metrics = new MetricsCollector();
+            var queue = new ChannelRequestQueue(10);
+            var unsafeOptions = new ServiceOptions
+            {
+                InstanceId = "test-unsafe",
+                UnsafeMode = true,
+                AllowTestOverrides = true,
+                SlowCallMinMs = 0,
+                SlowCallMaxMs = 0
+            };
+
+            var unsafeProcessor = new EnrollmentRequestProcessor(
+                _requestRepo,
+                _groupRepo,
+                _enrollmentRepo,
+                _decanateRepo,
+                _factory,
+                metrics,
+                unsafeOptions);
+
+            var item = new QueuedRequestItem
+            {
+                Id = testRequestId,
+                StudentId = studentId,
+                GroupId = groupId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                EnrollmentId = null,
+                RequestedEnrollmentId = fakeEnrollmentId
+            };
+
+            await unsafeProcessor.ProcessItemAsync(1, item, isAsyncModel: true, queue, CancellationToken.None);
+
+            await using var check = new NpgsqlCommand("SELECT status, rejection_reason FROM enrollment_requests WHERE id = @id;", conn);
+            check.Parameters.AddWithValue("id", testRequestId);
+            await using var reader = await check.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal("rejected", reader.GetString(0));
+            Assert.Contains("Спільний наскрізний сценарій Web + DPC підтримується виключно в безпечному режимі SAFE", reader.GetString(1));
+            await reader.CloseAsync();
+
+            await using var checkRoster = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE request_id = @id;", conn);
+            checkRoster.Parameters.AddWithValue("id", testRequestId);
+            long count = (long)(await checkRoster.ExecuteScalarAsync())!;
+            Assert.Equal(0L, count);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+        }
+    }
 }

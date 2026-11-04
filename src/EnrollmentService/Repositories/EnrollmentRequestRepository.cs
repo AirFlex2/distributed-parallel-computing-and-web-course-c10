@@ -201,9 +201,9 @@ public sealed class EnrollmentRequestRepository
         {
             await using var insertCmd = new NpgsqlCommand(@"
                 INSERT INTO enrollment_requests (
-                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash, enrollment_id
+                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash, enrollment_id, requested_enrollment_id
                 ) VALUES (
-                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash, @enrollmentId
+                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash, @enrollmentId, @requestedEnrollmentId
                 )
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id;", conn);
@@ -223,19 +223,24 @@ public sealed class EnrollmentRequestRepository
             {
                 Value = (object?)item.EnrollmentId ?? DBNull.Value
             });
+            insertCmd.Parameters.Add(new NpgsqlParameter("requestedEnrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
+            {
+                Value = (object?)item.RequestedEnrollmentId ?? DBNull.Value
+            });
 
             var result = await insertCmd.ExecuteScalarAsync(cancellationToken);
             return result != null;
         }
-        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.ForeignKeyViolation)
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.ForeignKeyViolation &&
+                                           string.Equals(ex.ConstraintName, "enrollment_requests_enrollment_id_fkey", StringComparison.OrdinalIgnoreCase))
         {
-            // Якщо enrollment_id не існує в enrollment, зберігаємо запит у таблиці з enrollment_id = NULL,
-            // щоб черга РПО прийняла його (202 Accepted), а воркер асинхронно відхилив у транзакції (§2.6)
+            // Якщо тільки enrollment_id не існує в enrollment (FK порушено), зберігаємо запис із enrollment_id = NULL,
+            // але ОБОВ'ЯЗКОВО зберігаємо requested_enrollment_id, щоб воркер у транзакції надійно виявив невалідний зв'язок
             await using var fallbackCmd = new NpgsqlCommand(@"
                 INSERT INTO enrollment_requests (
-                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash, enrollment_id
+                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash, enrollment_id, requested_enrollment_id
                 ) VALUES (
-                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash, NULL
+                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash, NULL, @requestedEnrollmentId
                 )
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id;", conn);
@@ -250,6 +255,10 @@ public sealed class EnrollmentRequestRepository
             fallbackCmd.Parameters.Add(new NpgsqlParameter("payloadHash", NpgsqlTypes.NpgsqlDbType.Text)
             {
                 Value = (object?)item.RequestPayloadHash ?? DBNull.Value
+            });
+            fallbackCmd.Parameters.Add(new NpgsqlParameter("requestedEnrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
+            {
+                Value = (object?)item.RequestedEnrollmentId ?? DBNull.Value
             });
 
             var res = await fallbackCmd.ExecuteScalarAsync(cancellationToken);
@@ -279,7 +288,7 @@ public sealed class EnrollmentRequestRepository
     {
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
-            SELECT id, student_id, group_id, created_at, idempotency_key, request_payload_hash, enrollment_id
+            SELECT id, student_id, group_id, created_at, idempotency_key, request_payload_hash, enrollment_id, requested_enrollment_id
             FROM enrollment_requests
             WHERE status = 'queued'
             ORDER BY created_at ASC, id ASC
@@ -299,6 +308,7 @@ public sealed class EnrollmentRequestRepository
                 IdempotencyKey = reader.IsDBNull(4) ? null : reader.GetString(4),
                 RequestPayloadHash = reader.IsDBNull(5) ? null : reader.GetString(5),
                 EnrollmentId = reader.IsDBNull(6) ? null : reader.GetGuid(6),
+                RequestedEnrollmentId = reader.IsDBNull(7) ? null : reader.GetGuid(7),
                 EnqueueTimestamp = System.Diagnostics.Stopwatch.GetTimestamp()
             });
         }

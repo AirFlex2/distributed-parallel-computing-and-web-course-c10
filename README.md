@@ -314,7 +314,8 @@ pojekt/
 │   ├── 005_composite_foreign_keys.sql             # Композитні FK (group_id, discipline_id)
 │   ├── 006_global_unique_idempotency_key.sql      # Глобальний унікальний індекс Idempotency-Key
 │   ├── 007_add_dpc_sandbox_enabled.sql            # Розділення автономних DPC-груп і Web-груп
-│   └── 008_idempotency_and_joint_enrollment.sql   # Ідемпотентність Web-записів та зв'язок enrollment_id у заявках РПО
+│   ├── 008_idempotency_and_joint_enrollment.sql   # Ідемпотентність Web-записів та зв'язок enrollment_id у заявках РПО
+│   └── 009_add_requested_enrollment_id.sql        # Надійне збереження вихідного Web-ідентифікатора (requested_enrollment_id)
 ├── scripts/                                       # Сценарії автоматизованої перевірки
 │   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів (PowerShell 7+)
 │   └── verify_all.sh                              # Bash-обгортка для середовищ Linux/macOS

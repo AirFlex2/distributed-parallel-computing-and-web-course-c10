@@ -80,6 +80,7 @@ public sealed class QueuedRequestItem
     public required string StudentId { get; init; }
     public required string GroupId { get; init; }
     public Guid? EnrollmentId { get; init; }
+    public Guid? RequestedEnrollmentId { get; init; }
     public required DateTimeOffset CreatedAtUtc { get; init; }
     public string? IdempotencyKey { get; init; }
     public string? RequestPayloadHash { get; init; }
