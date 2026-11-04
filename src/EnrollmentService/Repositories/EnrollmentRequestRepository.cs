@@ -227,6 +227,34 @@ public sealed class EnrollmentRequestRepository
             var result = await insertCmd.ExecuteScalarAsync(cancellationToken);
             return result != null;
         }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.ForeignKeyViolation)
+        {
+            // Якщо enrollment_id не існує в enrollment, зберігаємо запит у таблиці з enrollment_id = NULL,
+            // щоб черга РПО прийняла його (202 Accepted), а воркер асинхронно відхилив у транзакції (§2.6)
+            await using var fallbackCmd = new NpgsqlCommand(@"
+                INSERT INTO enrollment_requests (
+                    id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash, enrollment_id
+                ) VALUES (
+                    @id, @studentId, @groupId, 'queued', @createdAt, @idempotencyKey, @payloadHash, NULL
+                )
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id;", conn);
+            fallbackCmd.Parameters.AddWithValue("id", item.Id);
+            fallbackCmd.Parameters.AddWithValue("studentId", item.StudentId);
+            fallbackCmd.Parameters.AddWithValue("groupId", item.GroupId);
+            fallbackCmd.Parameters.AddWithValue("createdAt", item.CreatedAtUtc);
+            fallbackCmd.Parameters.Add(new NpgsqlParameter("idempotencyKey", NpgsqlTypes.NpgsqlDbType.Text)
+            {
+                Value = (object?)item.IdempotencyKey ?? DBNull.Value
+            });
+            fallbackCmd.Parameters.Add(new NpgsqlParameter("payloadHash", NpgsqlTypes.NpgsqlDbType.Text)
+            {
+                Value = (object?)item.RequestPayloadHash ?? DBNull.Value
+            });
+
+            var res = await fallbackCmd.ExecuteScalarAsync(cancellationToken);
+            return res != null;
+        }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
         {
             // Унікальний конфлікт по student_id + idempotency_key

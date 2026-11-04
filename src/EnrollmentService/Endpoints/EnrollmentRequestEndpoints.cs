@@ -164,7 +164,7 @@ public static class EnrollmentRequestEndpoints
                         "group_not_found");
                 }
 
-                if (!group.DpcSandboxEnabled)
+                if (!group.DpcSandboxEnabled && !dto.EnrollmentId.HasValue)
                 {
                     return ProblemDetailsMapper.CreateProblemResult(
                         httpContext, opts,

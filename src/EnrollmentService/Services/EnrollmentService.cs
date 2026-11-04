@@ -96,6 +96,27 @@ public sealed class EnrollmentService
             string disciplineTitle = groupWithDisc.Value.DisciplineTitle;
             decimal disciplineEcts = groupWithDisc.Value.DisciplineEcts;
 
+            // Повторна перевірка ідемпотентності під транзакційним блокуванням (на випадок конкурентного надсилання)
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                var existingInTx = await _enrollmentRepo.GetEnrollmentByIdempotencyKeyAsync(idempotencyKey, conn, tx, cancellationToken);
+                if (existingInTx != null)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    if (!string.Equals(existingInTx.Value.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
+                        !string.Equals(existingInTx.Value.StudentId, studentId, StringComparison.Ordinal))
+                    {
+                        return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                            StatusCodes.Status409Conflict,
+                            "idempotency_key_conflict",
+                            "Конфлікт ключа ідемпотентності",
+                            "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
+                    }
+
+                    return ServiceResult<WebEnrollmentResponseDto>.Ok(existingInTx.Value.Enrollment);
+                }
+            }
+
             bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(studentId, disciplineId, conn, tx, cancellationToken);
 
             // Фіксуємо точний час безпосередньо перед перевіркою правил після отримання блокувань студента і групи
@@ -283,7 +304,16 @@ public sealed class EnrollmentService
                     "Час утримання місця (held, 15 хв) завершився, запис перейшов у стан 'expired'.");
             }
 
-            await _enrollmentRepo.ConfirmEnrollmentHeldAsync(enrollmentId, conn, tx, cancellationToken);
+            bool confirmed = await _enrollmentRepo.ConfirmEnrollmentHeldAsync(enrollmentId, conn, tx, cancellationToken);
+            if (!confirmed)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_not_held",
+                    "Неможливо підтвердити запис",
+                    "Запис не перебуває у стані 'held' або вже був змінений.");
+            }
 
             await tx.CommitAsync(cancellationToken);
 

@@ -500,7 +500,7 @@ public sealed class EnrollmentRepository
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task ConfirmEnrollmentHeldAsync(
+    public async Task<bool> ConfirmEnrollmentHeldAsync(
         Guid id,
         NpgsqlConnection conn,
         NpgsqlTransaction tx,
@@ -512,7 +512,35 @@ public sealed class EnrollmentRepository
             WHERE id = @enrollmentId AND status = 'held';", conn, tx);
         cmd.Parameters.AddWithValue("enrollmentId", id);
 
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+        int rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
+    }
+
+    public async Task<(string StudentId, string GroupId, string DisciplineId, string Status, DateTimeOffset ExpiresAt)?> GetEnrollmentForJointVerificationAsync(
+        Guid id,
+        NpgsqlConnection conn,
+        NpgsqlTransaction tx,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT student_id, group_id, discipline_id, status, expires_at
+            FROM enrollment
+            WHERE id = @id
+            FOR UPDATE OF enrollment;", conn, tx);
+        cmd.Parameters.AddWithValue("id", id);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return (
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetString(3),
+            reader.GetFieldValue<DateTimeOffset>(4));
     }
 
     public async Task ResetEnrollmentsAndStudentsAsync(

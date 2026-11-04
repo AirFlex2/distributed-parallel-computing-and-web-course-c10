@@ -304,7 +304,7 @@ if ([int]$noUserPost.StatusCode -eq 400 -and [int]$noUserGet.StatusCode -eq 400 
     Write-Fail "Помилка перевірки обов'язковості X-User-Id: POST=$([int]$noUserPost.StatusCode), GET=$([int]$noUserGet.StatusCode)"
 }
 
-$ownerInBodyRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1" } -Body '{"group_id":"DISC-WEB-01","student_id":"student-2"}' -SkipHttpErrorCheck
+$ownerInBodyRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = "owner-test-idem" } -Body '{"group_id":"DISC-WEB-01","student_id":"student-2"}' -SkipHttpErrorCheck
 $ownerInBodyJson = (Get-ResponseText $ownerInBodyRes) | ConvertFrom-Json
 if ([int]$ownerInBodyRes.StatusCode -eq 422 -and $ownerInBodyJson.error_code -eq "owner_in_body_forbidden") {
     Write-Pass "Спробу передати власника student_id у тілі POST /v1/enrollments відхилено з HTTP 422 (error_code=owner_in_body_forbidden)"
@@ -928,12 +928,39 @@ try {
     # --------------------------------------------------------------------------
     Write-Header "10. Курс «Web»: Пагінація курсором, життєвий цикл (held -> confirmed / expired), відмови 400/404/409, least_conn"
 
-    $webHeadersStudent1 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Authorization" = "Bearer $Token" }
-    $webHeadersStudent2 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "Authorization" = "Bearer $Token" }
-    $webHeadersStudent3 = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-3"; "Authorization" = "Bearer $Token" }
+    function Get-WebEnrollmentHeaders($studentId, $ik = $null) {
+        $key = if ([string]::IsNullOrWhiteSpace($ik)) { "web-$studentId-$([System.Guid]::NewGuid().ToString('N'))" } else { $ik }
+        return @{
+            "Content-Type" = "application/json"
+            "X-User-Id" = $studentId
+            "Authorization" = "Bearer $Token"
+            "Idempotency-Key" = $key
+        }
+    }
+
+    $webHeadersStudent1 = Get-WebEnrollmentHeaders "student-1"
+    $webHeadersStudent2 = Get-WebEnrollmentHeaders "student-2"
+    $webHeadersStudent3 = Get-WebEnrollmentHeaders "student-3"
+
+    # 10.0 Перевірка обов'язковості заголовка Idempotency-Key для POST /v1/enrollments (О1.4 Web)
+    $missingIkRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Authorization" = "Bearer $Token" } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $missingIkBody = (Get-ResponseText $missingIkRes) | ConvertFrom-Json
+    if ([int]$missingIkRes.StatusCode -eq 400 -and $missingIkBody.error_code -eq "missing_idempotency_key") {
+        Write-Pass "Web О1.4: Відсутній заголовок Idempotency-Key відхилено з HTTP 400 Bad Request (error_code=missing_idempotency_key)"
+    } else {
+        Write-Fail "Помилка перевірки обов'язковості Idempotency-Key: status=$([int]$missingIkRes.StatusCode)"
+    }
+
+    $emptyIkRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Authorization" = "Bearer $Token"; "Idempotency-Key" = "   " } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $emptyIkBody = (Get-ResponseText $emptyIkRes) | ConvertFrom-Json
+    if ([int]$emptyIkRes.StatusCode -eq 400 -and $emptyIkBody.error_code -eq "missing_idempotency_key") {
+        Write-Pass "Web О1.4: Порожній заголовок Idempotency-Key відхилено з HTTP 400 Bad Request (error_code=missing_idempotency_key)"
+    } else {
+        Write-Fail "Помилка перевірки порожнього Idempotency-Key: status=$([int]$emptyIkRes.StatusCode)"
+    }
 
     # 10.1 Синтаксично пошкоджений JSON -> 400 Bad Request (О1.3 Web)
-    $malformedJsonRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":' -SkipHttpErrorCheck
+    $malformedJsonRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-1") -Body '{"group_id":' -SkipHttpErrorCheck
     $malformedJsonBody = (Get-ResponseText $malformedJsonRes) | ConvertFrom-Json
     if ([int]$malformedJsonRes.StatusCode -eq 400 -and $malformedJsonBody.error_code -eq "invalid_json_syntax") {
         Write-Pass "Web О1.3: Синтаксично пошкоджений JSON відхилено з HTTP 400 Bad Request (error_code=invalid_json_syntax)"
@@ -942,7 +969,7 @@ try {
     }
 
     # 10.2 Невідома група у Web-контурі -> 404 Not Found (О1.4 Web)
-    $unknownWebGroupRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"NON-EXISTENT-GRP"}' -SkipHttpErrorCheck
+    $unknownWebGroupRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-1") -Body '{"group_id":"NON-EXISTENT-GRP"}' -SkipHttpErrorCheck
     $unknownWebGroupBody = (Get-ResponseText $unknownWebGroupRes) | ConvertFrom-Json
     if ([int]$unknownWebGroupRes.StatusCode -eq 404 -and $unknownWebGroupBody.error_code -eq "group_not_found") {
         Write-Pass "Web О1.4: Невідома навчальна група у Web-контурі відхилена з HTTP 404 Not Found (error_code=group_not_found)"
@@ -951,7 +978,7 @@ try {
     }
 
     # 10.3 Відхилення через закрите часове вікно -> 422 Unprocessable Content (О1.1 Web)
-    $windowRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-WINDOW-TEST"}' -SkipHttpErrorCheck
+    $windowRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-3") -Body '{"group_id":"DISC-WINDOW-TEST"}' -SkipHttpErrorCheck
     $windowJson = (Get-ResponseText $windowRes) | ConvertFrom-Json
     if ([int]$windowRes.StatusCode -eq 422 -and $windowJson.error_code -eq "enrollment_window_closed") {
         Write-Pass "Web О1.1: Спроба запису поза вікном (DISC-WINDOW-TEST) відхилена з HTTP 422 Unprocessable Content (error_code=enrollment_window_closed)"
@@ -960,7 +987,7 @@ try {
     }
 
     # 10.4 Відхилення через перевищення ліміту K дисциплін -> 422 Unprocessable Content (О1.1 Web)
-    $limitMaxHeaders = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-limit-max"; "Authorization" = "Bearer $Token" }
+    $limitMaxHeaders = Get-WebEnrollmentHeaders "student-limit-max"
     $limitKRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $limitMaxHeaders -Body '{"group_id":"DISC-SEC-04"}' -SkipHttpErrorCheck
     $limitKJson = (Get-ResponseText $limitKRes) | ConvertFrom-Json
     if ([int]$limitKRes.StatusCode -eq 422 -and $limitKJson.error_code -eq "discipline_limit_exceeded") {
@@ -970,7 +997,7 @@ try {
     }
 
     # 10.5 Відхилення через перевищення 30.0 ЄКТС -> 422 Unprocessable Content (О1.1, Д1.5 Web)
-    $ects20Headers = @{ "Content-Type" = "application/json"; "X-User-Id" = "student-ects-20"; "Authorization" = "Bearer $Token" }
+    $ects20Headers = Get-WebEnrollmentHeaders "student-ects-20"
     $limitEctsRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $ects20Headers -Body '{"group_id":"DISC-ECTS-10-5-G1"}' -SkipHttpErrorCheck
     $limitEctsJson = (Get-ResponseText $limitEctsRes) | ConvertFrom-Json
     if ([int]$limitEctsRes.StatusCode -eq 422 -and $limitEctsJson.error_code -eq "ects_limit_exceeded") {
@@ -980,8 +1007,8 @@ try {
     }
 
     # 10.6 Відхилення через брак місць у групі -> 409 Conflict (О1.1 Web, група DISC-ONE-SEAT)
-    $oneSeat1 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent2 -Body '{"group_id":"DISC-ONE-SEAT"}' -SkipHttpErrorCheck
-    $oneSeat2 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-ONE-SEAT"}' -SkipHttpErrorCheck
+    $oneSeat1 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-2") -Body '{"group_id":"DISC-ONE-SEAT"}' -SkipHttpErrorCheck
+    $oneSeat2 = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-3") -Body '{"group_id":"DISC-ONE-SEAT"}' -SkipHttpErrorCheck
     $oneSeat2Json = (Get-ResponseText $oneSeat2) | ConvertFrom-Json
     if ([int]$oneSeat2.StatusCode -eq 409 -and $oneSeat2Json.error_code -eq "group_full") {
         Write-Pass "Web О1.1: Спроба запису в заповнену групу DISC-ONE-SEAT відхилена з HTTP 409 Conflict (error_code=group_full)"
@@ -990,7 +1017,7 @@ try {
     }
 
     # 10.7 Успішне створення запису Web: 201 Created, Location, X-Request-ID та стан held (О1.1, О1.4 Web)
-    $postEnrollRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $postEnrollRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-1") -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
     $postEnrollJson = (Get-ResponseText $postEnrollRes) | ConvertFrom-Json
     $heldId = $postEnrollJson.id
     $locHeader = [string]($postEnrollRes.Headers["Location"] | Select-Object -First 1)
@@ -1003,7 +1030,7 @@ try {
     }
 
     # Додатковий запис для student-1 для тестування повної пагінації за next_cursor
-    $null = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent1 -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
+    $null = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-1") -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
 
     # 10.8 Помилка пошкодженого курсору -> 400 Bad Request (О1.5 Web)
     $brokenCursorRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments?after=invalid_base64_or_corrupted" -Method Get -Headers $webHeadersStudent1 -SkipHttpErrorCheck
@@ -1058,7 +1085,7 @@ try {
 
     # 10.12 Ліниве прострочення (held -> expired із автоматичним поверненням місця в групу, п. 2)
     $student3InitSeats = (Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-AI-02" -Method Get -Headers $Headers).free_seats
-    $heldToExpire = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent3 -Body '{"group_id":"DISC-AI-02"}'
+    $heldToExpire = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-3") -Body '{"group_id":"DISC-AI-02"}'
     $expId = $heldToExpire.id
     $seatsAfterHold = (Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/DISC-AI-02" -Method Get -Headers $Headers).free_seats
 
@@ -1076,7 +1103,7 @@ try {
     }
 
     # 10.13 Скасування запису та перевірка повторного скасування
-    $enrToCancelRes = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers $webHeadersStudent2 -Body '{"group_id":"DISC-WEB-01"}'
+    $enrToCancelRes = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers (Get-WebEnrollmentHeaders "student-2") -Body '{"group_id":"DISC-WEB-01"}'
     $cancelId = $enrToCancelRes.id
     $firstCancel = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$cancelId/cancel" -Method Post -Headers $webHeadersStudent2
     $secondCancel = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$cancelId/cancel" -Method Post -Headers $webHeadersStudent2

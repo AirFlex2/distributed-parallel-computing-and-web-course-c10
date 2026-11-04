@@ -73,19 +73,25 @@ public static class EnrollmentEndpoints
                 return userHeaderProblem!;
             }
 
-            string? idempotencyKey = null;
-            if (ctx.Request.Headers.TryGetValue("Idempotency-Key", out var ikHeader) && !string.IsNullOrWhiteSpace(ikHeader))
+            if (!ctx.Request.Headers.TryGetValue("Idempotency-Key", out var ikHeader) || string.IsNullOrWhiteSpace(ikHeader))
             {
-                idempotencyKey = ikHeader.ToString().Trim();
-                if (idempotencyKey.Length > 128)
-                {
-                    return ProblemDetailsMapper.CreateProblemResult(
-                        ctx, opts,
-                        StatusCodes.Status400BadRequest,
-                        "Некоректний заголовок Idempotency-Key",
-                        "Довжина ключа Idempotency-Key не може перевищувати 128 символів.",
-                        "invalid_idempotency_key");
-                }
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Відсутній або порожній заголовок Idempotency-Key",
+                    "Заголовок 'Idempotency-Key' є обов'язковим для створення запису (POST /v1/enrollments) і не може бути порожнім.",
+                    "missing_idempotency_key");
+            }
+
+            string idempotencyKey = ikHeader.ToString().Trim();
+            if (idempotencyKey.Length > 128)
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний заголовок Idempotency-Key",
+                    "Довжина ключа Idempotency-Key не може перевищувати 128 символів.",
+                    "invalid_idempotency_key");
             }
 
             var (dto, problemResult) = await HttpPayloadHelper.ReadAndValidateAsync<CreateWebEnrollmentDto>(ctx, opts);
@@ -94,7 +100,11 @@ public static class EnrollmentEndpoints
                 return problemResult;
             }
 
-            var result = await enrollmentService.CreateEnrollmentAsync(studentId, dto!, idempotencyKey, ctx.RequestAborted);
+            var result = await enrollmentService.CreateEnrollmentAsync(
+                studentId,
+                dto!,
+                idempotencyKey: idempotencyKey,
+                cancellationToken: ctx.RequestAborted);
             if (!result.IsSuccess)
             {
                 return result.ToProblemResult(ctx, opts);
