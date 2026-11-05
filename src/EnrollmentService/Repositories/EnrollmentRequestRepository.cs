@@ -351,13 +351,23 @@ public sealed class EnrollmentRequestRepository
         NpgsqlTransaction? tx = null,
         CancellationToken cancellationToken = default)
     {
-        await using var cmd = new NpgsqlCommand(@"
-            UPDATE enrollment_requests
-            SET status = @status,
-                rejection_reason = @rejectionReason,
-                assigned_group_id = @assignedGroupId,
-                finished_at = @finishedAt
-            WHERE id = @id;", conn, tx);
+        // О1.4 РПО: Якщо статус відмінний від 'done' (наприклад 'failed' або 'rejected'),
+        // забороняємо перезапис уже зафіксованого термінального стану 'done'.
+        string sql = status == "done"
+            ? @"UPDATE enrollment_requests
+                SET status = @status,
+                    rejection_reason = @rejectionReason,
+                    assigned_group_id = @assignedGroupId,
+                    finished_at = @finishedAt
+                WHERE id = @id;"
+            : @"UPDATE enrollment_requests
+                SET status = @status,
+                    rejection_reason = @rejectionReason,
+                    assigned_group_id = @assignedGroupId,
+                    finished_at = @finishedAt
+                WHERE id = @id AND status != 'done';";
+
+        await using var cmd = new NpgsqlCommand(sql, conn, tx);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("status", status);
         cmd.Parameters.Add(new NpgsqlParameter("rejectionReason", NpgsqlTypes.NpgsqlDbType.Text)

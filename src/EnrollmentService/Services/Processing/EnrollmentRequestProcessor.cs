@@ -35,7 +35,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         _connectionFactory = connectionFactory;
         _metrics = metrics;
         _options = options;
-        _enrollmentService = enrollmentService ?? new WebEnrollmentService(groupRepo, enrollmentRepo, connectionFactory, options);
+        _enrollmentService = enrollmentService ?? new WebEnrollmentService(groupRepo, enrollmentRepo, decanateRepo, connectionFactory, options);
     }
 
     private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
@@ -140,23 +140,30 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
         string finalStatus = "failed";
         string? rejectionReason = null;
+        bool committed = false;
 
         try
         {
             bool isUnsafe = _options.AllowTestOverrides && _options.UnsafeMode;
             // Єдиний конвеєр обробки для SAFE та UNSAFE режимів (О1.4 РПО):
             // Єдина відмінність між ними — наявність транзакційного блокування FOR UPDATE у SAFE.
-            (finalStatus, rejectionReason) = await ProcessEnrollmentCoreAsync(item, isUnsafe, cancellationToken);
+            (finalStatus, rejectionReason, committed) = await ProcessEnrollmentCoreAsync(item, isUnsafe, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            finalStatus = "failed";
-            rejectionReason = "Обробку перервано через зупинку процесу (SIGTERM/Cancellation).";
+            if (!committed)
+            {
+                finalStatus = "failed";
+                rejectionReason = "Обробку перервано через зупинку процесу (SIGTERM/Cancellation).";
+            }
         }
         catch (Exception ex)
         {
-            finalStatus = "failed";
-            rejectionReason = $"Системна помилка під час обробки: {ex.Message}";
+            if (!committed)
+            {
+                finalStatus = "failed";
+                rejectionReason = $"Системна помилка під час обробки: {ex.Message}";
+            }
             StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_processing_exception", new Dictionary<string, object?>
             {
                 ["worker_id"] = workerId,
@@ -169,9 +176,10 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         {
             var finishedAtUtc = _metrics.MarkProcessingFinished(item);
 
-            // Якщо це не done (наприклад, rejected або failed), записуємо фінальний статус у БД
+            // Якщо це не done або транзакція не була зафіксована (наприклад, rejected або failed до коміту),
+            // записуємо фінальний статус у БД.
             // (Для статусу 'done' у SAFE та UNSAFE режимах він вже зафіксований атомарно всередині tx)
-            if (finalStatus != "done")
+            if (!committed && finalStatus != "done")
             {
                 bool updated = false;
                 for (int attempt = 1; attempt <= 3 && !updated; attempt++)
@@ -228,7 +236,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         });
     }
 
-    private async Task<(string Status, string? Reason)> ProcessEnrollmentCoreAsync(
+    private async Task<(string Status, string? Reason, bool Committed)> ProcessEnrollmentCoreAsync(
         QueuedRequestItem item,
         bool isUnsafe,
         CancellationToken cancellationToken)
@@ -245,6 +253,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+        bool committed = false;
 
         try
         {
@@ -257,7 +266,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             if (student == null)
             {
                 await tx.RollbackAsync(cancellationToken);
-                return ("rejected", $"Студента '{item.StudentId}' не знайдено в базі даних.");
+                return ("rejected", $"Студента '{item.StudentId}' не знайдено в базі даних.", false);
             }
 
             // 2. discipline_group FOR UPDATE (у SAFE режимі) або звичайний SELECT (в UNSAFE)
@@ -271,7 +280,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             if (!groupWithDisc.HasValue)
             {
                 await tx.RollbackAsync(cancellationToken);
-                return ("failed", $"Навчальну групу '{item.GroupId}' не знайдено.");
+                return ("failed", $"Навчальну групу '{item.GroupId}' не знайдено.", false);
             }
 
             var group = groupWithDisc.Value.Group;
@@ -280,7 +289,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             if (!group.DpcSandboxEnabled && !targetEnrollmentId.HasValue)
             {
                 await tx.RollbackAsync(cancellationToken);
-                return ("rejected", $"Група '{item.GroupId}' не призначена для автономної обробки РПО (dpc_sandbox_enabled = false).");
+                return ("rejected", $"Група '{item.GroupId}' не призначена для автономної обробки РПО (dpc_sandbox_enabled = false).", false);
             }
 
             // У режимі UNSAFE спільний наскрізний сценарій Web + DPC суворо заборонено,
@@ -288,7 +297,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             if (isUnsafe && targetEnrollmentId.HasValue)
             {
                 await tx.RollbackAsync(cancellationToken);
-                return ("rejected", "Спільний наскрізний сценарій Web + DPC підтримується виключно в безпечному режимі SAFE (атомарна транзакція з блокуванням FOR UPDATE).");
+                return ("rejected", "Спільний наскрізний сценарій Web + DPC підтримується виключно в безпечному режимі SAFE (атомарна транзакція з блокуванням FOR UPDATE).", false);
             }
 
             string disciplineId = group.DisciplineId;
@@ -311,13 +320,14 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     tx,
                     cancellationToken);
                 await tx.CommitAsync(cancellationToken);
+                committed = true;
 
                 if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                 {
                     await TestHookAfterCommitAsync(item);
                 }
 
-                return ("done", null);
+                return ("done", null, true);
             }
 
             if (!isUnsafe)
@@ -335,59 +345,76 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     if (!heldEnrollment.HasValue)
                     {
                         await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Пов'язаний Web-запис '{targetEnrollmentId.Value}' не знайдено або було видалено з бази даних.");
+                        return ("rejected", $"Пов'язаний Web-запис '{targetEnrollmentId.Value}' не знайдено або було видалено з бази даних.", false);
                     }
 
                     // 2. Перевіряємо відповідність студента
                     if (!string.Equals(heldEnrollment.Value.StudentId, item.StudentId, StringComparison.Ordinal))
                     {
                         await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' належить іншому студенту ('{heldEnrollment.Value.StudentId}', очікувався '{item.StudentId}').");
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' належить іншому студенту ('{heldEnrollment.Value.StudentId}', очікувався '{item.StudentId}').", false);
                     }
 
                     // 3. Перевіряємо відповідність групи
                     if (!string.Equals(heldEnrollment.Value.GroupId, item.GroupId, StringComparison.Ordinal))
                     {
                         await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' відноситься до групи '{heldEnrollment.Value.GroupId}', а не '{item.GroupId}'.");
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' відноситься до групи '{heldEnrollment.Value.GroupId}', а не '{item.GroupId}'.", false);
                     }
 
                     // 4. Перевіряємо статус (має бути 'held')
                     if (!string.Equals(heldEnrollment.Value.Status, "held", StringComparison.Ordinal))
                     {
                         await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' перебуває у неприпустимому для підтвердження стані '{heldEnrollment.Value.Status}'.");
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' перебуває у неприпустимому для підтвердження стані '{heldEnrollment.Value.Status}'.", false);
                     }
 
                     // 5. Перевіряємо строк дії резервування (held)
                     if (heldEnrollment.Value.ExpiresAt <= DateTimeOffset.UtcNow)
                     {
                         await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Термін дії резервування Web-запису '{targetEnrollmentId.Value}' сплив.");
+                        return ("rejected", $"Термін дії резервування Web-запису '{targetEnrollmentId.Value}' сплив.", false);
                     }
 
                     // 6. Перевіряємо чи група не закрита деканатом
                     if (group.Closed)
                     {
                         await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).");
+                        return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).", false);
                     }
 
                     var finishedAtUtcJoint = _metrics.MarkProcessingFinished(item);
 
-                    // РПО атомарно фіксує результат обробки у власних таблицях (відомість decanate_roster та стан заявки)
-                    await _decanateRepo.InsertRosterEntryAsync(
-                        item.Id,
-                        item.StudentId,
-                        item.GroupId,
-                        disciplineId,
-                        disciplineEcts,
-                        targetEnrollmentId.Value,
-                        "joint_web_enrollment",
-                        finishedAtUtcJoint,
-                        conn,
-                        tx,
-                        cancellationToken);
+                    try
+                    {
+                        // РПО вносить запис до відомості decanate_roster у спільній транзакції
+                        await _decanateRepo.InsertRosterEntryAsync(
+                            item.Id,
+                            item.StudentId,
+                            item.GroupId,
+                            disciplineId,
+                            disciplineEcts,
+                            targetEnrollmentId.Value,
+                            "joint_web_enrollment",
+                            finishedAtUtcJoint,
+                            conn,
+                            tx,
+                            cancellationToken);
+                    }
+                    catch (DecanateConflictException ex)
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", ex.Message, false);
+                    }
+
+                    // Web підтверджує Web-запис (held -> confirmed) в єдиній спільній транзакції
+                    bool confirmed = await _enrollmentService.ConfirmEnrollmentFromRosterAsync(
+                        targetEnrollmentId.Value, item.Id, conn, tx, cancellationToken);
+                    if (!confirmed)
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' не вдалося підтвердити у спільній транзакції.", false);
+                    }
 
                     await _requestRepo.UpdateStatusAsync(
                         item.Id,
@@ -400,17 +427,14 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                         cancellationToken);
 
                     await tx.CommitAsync(cancellationToken);
-
-                    // Web самостійно переводить Web-запис у confirmed на основі зафіксованого результату РПО
-                    await _enrollmentService.ConfirmEnrollmentFromRosterAsync(
-                        targetEnrollmentId.Value, item.Id, cancellationToken);
+                    committed = true;
 
                     if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                     {
                         await TestHookAfterCommitAsync(item);
                     }
 
-                    return ("done", null);
+                    return ("done", null, true);
                 }
 
                 // 4. Перевірка наявності активного запису на дисципліну в обох таблицях для автономного прийому (єдине предметне правило §1.10)
@@ -426,7 +450,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 if (!policyResult.Allowed)
                 {
                     await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", policyResult.RejectionReason);
+                    return ("rejected", policyResult.RejectionReason, false);
                 }
 
                 // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
@@ -436,7 +460,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 if (!decremented)
                 {
                     await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"У навчальній групі '{item.GroupId}' немає вільних місць (декремент available повернув false).");
+                    return ("rejected", $"У навчальній групі '{item.GroupId}' немає вільних місць (декремент available повернув false).", false);
                 }
 
                 // Оновлення кількості та кредитів студента
@@ -446,19 +470,27 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 // гарантовано зафіксував delivery_wait_ms на найпершому отриманні фінального результату
                 var finishedAtUtc = _metrics.MarkProcessingFinished(item);
 
-                // Запис до відомості деканату
-                await _decanateRepo.InsertRosterEntryAsync(
-                    item.Id,
-                    item.StudentId,
-                    item.GroupId,
-                    disciplineId,
-                    disciplineEcts,
-                    null,
-                    "primary_roster",
-                    finishedAtUtc,
-                    conn,
-                    tx,
-                    cancellationToken);
+                try
+                {
+                    // Запис до відомості деканату
+                    await _decanateRepo.InsertRosterEntryAsync(
+                        item.Id,
+                        item.StudentId,
+                        item.GroupId,
+                        disciplineId,
+                        disciplineEcts,
+                        null,
+                        "primary_roster",
+                        finishedAtUtc,
+                        conn,
+                        tx,
+                        cancellationToken);
+                }
+                catch (DecanateConflictException ex)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ("rejected", ex.Message, false);
+                }
 
                 // Запис кінцевого стану 'done' у тій самій транзакції, що і предметний ефект
                 await _requestRepo.UpdateStatusAsync(
@@ -472,13 +504,14 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     cancellationToken);
 
                 await tx.CommitAsync(cancellationToken);
+                committed = true;
 
                 if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                 {
                     await TestHookAfterCommitAsync(item);
                 }
 
-                return ("done", null);
+                return ("done", null, true);
             }
             else
             {
@@ -495,7 +528,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 if (!policyResult.Allowed)
                 {
                     await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", policyResult.RejectionReason);
+                    return ("rejected", policyResult.RejectionReason, false);
                 }
 
                 // Прочитали available, потім записали available - 1 без умови WHERE available > 0 (Lost Update).
@@ -505,18 +538,26 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
 
                 var finishedAtUtc = _metrics.MarkProcessingFinished(item);
-                await _decanateRepo.InsertRosterEntryAsync(
-                    item.Id,
-                    item.StudentId,
-                    item.GroupId,
-                    disciplineId,
-                    disciplineEcts,
-                    null,
-                    "unsafe_overcommit",
-                    finishedAtUtc,
-                    conn,
-                    tx,
-                    cancellationToken);
+                try
+                {
+                    await _decanateRepo.InsertRosterEntryAsync(
+                        item.Id,
+                        item.StudentId,
+                        item.GroupId,
+                        disciplineId,
+                        disciplineEcts,
+                        null,
+                        "unsafe_overcommit",
+                        finishedAtUtc,
+                        conn,
+                        tx,
+                        cancellationToken);
+                }
+                catch (DecanateConflictException ex)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ("rejected", ex.Message, false);
+                }
 
                 await _requestRepo.UpdateStatusAsync(
                     item.Id,
@@ -529,25 +570,29 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     cancellationToken);
 
                 await tx.CommitAsync(cancellationToken);
+                committed = true;
 
                 if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                 {
                     await TestHookAfterCommitAsync(item);
                 }
 
-                return ("done", null);
+                return ("done", null, true);
             }
         }
         catch
         {
-            _metrics.ResetProcessingFinished(item);
-            try
+            if (!committed)
             {
-                await tx.RollbackAsync(cancellationToken);
-            }
-            catch
-            {
-                // Транзакція могла вже бути зафіксована до виникнення помилки
+                _metrics.ResetProcessingFinished(item);
+                try
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                }
+                catch
+                {
+                    // Транзакція могла вже бути зафіксована до виникнення помилки
+                }
             }
             throw;
         }

@@ -616,15 +616,14 @@ paths:
     get:
       operationId: listPrecreatedStudents
       tags: [Web]
-      summary: Список студентів у БД із захистом персональних даних (Web О1.4, О3.2, GDPR)
+      summary: Список студентів у БД із захистом персональних даних (Web О1.4, О3.2)
       description: |
         Повертає перелік студентів із дотриманням рольового доступу (RBAC):
         - Персонал (із заголовком Authorization: Bearer <token>) має право переглядати повний список студентів або фільтрувати за ?student_id=...;
-        - Студент (із заголовком X-User-Id) має доступ виключно до власного профілю (спроба отримати чужі дані через ?student_id=... повертає 403 Forbidden);
-        - Неавтентифіковані запити відхиляються зі статусом 401 Unauthorized.
+        - Студент (із заголовком X-User-Id — навчальна емуляція контексту користувача для ЛР1 до впровадження JWT у ЛР3) має доступ виключно до власного профілю (спроба отримати чужі дані через ?student_id=... повертає 403 Forbidden);
+        - Неавтентифіковані запити (без валідного токена або заголовка) відхиляються зі статусом 401 Unauthorized.
       security:
         - bearerAuth: []
-        - {}
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/XUserIdOptionalHeader"
@@ -671,11 +670,11 @@ paths:
       summary: Отримання профілю конкретного студента (Web О3.2)
       description: |
         Повертає профіль студента за його ідентифікатором:
-        - Персонал може отримати профіль будь-якого студента;
-        - Студент може отримати виключно власний профіль (спроба запитати чуже ID повертає 403 Forbidden).
+        - Персонал (із Bearer токеном) може отримати профіль будь-якого студента;
+        - Студент (із X-User-Id) може отримати виключно власний профіль (спроба запитати чуже ID повертає 403 Forbidden);
+        - Неавтентифіковані запити відхиляються зі статусом 401 Unauthorized.
       security:
         - bearerAuth: []
-        - {}
       parameters:
         - name: id
           in: path
@@ -1180,6 +1179,79 @@ paths:
                     detail: "Час утримання місця (held) завершився, запис перейшов у стан 'expired' і не підлягає скасуванню."
                     instance: "/v1/enrollments/8f14e45f-ceea-467a-9a38-1b241d45b001/cancel"
                     error_code: "enrollment_expired"
+
+  /v1/enrollments/{id}/registrations:
+    post:
+      operationId: registerEnrollmentToDecanate
+      tags: [Web, DPC]
+      summary: Асинхронна реєстрація попереднього запису у відомості деканату через чергу РПО (Web C10, стор. 37)
+      description: |
+        Приймає заявку на реєстрацію попереднього запису (held) у відомість деканату, ставить її в обмежену чергу РПО
+        і повертає 202 Accepted із заголовком Location на стан заявки в черзі РПО.
+      x-course: registrations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Рядковий UUID Web-запису студента
+          schema:
+            type: string
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdRequiredHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Необов'язковий ключ ідемпотентності
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Заявку прийнято в чергу на обробку
+          headers:
+            Location:
+              description: URL для опитування стану обробки заявки
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DpcEnrollmentAcceptedResponse"
+        "400":
+          description: Некоректний ідентифікатор запису або відсутній X-User-Id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Запис не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "409":
+          description: Запис не перебуває у стані held або вже зареєстрований
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          description: Черга запитів переповнена (Backpressure)
+          headers:
+            Retry-After:
+              description: Час очікування перед повтором запиту (секунди)
+              schema:
+                type: integer
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: Сервіс завершує роботу (SIGTERM)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
 
   /v1/groups/{id}/close:
     post:

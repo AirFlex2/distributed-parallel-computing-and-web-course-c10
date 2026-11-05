@@ -1,5 +1,8 @@
+using System.Diagnostics;
 using System.Globalization;
 using EnrollmentService.Http;
+using EnrollmentService.Metrics;
+using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
 using EnrollmentService.Services;
 using Microsoft.AspNetCore.Routing;
@@ -10,7 +13,9 @@ public static class EnrollmentEndpoints
 {
     public static IEndpointRouteBuilder MapEnrollmentEndpoints(this IEndpointRouteBuilder app)
     {
-        // Довідковий маршрут: список студентів у БД із захистом персональних даних (GDPR / Web О1.4, О3.2)
+        // Довідковий маршрут: список студентів у БД із захистом персональних даних (Web О1.4, О3.2)
+        // Примітка: заголовок X-User-Id є навчальною симуляцією контексту користувача для ЛР1 (до впровадження JWT у ЛР3);
+        // повноцінна автентифікація та авторизація персоналу реалізована через заголовок Authorization: Bearer <token>.
         // 401 Unauthorized — якщо немає Bearer токена або X-User-Id
         // 403 Forbidden — якщо студент із X-User-Id намагається переглянути чужі дані через ?student_id=...
         // 200 OK — персонал бачить усіх або фільтрованого студента; студент бачить виключно власний профіль
@@ -357,6 +362,152 @@ public static class EnrollmentEndpoints
             }
 
             return Results.Ok(result.Value);
+        });
+
+        // Асинхронна реєстрація у відомості деканату через чергу РПО (Web С10, стор. 37: POST /v1/enrollments/{id}/registrations -> 202 Accepted)
+        app.MapPost("/v1/enrollments/{id}/registrations", async (
+            string id,
+            HttpContext ctx,
+            IBoundedRequestQueue queue,
+            EnrollmentWorkerPool workerPool,
+            MetricsCollector metrics,
+            EnrollmentRequestRepository requestRepo,
+            EnrollmentRepository enrollmentRepo,
+            IDbConnectionFactory connectionFactory,
+            ServiceOptions opts) =>
+        {
+            if (workerPool.IsShuttingDown)
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status503ServiceUnavailable,
+                    "Сервіс завершує роботу",
+                    "Отримано сигнал SIGTERM (Д1.4). Нові запити не приймаються.",
+                    "service_shutting_down");
+            }
+
+            if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string callerStudentId, out var userHeaderProblem))
+            {
+                return userHeaderProblem!;
+            }
+
+            if (!Guid.TryParse(id, out var enrollmentGuid))
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний ідентифікатор запису",
+                    "Параметр id має бути валідним UUID.",
+                    "invalid_enrollment_id");
+            }
+
+            var enrollment = await enrollmentRepo.GetEnrollmentByIdAsync(enrollmentGuid, callerStudentId, ctx.RequestAborted);
+            if (enrollment == null)
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status404NotFound,
+                    "Запис не знайдено",
+                    $"Запис із номером '{enrollmentGuid}' для студента '{callerStudentId}' не існує.",
+                    "enrollment_not_found");
+            }
+
+            if (enrollment.Status != "held")
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status409Conflict,
+                    "Запис не перебуває у стані held",
+                    $"Неможливо зареєструвати у відомості запис зі статусом '{enrollment.Status}'. Очікується 'held'.",
+                    "enrollment_not_held");
+            }
+
+            if (!queue.TryReserveSlot())
+            {
+                metrics.RecordRejected429();
+                ctx.Response.Headers["Retry-After"] = "1";
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status429TooManyRequests,
+                    "Черга запитів переповнена (Backpressure)",
+                    $"Перевищено місткість обмеженої черги QUEUE_CAPACITY ({opts.QueueCapacity}). Спробуйте повторити запит через 1 секунду.",
+                    "queue_overflow");
+            }
+
+            bool slotConsumedByQueue = false;
+            var requestId = Guid.NewGuid();
+            string? idempotencyKey = ctx.Request.Headers["Idempotency-Key"].FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                idempotencyKey = requestId.ToString("D");
+            }
+
+            var item = new QueuedRequestItem
+            {
+                Id = requestId,
+                StudentId = callerStudentId,
+                GroupId = enrollment.GroupId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                IdempotencyKey = idempotencyKey,
+                RequestPayloadHash = $"{callerStudentId}:{enrollment.GroupId}",
+                EnrollmentId = enrollmentGuid,
+                RequestedEnrollmentId = enrollmentGuid,
+                EnqueueTimestamp = Stopwatch.GetTimestamp()
+            };
+
+            try
+            {
+                await using (var conn = await connectionFactory.OpenConnectionAsync(ctx.RequestAborted))
+                {
+                    bool inserted = await requestRepo.TryInsertQueuedRequestAsync(item, conn, ctx.RequestAborted);
+                    if (!inserted)
+                    {
+                        return ProblemDetailsMapper.CreateProblemResult(
+                            ctx, opts,
+                            StatusCodes.Status409Conflict,
+                            "Конфлікт реєстрації",
+                            "Заявку на реєстрацію вже було надіслано раніше.",
+                            "registration_conflict");
+                    }
+                }
+
+                workerPool.TrackEnqueued(item.Id);
+                bool enqueued = metrics.TryEnqueueReservedAndRecordAccepted(queue, item);
+                if (!enqueued)
+                {
+                    workerPool.UntrackEnqueued(item.Id);
+                    await using (var conn = await connectionFactory.OpenConnectionAsync(CancellationToken.None))
+                    {
+                        await requestRepo.DeleteRequestAsync(item.Id, conn, CancellationToken.None);
+                    }
+                    metrics.RecordRejected429();
+                    ctx.Response.Headers["Retry-After"] = "1";
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        ctx, opts,
+                        StatusCodes.Status429TooManyRequests,
+                        "Черга запитів переповнена",
+                        "Не вдалося розмістити заявку в черзі.",
+                        "queue_overflow");
+                }
+
+                slotConsumedByQueue = true;
+
+                string locUrl = $"/v1/enrollment-requests/{requestId}";
+                ctx.Response.Headers.Location = locUrl;
+                return Results.Accepted(locUrl, new EnrollmentAcceptedResponseDto(
+                    requestId,
+                    callerStudentId,
+                    enrollment.GroupId,
+                    "queued",
+                    item.CreatedAtUtc));
+            }
+            finally
+            {
+                if (!slotConsumedByQueue)
+                {
+                    queue.ReleaseSlot();
+                }
+            }
         });
 
         return app;

@@ -2,6 +2,17 @@ using Npgsql;
 
 namespace EnrollmentService.Repositories;
 
+public sealed class DecanateConflictException : Exception
+{
+    public string ConflictType { get; }
+
+    public DecanateConflictException(string conflictType, string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+        ConflictType = conflictType;
+    }
+}
+
 public sealed class DecanateRepository
 {
     private readonly IDbConnectionFactory _connectionFactory;
@@ -38,26 +49,49 @@ public sealed class DecanateRepository
         NpgsqlTransaction? tx = null,
         CancellationToken cancellationToken = default)
     {
-        await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO decanate_roster (
-                request_id, student_id, group_id, discipline_id, ects, enrollment_id, assignment_type, created_at
-            ) VALUES (
-                @requestId, @studentId, @groupId, @disciplineId, @ects, @enrollmentId, @assignmentType, @createdAt
-            )
-            ON CONFLICT (request_id) DO NOTHING;", conn, tx);
-        cmd.Parameters.AddWithValue("requestId", requestId);
-        cmd.Parameters.AddWithValue("studentId", studentId);
-        cmd.Parameters.AddWithValue("groupId", groupId);
-        cmd.Parameters.AddWithValue("disciplineId", disciplineId);
-        cmd.Parameters.AddWithValue("ects", ects);
-        cmd.Parameters.Add(new NpgsqlParameter("enrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
+        try
         {
-            Value = (object?)enrollmentId ?? DBNull.Value
-        });
-        cmd.Parameters.AddWithValue("assignmentType", assignmentType);
-        cmd.Parameters.AddWithValue("createdAt", createdAt);
+            await using var cmd = new NpgsqlCommand(@"
+                INSERT INTO decanate_roster (
+                    request_id, student_id, group_id, discipline_id, ects, enrollment_id, assignment_type, created_at
+                ) VALUES (
+                    @requestId, @studentId, @groupId, @disciplineId, @ects, @enrollmentId, @assignmentType, @createdAt
+                )
+                ON CONFLICT (request_id) DO NOTHING;", conn, tx);
+            cmd.Parameters.AddWithValue("requestId", requestId);
+            cmd.Parameters.AddWithValue("studentId", studentId);
+            cmd.Parameters.AddWithValue("groupId", groupId);
+            cmd.Parameters.AddWithValue("disciplineId", disciplineId);
+            cmd.Parameters.AddWithValue("ects", ects);
+            cmd.Parameters.Add(new NpgsqlParameter("enrollmentId", NpgsqlTypes.NpgsqlDbType.Uuid)
+            {
+                Value = (object?)enrollmentId ?? DBNull.Value
+            });
+            cmd.Parameters.AddWithValue("assignmentType", assignmentType);
+            cmd.Parameters.AddWithValue("createdAt", createdAt);
 
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505" || ex.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            if (string.Equals(ex.ConstraintName, "uq_decanate_roster_student_discipline", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new DecanateConflictException(
+                    "duplicate_discipline",
+                    $"Студент '{studentId}' вже внесений до відомості деканату з дисципліни '{disciplineId}' (§1.10 РПО / C10).",
+                    ex);
+            }
+
+            if (string.Equals(ex.ConstraintName, "uq_decanate_roster_enrollment_id", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new DecanateConflictException(
+                    "duplicate_enrollment",
+                    $"Web-запис '{enrollmentId}' вже зареєстровано у відомості деканату (О1.4 РПО / C10).",
+                    ex);
+            }
+
+            throw;
+        }
     }
 
     public async Task<IReadOnlyList<DecanateRosterEntryDto>> GetRosterEntriesAsync(
