@@ -74,6 +74,11 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     /// </summary>
     public Func<QueuedRequestItem, Task>? TestHookAfterCommitAsync { get; set; }
 
+    /// <summary>
+    /// Глобальна тестова точка перехоплення перед початком обробки заявки воркером (для детермінованого тестування черги та ідемпотентності).
+    /// </summary>
+    public Func<QueuedRequestItem, Task>? TestPreProcessingHookAsync { get; set; }
+
     public async Task ProcessItemAsync(
         int workerId,
         QueuedRequestItem item,
@@ -95,6 +100,27 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             catch (Exception ex)
             {
                 StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_scoped_hook_failed", new Dictionary<string, object?>
+                {
+                    ["worker_id"] = workerId,
+                    ["request_id"] = item.Id,
+                    ["error"] = ex.Message
+                });
+            }
+        }
+
+        if (_options.AllowTestOverrides && TestPreProcessingHookAsync != null)
+        {
+            try
+            {
+                await TestPreProcessingHookAsync(item);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_preprocessing_hook_failed", new Dictionary<string, object?>
                 {
                     ["worker_id"] = workerId,
                     ["request_id"] = item.Id,

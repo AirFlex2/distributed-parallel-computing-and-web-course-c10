@@ -3296,6 +3296,18 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
 
+        var processor = _factory.Services.GetRequiredService<EnrollmentRequestProcessor>();
+        var requestRepo = _factory.Services.GetRequiredService<EnrollmentRequestRepository>();
+        var pauseTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        processor.TestPreProcessingHookAsync = async item =>
+        {
+            if (item.StudentId == studentId)
+            {
+                await pauseTcs.Task;
+            }
+        };
+
         try
         {
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
@@ -3321,7 +3333,12 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Guid reqId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
             string loc1 = resp1.Headers.Location?.ToString() ?? "";
 
-            // Повторний виклик з тим самим Idempotency-Key
+            // Гарантуємо, що воркер ще не встиг завершити обробку заявки:
+            var reqRecord = await requestRepo.GetStatusByIdAsync(reqId1);
+            Assert.NotNull(reqRecord);
+            Assert.NotEqual("done", reqRecord.Status);
+
+            // Повторний виклик з тим самим Idempotency-Key ДО завершення обробки
             using var req2 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
             req2.Headers.Add("Idempotency-Key", ik);
             var resp2 = await client.SendAsync(req2);
@@ -3336,6 +3353,8 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         }
         finally
         {
+            pauseTcs.TrySetResult(true);
+            processor.TestPreProcessingHookAsync = null;
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
         }
     }
@@ -3534,6 +3553,58 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
             Assert.Equal(reqIdA, reqIdB);
             Assert.Equal(responses[0].Headers.Location, responses[1].Headers.Location);
+
+            // Очікуємо завершення обробки воркером РПО
+            var dpcClient = _factory.CreateClient();
+            dpcClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            bool isDone = false;
+            for (int i = 0; i < 40 && !isDone; i++)
+            {
+                await Task.Delay(100);
+                var getResp = await dpcClient.GetAsync($"/v1/enrollment-requests/{reqIdA}");
+                if (getResp.StatusCode == HttpStatusCode.OK)
+                {
+                    var getJson = await getResp.Content.ReadAsStringAsync();
+                    using var getDoc = JsonDocument.Parse(getJson);
+                    if (getDoc.RootElement.GetProperty("status").GetString() == "done")
+                    {
+                        isDone = true;
+                    }
+                }
+            }
+            Assert.True(isDone, "Конкурентна заявка мала успішно перейти у статус done");
+
+            // Перевіряємо, що в БД створено РІВНО ОДНУ заявку з цим Idempotency-Key
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdReqCount = new NpgsqlCommand("SELECT COUNT(*) FROM enrollment_requests WHERE idempotency_key = @ik;", conn);
+                cmdReqCount.Parameters.AddWithValue("ik", ik);
+                long reqCount = (long)(await cmdReqCount.ExecuteScalarAsync())!;
+                Assert.Equal(1L, reqCount);
+
+                // Перевіряємо, що у decanate_roster створено РІВНО ОДИН запис для цього Web-запису
+                await using var cmdRosterCount = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE enrollment_id = @eid;", conn);
+                cmdRosterCount.Parameters.AddWithValue("eid", enrollmentId);
+                long rosterCount = (long)(await cmdRosterCount.ExecuteScalarAsync())!;
+                Assert.Equal(1L, rosterCount);
+
+                // Перевіряємо, що Web-запис підтверджено (confirmed) і його версія збільшилась рівно 1 раз (1 -> 2)
+                await using var cmdEnr = new NpgsqlCommand("SELECT status, version FROM enrollment WHERE id = @eid;", conn);
+                cmdEnr.Parameters.AddWithValue("eid", enrollmentId);
+                await using var readerEnr = await cmdEnr.ExecuteReaderAsync();
+                Assert.True(await readerEnr.ReadAsync());
+                Assert.Equal("confirmed", readerEnr.GetString(0));
+                Assert.Equal(2, readerEnr.GetInt32(1));
+                await readerEnr.CloseAsync();
+
+                // Перевіряємо, що предметний ефект списання місця в групі виконано РІВНО один раз:
+                // seats = 5, початковий available = 5, після створення запису held стало 4, при внесенні в roster повторного списання немає (залишається 4)
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @gid;", conn);
+                cmdGrp.Parameters.AddWithValue("gid", groupId);
+                int available = (int)(await cmdGrp.ExecuteScalarAsync())!;
+                Assert.Equal(4, available);
+            }
         }
         finally
         {
@@ -3603,6 +3674,21 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         var decanateRepo = _factory.Services.GetRequiredService<DecanateRepository>();
         var metrics = _factory.Services.GetRequiredService<MetricsCollector>();
         var options = _factory.Services.GetRequiredService<ServiceOptions>();
+        var testOptions = new ServiceOptions
+        {
+            InstanceId = options.InstanceId,
+            DbConnectionString = options.DbConnectionString,
+            ApiAuthToken = options.ApiAuthToken,
+            QueueCapacity = options.QueueCapacity,
+            Workers = options.Workers,
+            UnsafeMode = options.UnsafeMode,
+            ExecutionModel = options.ExecutionModel,
+            QueueEngine = options.QueueEngine,
+            SlowCallMinMs = options.SlowCallMinMs,
+            SlowCallMaxMs = options.SlowCallMaxMs,
+            AllowTestOverrides = true,
+            EnableWorkers = options.EnableWorkers
+        };
 
         var processor = new EnrollmentRequestProcessor(
             requestRepo,
@@ -3611,13 +3697,18 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             decanateRepo,
             connFactory,
             metrics,
-            options);
+            testOptions);
 
+        bool hookCalled = false;
         // Налаштовуємо тестовий hook, що викидає виключення після фіксації транзакції
         processor.TestHookAfterCommitAsync = item =>
         {
+            hookCalled = true;
             throw new InvalidOperationException("Simulated exception after transaction COMMIT");
         };
+
+        long initialDone = metrics.TotalDone;
+        long initialFailed = metrics.TotalFailed;
 
         try
         {
@@ -3641,10 +3732,14 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
             var dummyQueue = new MonitorRequestQueue(100);
             dummyQueue.TryReserveSlot();
-            dummyQueue.TryEnqueue(item);
+            bool enqueued = metrics.TryEnqueueReservedAndRecordAccepted(dummyQueue, item);
+            Assert.True(enqueued);
 
             // Виконуємо обробку воркером
             await processor.ProcessItemAsync(1, item, false, dummyQueue, CancellationToken.None);
+
+            // Перевіряємо, що hook дійсно був викликаний і викинув виключення
+            Assert.True(hookCalled, "TestHookAfterCommitAsync мав бути обов'язково викликаний після COMMIT");
 
             // Перевіряємо статус у базі даних: повинен залишатися 'done', а не 'failed'!
             var statusDto = await requestRepo.GetStatusByIdAsync(reqId);
@@ -3652,6 +3747,13 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Assert.Equal("done", statusDto.Status);
             Assert.Null(statusDto.RejectionReason);
             Assert.True(statusDto.RecordedInRoster);
+
+            // Перевіряємо метрики: лічильник успішних зафіксованих операцій збільшено, помилок немає
+            Assert.Equal(initialDone + 1, metrics.TotalDone);
+            Assert.Equal(initialFailed, metrics.TotalFailed);
+            var (_, procWait, _) = metrics.GetItemTimings(reqId);
+            Assert.NotNull(procWait);
+            Assert.True(procWait >= 0, "Час обробки має бути зафіксований у метриках");
         }
         finally
         {
@@ -3751,7 +3853,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             bool foreignOnConfirmed = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, foreignReqId);
             Assert.False(foreignOnConfirmed, "Чужий requestId навіть для confirmed запису повинен повертати false");
 
-            // Перевірка 6: Невалідний стан (expired або cancelled) -> повертає FALSE
+            // Перевірка 6: Невалідний стан cancelled -> повертає FALSE
             await using (var conn = await connFactory.OpenConnectionAsync())
             {
                 await using var cmd = new NpgsqlCommand("UPDATE enrollment SET status = 'cancelled' WHERE id = @eid;", conn);
@@ -3761,6 +3863,28 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
             bool cancelledResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
             Assert.False(cancelledResult, "Скасований запис (cancelled) повинен відхилятися з false");
+
+            // Перевірка 7: Невалідний стан expired -> повертає FALSE
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("UPDATE enrollment SET status = 'expired' WHERE id = @eid;", conn);
+                cmd.Parameters.AddWithValue("eid", enrollmentId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            bool expiredResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
+            Assert.False(expiredResult, "Прострочений запис (expired) повинен відхилятися з false");
+
+            // Перевірка 8: Запис held, але час резерву сплив (expires_at <= now) -> повертає FALSE
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("UPDATE enrollment SET status = 'held', created_at = NOW() - INTERVAL '20 minutes', expires_at = NOW() - INTERVAL '5 minutes' WHERE id = @eid;", conn);
+                cmd.Parameters.AddWithValue("eid", enrollmentId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            bool timedOutHeldResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
+            Assert.False(timedOutHeldResult, "Запис held із минулим expires_at повинен відхилятися з false");
         }
         finally
         {
