@@ -57,6 +57,8 @@ public sealed class EnrollmentWorkerPool : IHostedService
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        _lifetime.ApplicationStopping.Register(() => InitiateShutdown());
+
         if (!_options.EnableWorkers)
         {
             StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_pool_disabled", new Dictionary<string, object?>
@@ -110,7 +112,6 @@ public sealed class EnrollmentWorkerPool : IHostedService
             }
         }
 
-        _lifetime.ApplicationStopping.Register(() => InitiateShutdown());
         _periodicSamplerTask = Task.Run(() => RunIndependentQueueSamplerAsync(_samplerCts.Token));
         StartWorkers();
         _replenishmentTask = Task.Run(() => RunQueueReplenishmentLoopAsync(_workerEpochCts.Token));
@@ -119,7 +120,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
     // Послідовна дозавантаження заявок зі статусом queued із PostgreSQL у вільні слоти черги
     public async Task<int> ReplenishQueueFromDatabaseAsync(CancellationToken cancellationToken = default)
     {
-        if (_isShuttingDown || _requestRepo == null) return 0;
+        if (!_options.EnableWorkers || _isShuttingDown || _requestRepo == null) return 0;
 
         int enqueuedCount = 0;
         while (!_isShuttingDown && !cancellationToken.IsCancellationRequested)
@@ -284,6 +285,25 @@ public sealed class EnrollmentWorkerPool : IHostedService
 
         _isShuttingDown = true;
 
+        if (!_options.EnableWorkers)
+        {
+            StructuredJsonLogger.LogEvent(_options.InstanceId, "sigterm_received", new Dictionary<string, object?>
+            {
+                ["queue_length"] = _queue.Count,
+                ["in_processing"] = _metrics.InProcessingCount,
+                ["enable_workers"] = false,
+                ["detail"] = "Отримано сигнал SIGTERM на вузлі без воркерів (ENABLE_WORKERS=false). Дозавантаження та дренування черги пропущено, щоб не відбирати заявки у робочого вузла."
+            });
+
+            StructuredJsonLogger.LogEvent(_options.InstanceId, "graceful_shutdown_completed", new Dictionary<string, object?>
+            {
+                ["detail"] = "Вузол без воркерів (ENABLE_WORKERS=false) штатно завершив роботу."
+            });
+
+            _lifetime.StopApplication();
+            return;
+        }
+
         StructuredJsonLogger.LogEvent(_options.InstanceId, "sigterm_received", new Dictionary<string, object?>
         {
             ["queue_length"] = _queue.Count,
@@ -301,6 +321,14 @@ public sealed class EnrollmentWorkerPool : IHostedService
     {
         try
         {
+            if (!_options.EnableWorkers)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "graceful_shutdown_completed", new Dictionary<string, object?>
+                {
+                    ["detail"] = "Вузол без воркерів (ENABLE_WORKERS=false): дренування пропущено."
+                });
+                return;
+            }
             // Якщо кількість прийнятих заявок перевищує ємність черги в оперативній пам'яті,
             // продовжуємо дозавантажувати збережені в БД заявки зі статусом queued у вільні слоти,
             // щоб усі прийняті заявки гарантовано дійшли до термінального статусу (done / rejected).
@@ -370,7 +398,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
 
     private async Task<int> ReplenishQueueDuringDrainAsync(CancellationToken cancellationToken = default)
     {
-        if (_requestRepo == null) return 0;
+        if (!_options.EnableWorkers || _requestRepo == null) return 0;
 
         int enqueuedCount = 0;
         int freeSlots = _queue.Capacity - _queue.Count;
@@ -411,6 +439,11 @@ public sealed class EnrollmentWorkerPool : IHostedService
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         InitiateShutdown();
+
+        if (!_options.EnableWorkers)
+        {
+            return;
+        }
 
         if (_asyncWorkers.Count > 0)
         {

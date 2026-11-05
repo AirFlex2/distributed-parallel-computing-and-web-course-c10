@@ -347,6 +347,69 @@ public sealed class RestartAndRecoveryTests
         }
     }
 
+    [SkippableFact]
+    public async Task GracefulShutdown_AppB_WhenEnableWorkersFalse_DoesNotDrainOrStealQueuedRequests_ShutsDownImmediately()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
+
+        // Створюємо 5 заявок у БД зі статусом queued
+        var ids = Enumerable.Range(1, 5).Select(_ => Guid.NewGuid()).ToList();
+
+        try
+        {
+            var baseTime = DateTimeOffset.UtcNow;
+            for (int i = 0; i < ids.Count; i++)
+            {
+                await InsertRequestWithStatusAsync(ids[i], $"student-appb-drain-{i + 1}", "DISC-DPC-01", "queued", baseTime.AddSeconds(i));
+            }
+
+            int queueCapacity = 10;
+            var queue = new MonitorRequestQueue(capacity: queueCapacity);
+            var metrics = new MetricsCollector();
+            var options = new ServiceOptions
+            {
+                InstanceId = "app-b",
+                EnableWorkers = false, // Вузол app-b без воркерів
+                Workers = 3,
+                QueueCapacity = queueCapacity,
+                SlowCallMinMs = 10,
+                SlowCallMaxMs = 20
+            };
+            var processor = new EnrollmentRequestProcessor(_requestRepo, _groupRepo, _enrollmentRepo, _decanateRepo, _factory, metrics, options);
+            var lifetime = new DummyHostLifetime();
+
+            var pool = new EnrollmentWorkerPool(queue, processor, _requestRepo, options, metrics, lifetime);
+
+            // 1. Запуск пулу на app-b: не повинен дозавантажувати заявки з БД
+            await pool.StartAsync(CancellationToken.None);
+            Assert.Equal(0, queue.Count);
+
+            // 2. Ініціюємо зупинку SIGTERM на вузлі app-b при наявності queued-заявок у БД
+            pool.InitiateShutdown();
+            Assert.True(pool.IsShuttingDown);
+
+            // 3. Зупинка повинна виконатися миттєво без блокування або зависання в очікуванні відсутніх воркерів
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await pool.StopAsync(stopCts.Token);
+
+            // 4. Перевірка: StopApplication викликано, черга не захоплювала заявки
+            Assert.True(lifetime.ApplicationStopping.IsCancellationRequested);
+            Assert.Equal(0, queue.Count);
+
+            // 5. Перевірка цілісності: усі 5 заявок у БД залишилися недоторканими у статусі 'queued' для робочого вузла app-a
+            foreach (var id in ids)
+            {
+                var s = await _requestRepo.GetStatusByIdAsync(id);
+                Assert.NotNull(s);
+                Assert.Equal("queued", s.Status);
+            }
+        }
+        finally
+        {
+            foreach (var rId in ids) await CleanupRequestAsync(rId);
+        }
+    }
+
     // Перевірка рівня репозиторію: пошук заявки за Idempotency-Key повертає збережений запис у кожному з 5 станів.
     // Повноцінна перевірка HTTP-відповіді 202 Accepted здійснюється в E2EHttpEndpointTests.PostEnrollmentRequests_IdempotentReplay_AcrossAllFiveStates_Returns202.
     [SkippableTheory]

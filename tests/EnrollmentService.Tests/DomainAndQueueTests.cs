@@ -722,6 +722,32 @@ public sealed class DomainAndQueueTests
         }
     }
 
+    [Fact]
+    public async Task EnrollmentWorkerPool_WhenEnableWorkersFalse_ShutdownDoesNotDrainAndSignalsStopImmediately()
+    {
+        var queue = new MonitorRequestQueue(capacity: 10);
+        var metrics = new MetricsCollector();
+        var options = new ServiceOptions
+        {
+            InstanceId = "app-b",
+            EnableWorkers = false,
+            Workers = 3,
+            QueueCapacity = 10
+        };
+        var lifetime = new TestHostLifetime();
+        var pool = new EnrollmentWorkerPool(queue, null, null, options, metrics, lifetime);
+
+        await pool.StartAsync(CancellationToken.None);
+
+        pool.InitiateShutdown();
+        Assert.True(pool.IsShuttingDown);
+        Assert.True(lifetime.ApplicationStopping.IsCancellationRequested);
+
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await pool.StopAsync(stopCts.Token);
+        Assert.Equal(0, queue.Count);
+    }
+
     private sealed class TestShutdownProcessor : IEnrollmentRequestProcessor
     {
         public ConcurrentDictionary<Guid, string> ProcessedStatus { get; } = new();
