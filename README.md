@@ -369,11 +369,11 @@ pojekt/
 │               └── EnrollmentRequestProcessor.cs  # Єдиний процесор обробки заявок (безпечний FOR UPDATE та UNSAFE)
 └── tests/
     └── EnrollmentService.Tests/
-        ├── DomainAndQueueTests.cs                 # 22 тестові випадки xUnit (14 [Fact] та 8 [InlineData] у межах [Theory])
+        ├── DomainAndQueueTests.cs                 # 23 тестові випадки xUnit (15 [Fact] та 8 [InlineData] у межах [Theory])
         ├── BusinessErrorStatusTests.cs            # 9 тестів відповідності бізнес-відмов HTTP-статусам (400/404/409/422)
         ├── FirstReadTimeTrackingTests.cs          # 11 тестів атомарної фіксації t4 first_read_at (усі 8 сценаріїв О1.5 DPC + детермінований тест гонки COMMIT/finish + відкат)
-        ├── RestartAndRecoveryTests.cs             # 8 тестів відновлення queued/processing із PostgreSQL при старті
-        ├── E2EHttpEndpointTests.cs                # Наскрізні E2E HTTP-тести через WebApplicationFactory і PostgreSQL
+        ├── RestartAndRecoveryTests.cs             # 9 тестів відновлення queued/processing із PostgreSQL при старті та захисту режимів
+        ├── E2EHttpEndpointTests.cs                # 39 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
         ├── TestEnvironmentSafetyTests.cs          # 23 тести перевірки ізоляції тестового середовища, створення dpc_c10_test, перевірки SQLSTATE 42501/28P01 та блокування dpc_c10
         ├── TestEnvironment.cs                    # Виділена конфігурація тестового середовища (dpc_c10_test) та очищення даних
         ├── TestCollectionOrder.cs                # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])
