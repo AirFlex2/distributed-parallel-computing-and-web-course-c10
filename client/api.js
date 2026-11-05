@@ -732,21 +732,28 @@ async function readAllWebEnrollmentPages() {
         tdInst.appendChild(spanInst);
         tr.appendChild(tdInst);
 
+        const hasPending = pendingRegistrations.has(item.id);
         const isBusy = isRegistrationBusy(item.id);
         const tdActions = document.createElement('td');
-        if (item.status === 'held') {
+
+        // Кнопка реєстрації/перевірки відображається для held АБО якщо є незавершена заявка в pendingRegistrations
+        if (item.status === 'held' || hasPending) {
             const btnRoster = document.createElement('button');
             btnRoster.className = 'teal';
             btnRoster.style.padding = '3px 7px';
             btnRoster.style.fontSize = '11px';
             btnRoster.style.marginRight = '4px';
             btnRoster.dataset.action = 'registration-check';
-            btnRoster.textContent = pendingRegistrations.has(item.id) ? 'Перевірити' : 'У відомість';
+            btnRoster.textContent = hasPending ? 'Перевірити' : 'У відомість';
             btnRoster.title = 'Зареєструвати у відомості деканату через чергу РПО (POST /registrations -> 202 Accepted)';
             btnRoster.disabled = activeRegistrations.has(item.id);
             btnRoster.addEventListener('click', () => registerWebEnrollmentToRoster(item.id, btnRoster));
             tdActions.appendChild(btnRoster);
+        }
 
+        // Кнопки прямого підтвердження та скасування створюються виключно для held.
+        // Для підтвердженого запису (confirmed) з незавершеною перевіркою відображається лише кнопка «Перевірити».
+        if (item.status === 'held') {
             const btnConfirm = document.createElement('button');
             btnConfirm.className = 'secondary';
             btnConfirm.style.padding = '3px 7px';
@@ -758,8 +765,7 @@ async function readAllWebEnrollmentPages() {
             btnConfirm.disabled = isBusy;
             btnConfirm.addEventListener('click', () => confirmWebEnrollment(item.id));
             tdActions.appendChild(btnConfirm);
-        }
-        if (item.status === 'held' || item.status === 'confirmed') {
+
             const btnCancel = document.createElement('button');
             btnCancel.className = 'danger';
             btnCancel.style.padding = '3px 7px';
@@ -769,7 +775,9 @@ async function readAllWebEnrollmentPages() {
             btnCancel.disabled = isBusy;
             btnCancel.addEventListener('click', () => cancelWebEnrollment(item.id));
             tdActions.appendChild(btnCancel);
-        } else {
+        }
+
+        if (!tdActions.hasChildNodes()) {
             tdActions.textContent = '—';
         }
         tr.appendChild(tdActions);
