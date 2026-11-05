@@ -2173,8 +2173,29 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         }
         finally
         {
-            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId1);
-            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId2);
+            Exception? cleanupEx = null;
+            try
+            {
+                await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId1);
+            }
+            catch (Exception ex)
+            {
+                cleanupEx = CombineExceptions(cleanupEx, ex);
+            }
+
+            try
+            {
+                await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId2);
+            }
+            catch (Exception ex)
+            {
+                cleanupEx = CombineExceptions(cleanupEx, ex);
+            }
+
+            if (cleanupEx != null)
+            {
+                throw cleanupEx;
+            }
         }
     }
 
@@ -2475,17 +2496,27 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             }
             catch (Exception ex)
             {
-                cleanupException = ex;
+                cleanupException = CombineExceptions(cleanupException, ex);
             }
 
+            // Окреме очищення першого тестового запису
             try
             {
                 await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithEnrollmentId);
+            }
+            catch (Exception ex)
+            {
+                cleanupException = CombineExceptions(cleanupException, ex);
+            }
+
+            // Окреме очищення другого тестового запису (виконується навіть при збої попереднього очищення)
+            try
+            {
                 await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqWithNullEnrollmentId);
             }
             catch (Exception ex)
             {
-                cleanupException = cleanupException == null ? ex : new AggregateException(cleanupException, ex);
+                cleanupException = CombineExceptions(cleanupException, ex);
             }
 
             // Якщо очищення завершилося з помилкою, не маскуємо первинне виключення тесту
@@ -2614,5 +2645,21 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         }
 
         throw new FileNotFoundException($"Файл міграції '{fileName}' не знайдено.");
+    }
+
+    private static Exception CombineExceptions(Exception? first, Exception second)
+    {
+        if (first == null)
+        {
+            return second;
+        }
+
+        if (first is AggregateException agg)
+        {
+            var list = new List<Exception>(agg.InnerExceptions) { second };
+            return new AggregateException(list);
+        }
+
+        return new AggregateException(first, second);
     }
 }
