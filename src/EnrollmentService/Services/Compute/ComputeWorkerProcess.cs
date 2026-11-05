@@ -106,9 +106,11 @@ public static class ComputeWorkerProcess
             }
 
             bool useLock = string.Equals(mode, "lock", StringComparison.Ordinal);
+            bool useNaiveKernel = string.Equals(kernel, "naive", StringComparison.Ordinal);
             ExecuteSharedMemorySlice(
                 sharedFilePath,
                 useLock,
+                useNaiveKernel,
                 workers,
                 a,
                 b,
@@ -133,6 +135,7 @@ public static class ComputeWorkerProcess
     private static unsafe void ExecuteSharedMemorySlice(
         string sharedFilePath,
         bool useLock,
+        bool useNaiveKernel,
         int workers,
         double a,
         double b,
@@ -190,18 +193,27 @@ public static class ComputeWorkerProcess
             {
                 long chunkEnd = Math.Min(endIdx, chunkStart + batchStride);
 
-                double tStart = a + chunkStart * h;
-                double tEnd = (chunkEnd == n) ? b : (a + chunkEnd * h);
-
-                double chunkSum = 0.5 * (modelB + modelA * Math.Exp(tStart * invNegTau));
-                for (long k = chunkStart + 1; k < chunkEnd; k++)
+                double contribution;
+                if (useNaiveKernel)
                 {
-                    double t = a + k * h;
-                    chunkSum += modelB + modelA * Math.Exp(t * invNegTau);
+                    contribution = C10IntensityMath.ComputeTrapezoidSliceNaivePerSubinterval(
+                        a, b, n, chunkStart, chunkEnd, modelA, modelB, modelTau);
                 }
-                chunkSum += 0.5 * (modelB + modelA * Math.Exp(tEnd * invNegTau));
+                else
+                {
+                    double tStart = a + chunkStart * h;
+                    double tEnd = (chunkEnd == n) ? b : (a + chunkEnd * h);
 
-                double contribution = chunkSum * h;
+                    double chunkSum = 0.5 * (modelB + modelA * Math.Exp(tStart * invNegTau));
+                    for (long k = chunkStart + 1; k < chunkEnd; k++)
+                    {
+                        double t = a + k * h;
+                        chunkSum += modelB + modelA * Math.Exp(t * invNegTau);
+                    }
+                    chunkSum += 0.5 * (modelB + modelA * Math.Exp(tEnd * invNegTau));
+
+                    contribution = chunkSum * h;
+                }
 
                 if (useLock)
                 {
