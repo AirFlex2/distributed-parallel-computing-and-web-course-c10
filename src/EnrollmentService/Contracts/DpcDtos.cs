@@ -90,4 +90,5 @@ public sealed class QueuedRequestItem
     public long FirstReadTimestamp;
     public int DeliverySampleRecorded;
     public bool IsRecoveredFromDb { get; init; }
+    public double RecoveredQueueWaitMs;
 }

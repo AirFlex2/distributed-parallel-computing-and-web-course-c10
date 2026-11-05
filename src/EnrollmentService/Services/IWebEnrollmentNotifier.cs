@@ -12,6 +12,17 @@ public enum RosterConfirmationResult
 }
 
 /// <summary>
+/// Інтерфейс для виконання підтвердження Web-запису.
+/// </summary>
+public interface IWebEnrollmentConfirmationService
+{
+    Task<RosterConfirmationResult> ConfirmEnrollmentDetailedAsync(
+        Guid enrollmentId,
+        Guid requestId,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>
 /// Інтерфейс повідомлення Web-контуру про внесення запису до відомості деканату DPC.
 /// Відокремлює доменну зону відповідальності DPC (ведення відомості decanate_roster)
 /// від доменної зони Web (переведення статусу held -> confirmed у власній транзакції).

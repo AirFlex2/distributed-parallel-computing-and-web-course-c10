@@ -20,17 +20,24 @@ if (-not (Get-Command "docker" -ErrorAction SilentlyContinue)) {
     }
 }
 
-$origSeats = 30
-$origAvailable = 30
+$origSeats = $null
+$origAvailable = $null
 
 try {
     Write-Host "=== Крок 1: Збереження вихідного стану групи DISC-DPC-01 та додавання 500 тестових студентів ===" -ForegroundColor Cyan
-    $rawGroupInfo = (& $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT seats, available FROM discipline_group WHERE id = 'DISC-DPC-01';").Trim()
-    if (![string]::IsNullOrWhiteSpace($rawGroupInfo) -and $rawGroupInfo -match '^(\d+)\|(\d+)$') {
-        $origSeats = [int]$matches[1]
-        $origAvailable = [int]$matches[2]
-        Write-Host "Вихідний стан групи DISC-DPC-01 збережено: seats=$origSeats, available=$origAvailable" -ForegroundColor Green
+    $rawGroupInfo = (& $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT seats, available FROM discipline_group WHERE id = 'DISC-DPC-01';")
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($rawGroupInfo)) {
+        throw "Не вдалося отримати вихідний стан групи DISC-DPC-01 з бази даних PostgreSQL."
     }
+
+    $trimmedLines = @(($rawGroupInfo -split "`r?`n") | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
+    if ($trimmedLines.Count -ne 1 -or $trimmedLines[0].Trim() -notmatch '^(\d+)\|(\d+)$') {
+        throw "Отримано некоректний формат стану групи DISC-DPC-01: '$($trimmedLines -join "; ")'. Очікувалось одне значення 'seats|available'."
+    }
+
+    $origSeats = [int]$matches[1]
+    $origAvailable = [int]$matches[2]
+    Write-Host "Вихідний стан групи DISC-DPC-01 збережено: seats=$origSeats, available=$origAvailable" -ForegroundColor Green
 
     & $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -c "
     INSERT INTO student (id, email, full_name, max_disciplines, active_count, active_ects)
@@ -68,13 +75,23 @@ try {
     }
 }
 finally {
-    Write-Host "=== Крок 4: Відновлення вихідної конфігурації БД (seats=$origSeats, available=$origAvailable) та очищення тестових даних ===" -ForegroundColor Cyan
-    & $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -c "
-    UPDATE discipline_group SET seats = $origSeats, available = $origAvailable WHERE id = 'DISC-DPC-01';
-    DELETE FROM decanate_roster WHERE student_id LIKE 'student-perf-%';
-    DELETE FROM enrollment_requests WHERE student_id LIKE 'student-perf-%';
-    DELETE FROM student WHERE id LIKE 'student-perf-%';
-    " | Out-Null
+    Write-Host "=== Крок 4: Відновлення вихідної конфігурації БД та очищення тестових даних ===" -ForegroundColor Cyan
+    if ($null -ne $origSeats -and $null -ne $origAvailable) {
+        Write-Host "Відновлення місткості групи DISC-DPC-01: seats=$origSeats, available=$origAvailable" -ForegroundColor Green
+        & $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -c "
+        UPDATE discipline_group SET seats = $origSeats, available = $origAvailable WHERE id = 'DISC-DPC-01';
+        DELETE FROM decanate_roster WHERE student_id LIKE 'student-perf-%';
+        DELETE FROM enrollment_requests WHERE student_id LIKE 'student-perf-%';
+        DELETE FROM student WHERE id LIKE 'student-perf-%';
+        " | Out-Null
+    } else {
+        Write-Host "Вихідний стан групи не було зафіксовано; відновлення seats/available пропущено, очищення тестових записів..." -ForegroundColor Yellow
+        & $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -c "
+        DELETE FROM decanate_roster WHERE student_id LIKE 'student-perf-%';
+        DELETE FROM enrollment_requests WHERE student_id LIKE 'student-perf-%';
+        DELETE FROM student WHERE id LIKE 'student-perf-%';
+        " | Out-Null
+    }
     $env:ALLOW_TEST_OVERRIDES = "false"
     & $DockerExe compose up -d app-a app-b | Out-Null
     & $DockerExe compose restart nginx | Out-Null

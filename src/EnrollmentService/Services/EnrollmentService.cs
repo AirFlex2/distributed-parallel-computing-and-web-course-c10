@@ -6,7 +6,7 @@ using Npgsql;
 
 namespace EnrollmentService.Services;
 
-public sealed class EnrollmentService
+public sealed class EnrollmentService : IWebEnrollmentConfirmationService
 {
     private readonly GroupRepository _groupRepo;
     private readonly EnrollmentRepository _enrollmentRepo;

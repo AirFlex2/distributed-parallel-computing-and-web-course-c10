@@ -150,6 +150,7 @@ public sealed class MetricsCollector
         item.StartProcessingTimestamp = now;
 
         Interlocked.Increment(ref _inProcessingCount);
+        _trackedItems.TryAdd(item.Id, item);
 
         lock (_stateLock)
         {
@@ -169,14 +170,12 @@ public sealed class MetricsCollector
             if (item.IsRecoveredFromDb)
             {
                 // Для відновлених або дозавантажених із БД заявок час очікування
-                // розраховується від персистентного часу створення CreatedAtUtc
-                double waitMs = (DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds;
-                if (waitMs >= 0)
-                {
-                    AddBoundedSample(_queueWaitSamplesMs, waitMs);
-                    _windowQueueWaitSumMs += waitMs;
-                    _windowQueueWaitCount++;
-                }
+                // фіксується безпосередньо в момент взяття воркером від персистентного часу створення CreatedAtUtc
+                double waitMs = Math.Max(0, (DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds);
+                item.RecoveredQueueWaitMs = waitMs;
+                AddBoundedSample(_queueWaitSamplesMs, waitMs);
+                _windowQueueWaitSumMs += waitMs;
+                _windowQueueWaitCount++;
             }
             else if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
             {
@@ -232,7 +231,10 @@ public sealed class MetricsCollector
 
         if (item.IsRecoveredFromDb)
         {
-            double fullMs = (DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds;
+            double procMs = item.StartProcessingTimestamp > 0 && now >= item.StartProcessingTimestamp
+                ? Stopwatch.GetElapsedTime(item.StartProcessingTimestamp, now).TotalMilliseconds
+                : 0;
+            double fullMs = item.RecoveredQueueWaitMs + procMs;
             if (fullMs >= 0)
             {
                 AddBoundedSample(_totalExecutionSamplesMs, fullMs);
@@ -327,7 +329,7 @@ public sealed class MetricsCollector
         {
             if (item.StartProcessingTimestamp > 0)
             {
-                qWait = Math.Max(0, Math.Round((DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds, 3));
+                qWait = Math.Round(item.RecoveredQueueWaitMs, 3);
             }
         }
         else if (item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0)

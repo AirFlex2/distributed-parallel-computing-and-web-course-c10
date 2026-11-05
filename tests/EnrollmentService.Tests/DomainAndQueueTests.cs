@@ -613,6 +613,115 @@ public sealed class DomainAndQueueTests
         Assert.True(lifetime.ApplicationStopping.IsCancellationRequested);
     }
 
+    [Fact]
+    public async Task WebEnrollmentNotifier_FinalAttemptException_ReturnsFalseWithoutThrowing()
+    {
+        var mockService = new ThrowingConfirmationService(new InvalidOperationException("Fatal DB error on attempt"));
+        var notifier = new WebEnrollmentNotifier(mockService);
+
+        bool result = await notifier.NotifyRosterRecordedAsync(Guid.NewGuid(), Guid.NewGuid(), CancellationToken.None);
+
+        Assert.False(result);
+        Assert.Equal(3, mockService.CallCount);
+    }
+
+    [Fact]
+    public async Task WebEnrollmentNotifier_CancellationRequested_RethrowsOperationCanceledException()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var mockService = new ThrowingConfirmationService(new OperationCanceledException(cts.Token));
+        var notifier = new WebEnrollmentNotifier(mockService);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await notifier.NotifyRosterRecordedAsync(Guid.NewGuid(), Guid.NewGuid(), cts.Token);
+        });
+    }
+
+    [Fact]
+    public async Task WebEnrollmentNotifier_PermanentFailure_ReturnsFalseImmediatelyWithoutRetrying()
+    {
+        var stubService = new StubConfirmationService(RosterConfirmationResult.PermanentFailure);
+        var notifier = new WebEnrollmentNotifier(stubService);
+
+        bool result = await notifier.NotifyRosterRecordedAsync(Guid.NewGuid(), Guid.NewGuid(), CancellationToken.None);
+
+        Assert.False(result);
+        Assert.Equal(1, stubService.CallCount);
+    }
+
+    [Fact]
+    public async Task MetricsCollector_RecoveredItem_QueueWaitMsFixedAtWorkerStart_DoesNotGrowWithUtcNow()
+    {
+        var collector = new MetricsCollector();
+        var item = new QueuedRequestItem
+        {
+            Id = Guid.NewGuid(),
+            StudentId = "student-rec-test",
+            GroupId = "DISC-DPC-01",
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(-500),
+            IsRecoveredFromDb = true
+        };
+
+        // Записуємо взяття заявки воркером
+        collector.RecordWorkerStarted(item, 0);
+
+        var (qWait1, _, _) = collector.GetItemTimings(item.Id);
+        Assert.NotNull(qWait1);
+        Assert.True(qWait1.Value >= 400.0);
+
+        // Чекаємо деякий час
+        await Task.Delay(60);
+
+        var (qWait2, _, _) = collector.GetItemTimings(item.Id);
+        Assert.NotNull(qWait2);
+
+        // Час очікування повинен залишатися фіксованим і НЕ зростати від UtcNow
+        Assert.Equal(qWait1.Value, qWait2.Value);
+    }
+
+    private sealed class ThrowingConfirmationService : IWebEnrollmentConfirmationService
+    {
+        private readonly Exception _exceptionToThrow;
+        public int CallCount { get; private set; }
+
+        public ThrowingConfirmationService(Exception exceptionToThrow)
+        {
+            _exceptionToThrow = exceptionToThrow;
+        }
+
+        public Task<RosterConfirmationResult> ConfirmEnrollmentDetailedAsync(
+            Guid enrollmentId,
+            Guid requestId,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            throw _exceptionToThrow;
+        }
+    }
+
+    private sealed class StubConfirmationService : IWebEnrollmentConfirmationService
+    {
+        private readonly RosterConfirmationResult _result;
+        public int CallCount { get; private set; }
+
+        public StubConfirmationService(RosterConfirmationResult result)
+        {
+            _result = result;
+        }
+
+        public Task<RosterConfirmationResult> ConfirmEnrollmentDetailedAsync(
+            Guid enrollmentId,
+            Guid requestId,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.FromResult(_result);
+        }
+    }
+
     private sealed class TestShutdownProcessor : IEnrollmentRequestProcessor
     {
         public ConcurrentDictionary<Guid, string> ProcessedStatus { get; } = new();

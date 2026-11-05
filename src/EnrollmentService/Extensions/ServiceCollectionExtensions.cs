@@ -44,6 +44,7 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddApplicationServices(this IServiceCollection services)
     {
         services.AddSingleton<EnrollmentService.Services.EnrollmentService>();
+        services.AddSingleton<IWebEnrollmentConfirmationService>(sp => sp.GetRequiredService<EnrollmentService.Services.EnrollmentService>());
         services.AddSingleton<IWebEnrollmentNotifier, WebEnrollmentNotifier>();
         return services;
     }

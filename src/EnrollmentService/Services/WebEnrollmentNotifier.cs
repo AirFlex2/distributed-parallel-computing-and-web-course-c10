@@ -7,11 +7,11 @@ namespace EnrollmentService.Services;
 /// </summary>
 public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
 {
-    private readonly EnrollmentService _enrollmentService;
+    private readonly IWebEnrollmentConfirmationService _confirmationService;
 
-    public WebEnrollmentNotifier(EnrollmentService enrollmentService)
+    public WebEnrollmentNotifier(IWebEnrollmentConfirmationService confirmationService)
     {
-        _enrollmentService = enrollmentService ?? throw new ArgumentNullException(nameof(enrollmentService));
+        _confirmationService = confirmationService ?? throw new ArgumentNullException(nameof(confirmationService));
     }
 
     public async Task<bool> NotifyRosterRecordedAsync(
@@ -25,7 +25,7 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
             try
             {
                 // Web самостійно виконує перехід held -> confirmed у власній транзакції
-                var result = await _enrollmentService.ConfirmEnrollmentDetailedAsync(enrollmentId, requestId, cancellationToken);
+                var result = await _confirmationService.ConfirmEnrollmentDetailedAsync(enrollmentId, requestId, cancellationToken);
                 switch (result)
                 {
                     case RosterConfirmationResult.Success:
@@ -54,17 +54,36 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
                         break;
                 }
             }
-            catch (Exception ex) when (attempt < 3 && !cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                StructuredJsonLogger.LogEvent("web_notifier", "roster_notification_retry", new Dictionary<string, object?>
+                // Не придушуємо відміну через CancellationToken
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (attempt < 3 && !cancellationToken.IsCancellationRequested)
                 {
-                    ["attempt"] = attempt,
-                    ["enrollment_id"] = enrollmentId,
-                    ["request_id"] = requestId,
-                    ["error"] = ex.Message
-                });
-                int delayMs = 50 * (1 << (attempt - 1)); // 50, 100, 200 мс
-                await Task.Delay(delayMs, cancellationToken);
+                    StructuredJsonLogger.LogEvent("web_notifier", "roster_notification_retry", new Dictionary<string, object?>
+                    {
+                        ["attempt"] = attempt,
+                        ["enrollment_id"] = enrollmentId,
+                        ["request_id"] = requestId,
+                        ["error"] = ex.Message
+                    });
+                    int delayMs = 50 * (1 << (attempt - 1)); // 50, 100, 200 мс
+                    await Task.Delay(delayMs, cancellationToken);
+                }
+                else
+                {
+                    StructuredJsonLogger.LogEvent("web_notifier", "roster_notification_final_error", new Dictionary<string, object?>
+                    {
+                        ["attempt"] = attempt,
+                        ["enrollment_id"] = enrollmentId,
+                        ["request_id"] = requestId,
+                        ["error"] = ex.Message
+                    });
+                    return false;
+                }
             }
         }
 
