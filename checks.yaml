@@ -62,15 +62,11 @@ scenario:
     idempotent: true
     status: 201
     save: enrollment
-  - name: dpc-submit
-    part: dpc
+  - name: web-register
+    part: web
+    user: student-1
     method: POST
-    path: /v1/enrollment-requests
-    body:
-      student_id: student-1
-      group_id: DISC-DPC-01
-      enrollment_id: "{enrollment}"
-      request_id: "{uuid}"
+    path: "/v1/enrollments/{enrollment}/registrations"
     idempotent: true
     status: 202
     save: request
@@ -82,6 +78,7 @@ scenario:
     expect:
       id: "{request}"
       status: done
+      recorded_in_roster: true
     wait: 60
   - name: web-result
     part: web

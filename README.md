@@ -15,7 +15,7 @@
 - **Технологічний стек**:
   - Бекенд: `.NET 8.0 SDK / ASP.NET Core Kestrel` (C# 12, Minimal API, чистий ADO.NET через `Npgsql 8.0` без сторонніх ORM).
   - База даних: `PostgreSQL 16 Alpine` (реляційна схема з обмеженнями цілісності, контрольованою денормалізацією та версіонованими міграціями SQL з контролем контрольних сум SHA-256).
-  - Балансування та мережа: `Nginx 1.27 Alpine` (алгоритм балансування `least_conn`, проксі для Web API, виділений маршрут `/health-app-a` та черга РПО).
+  - Балансування та мережа: `Nginx 1.27 Alpine` (алгоритм балансування `least_conn`, проксі для Web API, виділений маршрут `/health-app-a`, маршрутизація `/registrations` та черги РПО на `dpc_backend`).
   - Клієнт: `JavaScript ES6+ / HTML5 / CSS3` (без сторонніх бібліотек чи фреймворків, порт 3000).
   - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (140 тестових випадків: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
 
@@ -266,10 +266,10 @@ flowchart TD
     Client["Браузерний Web UI (порт 3000)<br>JavaScript ES6+ (Д1.2)"] -->|HTTP / JSON| Nginx["Балансувальник Nginx 1.27 (порт 8080)"]
 
     subgraph Cluster["Контейнерне середовище Docker Compose"]
-        Nginx -->|"GET/POST /v1/enrollments<br>GET /v1/disciplines<br>GET /health<br>(алгоритм least_conn)"| AppB["app-b:8080 (Безстановий вузол)<br>ENABLE_WORKERS=false"]
+        Nginx -->|"GET/POST /v1/enrollments (крім /registrations)<br>GET /v1/disciplines<br>GET /health<br>(алгоритм least_conn)"| AppB["app-b:8080 (Безстановий вузол)<br>ENABLE_WORKERS=false"]
         Nginx -->|"GET/POST /v1/enrollments<br>GET /v1/disciplines<br>(алгоритм least_conn)"| AppA["app-a:8080 (Головний вузол РПО)<br>ENABLE_WORKERS=true"]
         
-        Nginx -->|"POST/GET /v1/enrollment-requests<br>GET /metrics, /health-app-a<br>(прямий проксі на dpc_backend)"| AppA
+        Nginx -->|"POST/GET /v1/enrollment-requests<br>POST /v1/enrollments/{id}/registrations<br>GET /metrics, /health-app-a<br>(прямий проксі на dpc_backend)"| AppA
 
         subgraph NodeA["Вузол app-a (Внутрішні компоненти РПО)"]
             AppA --> MemQueue["Обмежена черга в пам'яті (QUEUE_CAPACITY=100)<br>MonitorRequestQueue (Д1.3) / ChannelRequestQueue"]
@@ -310,7 +310,7 @@ flowchart TD
 ## 4. Структура репозиторію
 
 ```text
-pojekt/
+project/
 ├── .spectral.yaml                                 # Правила лінтування OpenAPI 3.1
 ├── compose.yaml                                   # Опис багатоконтейнерної системи (app-a, app-b, nginx, postgres)
 ├── Dockerfile                                     # Multi-stage збірка .NET 8.0 SDK -> ASP.NET Core Runtime
@@ -332,7 +332,8 @@ pojekt/
 │   ├── 006_global_unique_idempotency_key.sql      # Глобальний унікальний індекс Idempotency-Key
 │   ├── 007_add_dpc_sandbox_enabled.sql            # Розділення автономних DPC-груп і Web-груп
 │   ├── 008_idempotency_and_joint_enrollment.sql   # Ідемпотентність Web-записів та зв'язок enrollment_id у заявках РПО
-│   └── 009_add_requested_enrollment_id.sql        # Надійне збереження вихідного Web-ідентифікатора (requested_enrollment_id)
+│   ├── 009_add_requested_enrollment_id.sql        # Надійне збереження вихідного Web-ідентифікатора (requested_enrollment_id)
+│   └── 010_decanate_roster_unique_constraints.sql # Унікальні обмеження decanate_roster (student_id + discipline_id та enrollment_id)
 ├── scripts/                                       # Сценарії автоматизованої перевірки
 │   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів (PowerShell 7+)
 │   └── verify_all.sh                              # Bash-обгортка для середовищ Linux/macOS
@@ -351,7 +352,7 @@ pojekt/
 │       ├── Endpoints/                             # Маршрути Minimal API
 │       │   ├── AdminEndpoints.cs                  # Стендовий маршрут /v1/admin/reset (захищений ALLOW_TEST_OVERRIDES)
 │       │   ├── DiagnosticsEndpoints.cs            # Маршрути GET /, GET /health, GET /metrics
-│       │   ├── EnrollmentEndpoints.cs             # Web-маршрути: POST, GET, confirm, cancel
+│       │   ├── EnrollmentEndpoints.cs             # Web-маршрути: POST, GET, confirm, cancel, registrations
 │       │   ├── EnrollmentRequestEndpoints.cs      # РПО-маршрути: POST (TryReserveSlot -> 429), GET за ID
 │       │   └── GroupEndpoints.cs                  # Каталог груп, ресурс group-seats, відомість, закриття групи
 │       ├── Extensions/
@@ -390,7 +391,7 @@ pojekt/
         ├── BusinessErrorStatusTests.cs            # 9 тестів відповідності бізнес-відмов HTTP-статусам (400/404/409/422)
         ├── FirstReadTimeTrackingTests.cs          # 11 тестів атомарної фіксації t4 first_read_at (усі 8 сценаріїв О1.5 DPC + детермінований тест гонки COMMIT/finish + відкат)
         ├── RestartAndRecoveryTests.cs             # 9 тестів відновлення queued/processing із PostgreSQL при старті та захисту режимів
-        ├── E2EHttpEndpointTests.cs                # 39 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
+        ├── E2EHttpEndpointTests.cs                # 65 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
         ├── TestEnvironmentSafetyTests.cs          # 23 тести перевірки ізоляції тестового середовища, створення dpc_c10_test, перевірки SQLSTATE 42501/28P01 та блокування dpc_c10
         ├── TestEnvironment.cs                    # Виділена конфігурація тестового середовища (dpc_c10_test) та очищення даних
         ├── TestCollectionOrder.cs                # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])
@@ -502,7 +503,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
   - `resource`: тестовий ресурс `path: /v1/group-seats/DISC-DPC-01`, поле інваріанта `ok_field: invariant_ok` (суворе узгодження з прикладом `normal` у `receiver`);
   - `metrics`: імена показників у `/metrics` (`queue_length`, `in_flight`, `rejected`).
 - **Розділ `scenario:`**:
-  - Логічно зв'язаний наскрізний ланцюжок дій (тема C10, `joint/README.md`): створення попереднього запису через Web (`POST /v1/enrollments` зі збереженням `{enrollment}`), передача ідентифікатора в асинхронну заявку РПО (`POST /v1/enrollment-requests` з полем `enrollment_id: "{enrollment}"`), очікування завершення обробки (`GET /v1/enrollment-requests/{request}` статус `done`), перевірка переведення статусу Web-запису у `confirmed` (`GET /v1/enrollments/{enrollment}`).
+  - Логічно зв'язаний наскрізний ланцюжок дій (тема C10, `joint/README.md`): створення попереднього запису через Web (`POST /v1/enrollments` зі збереженням `{enrollment}`), реєстрація у відомості через публічний Web-маршрут (`POST /v1/enrollments/{enrollment}/registrations` зі статусом `202 Accepted` та збереженням `{request}`), очікування завершення обробки (`GET /v1/enrollment-requests/{request}` зі статусом `done` та `recorded_in_roster: true`), перевірка автоматичного переведення статусу Web-запису у `confirmed` (`GET /v1/enrollments/{enrollment}`).
 - **Структура конфігурації**: Файл `checks.yaml` суворо відповідає формату `joint/checks-template.yaml` (секції `web:`, `dpc:` та `scenario:`), без зайвих непідтверджених кореневих дублювань.
 
 ---
@@ -523,6 +524,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | `/v1/enrollments` | `GET` | `list` | Список власних записів студента (`X-User-Id`) із курсорним пагінуванням `(created_at, id)` |
 | `/v1/enrollments/{id}` | `GET` | `object` | Отримання конкретного запису студента за рядковим UUID |
 | `/v1/enrollments/{id}/confirm` | `POST` | `update` | Підтвердження попереднього запису студентом (`held -> confirmed`, зміна стану об'єкта) |
+| `/v1/enrollments/{id}/registrations` | `POST` | `long-operation` | **Асинхронна реєстрація у відомості**: прийом запису `held` у чергу РПО (`202 Accepted` + `Location: /v1/enrollment-requests/{id}`) для внесення до `decanate_roster` та підтвердження |
 | `/v1/enrollments/{id}/cancel` | `POST` | `cancel` | Скасування власного запису студентом із поверненням місця в групі |
 | `/v1/groups/{id}/close` | `POST` | `staff-action` | Закриття набору в групу працівником деканату (`closed = true`; у ЛР1 захищено Bearer-токеном) |
 | `/v1/enrollment-requests` | `POST` | `receiver` | **Приймач черги РПО**: прийом заявки в чергу (`202 Accepted`, відсікання `429 Too Many Requests`); приклад `normal` із `{uuid}` |

@@ -1201,7 +1201,7 @@ paths:
         - При повторі з тим самим Idempotency-Key повертається 202 Accepted зі збереженим requestId і Location
           як до початку обробки, так і після її завершення (done), без додаткового споживання слотів черги.
         - При зміні параметрів (студент, запис) повертається 409 Conflict (idempotency_conflict).
-      x-course: registrations
+      x-course: long-operation
       parameters:
         - name: id
           in: path

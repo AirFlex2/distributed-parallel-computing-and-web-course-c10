@@ -212,6 +212,12 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
 
         if (res.status === 201) {
             const safeModel = parseWebEnrollmentDtoSafely(rawBody);
+            lastCreatedHeldEnrollmentId = safeModel.id;
+            const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
+            if (btnReg) {
+                btnReg.style.display = 'inline-block';
+                btnReg.textContent = `2. Зареєструвати запис у відомості (POST /registrations)`;
+            }
             appendWebOpLog(
                 `[201 Created] Запис створено успішно (після COMMIT у PostgreSQL)!\n` +
                 `  Location: ${locationHeader} | Вузол за Nginx: ${instanceHeader} | X-Request-ID: ${reqIdHeader}\n` +
@@ -256,6 +262,75 @@ async function cancelWebEnrollment(enrollmentId) {
         await refreshAll();
     } catch (err) {
         appendWebOpLog(`Помилка скасування запису: ${err.message}`);
+    }
+}
+
+let lastCreatedHeldEnrollmentId = null;
+
+// Наскрізна асинхронна реєстрація Web-запису у відомості деканату через чергу РПО (Web C10: held -> черга РПО -> decanate_roster -> confirmed)
+async function registerWebEnrollmentToRoster(enrollmentId = null) {
+    const targetId = enrollmentId || lastCreatedHeldEnrollmentId;
+    if (!targetId) {
+        appendWebOpLog('Помилка: не вказано ідентифікатор Web-запису для реєстрації.');
+        return;
+    }
+    appendWebOpLog(`[1/3] Реєстрація Web-запису ${targetId} у відомості деканату (POST /v1/enrollments/${targetId}/registrations)...`);
+    try {
+        const ik = `ik-reg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const headers = getAuthHeaders();
+        headers['Idempotency-Key'] = ik;
+
+        const res = await fetch(`${getApiBase()}/v1/enrollments/${targetId}/registrations`, {
+            method: 'POST',
+            headers
+        });
+
+        const rawBody = await res.json().catch(() => ({}));
+        if (res.status !== 202) {
+            appendWebOpLog(`[HTTP ${res.status}] Помилка взяття в чергу: ${rawBody.detail || rawBody.title || 'Помилка'}`);
+            await refreshAll();
+            return;
+        }
+
+        const requestId = rawBody.id;
+        const loc = res.headers.get('Location') || `/v1/enrollment-requests/${requestId}`;
+        appendWebOpLog(`[2/3 202 Accepted] Заявку розміщено в черзі РПО: requestId=${requestId}, Location=${loc}.\n  Очікуємо обробку воркером та внесення до decanate_roster...`);
+
+        // Опитування стану через GET /v1/enrollment-requests/{requestId}
+        let isDone = false;
+        const startTime = Date.now();
+        while (!isDone && (Date.now() - startTime < 30000)) {
+            await new Promise(r => setTimeout(r, 200));
+            const pollRes = await fetch(`${getApiBase()}/v1/enrollment-requests/${requestId}`, {
+                headers: getAuthHeaders()
+            });
+            if (!pollRes.ok) continue;
+            const pollBody = await pollRes.json();
+            if (pollBody.status === 'done' || pollBody.status === 'rejected' || pollBody.status === 'failed') {
+                isDone = true;
+                appendWebOpLog(`  Статус заявки в черзі РПО: status="${pollBody.status}", recorded_in_roster=${pollBody.recorded_in_roster}.`);
+                break;
+            }
+        }
+
+        // Отримуємо оновлений Web-запис
+        const webEnrRes = await fetch(`${getApiBase()}/v1/enrollments/${targetId}`, {
+            headers: getAuthHeaders()
+        });
+        if (webEnrRes.ok) {
+            const webEnr = await webEnrRes.json();
+            appendWebOpLog(`[3/3 Успіх] Наскрізний сценарій завершено! Web-запис ${targetId} підтверджено у відомості деканату.\n  Статус="${webEnr.status}", версія=${webEnr.version}.`);
+        }
+
+        const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
+        if (btnReg) {
+            btnReg.style.display = 'none';
+        }
+        lastCreatedHeldEnrollmentId = null;
+
+        await refreshAll();
+    } catch (err) {
+        appendWebOpLog(`Помилка реєстрації у відомості: ${err.message}`);
     }
 }
 
@@ -400,12 +475,23 @@ async function readAllWebEnrollmentPages() {
 
         const tdActions = document.createElement('td');
         if (item.status === 'held') {
+            const btnRoster = document.createElement('button');
+            btnRoster.className = 'teal';
+            btnRoster.style.padding = '3px 7px';
+            btnRoster.style.fontSize = '11px';
+            btnRoster.style.marginRight = '4px';
+            btnRoster.textContent = 'У відомість';
+            btnRoster.title = 'Зареєструвати у відомості деканату через чергу РПО (POST /registrations -> 202 Accepted)';
+            btnRoster.addEventListener('click', () => registerWebEnrollmentToRoster(item.id));
+            tdActions.appendChild(btnRoster);
+
             const btnConfirm = document.createElement('button');
-            btnConfirm.className = 'teal';
+            btnConfirm.className = 'secondary';
             btnConfirm.style.padding = '3px 7px';
             btnConfirm.style.fontSize = '11px';
             btnConfirm.style.marginRight = '4px';
             btnConfirm.textContent = 'Підтвердити';
+            btnConfirm.title = 'Пряме підтвердження студентом без запису до відомості (POST /confirm)';
             btnConfirm.addEventListener('click', () => confirmWebEnrollment(item.id));
             tdActions.appendChild(btnConfirm);
         }
@@ -852,6 +938,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // Прив'язка обробників подій до кнопок та селектів без inline обробників (О1.7, Д1.2)
     document.getElementById('btnRefreshAll')?.addEventListener('click', () => refreshAll());
     document.getElementById('btnCreateWebEnrollment')?.addEventListener('click', () => createWebEnrollment());
+    document.getElementById('btnRegisterWebEnrollmentToRoster')?.addEventListener('click', () => registerWebEnrollmentToRoster());
     document.getElementById('btnRunWebBoundaryTests')?.addEventListener('click', () => runWebBoundaryTests());
     document.getElementById('btnRunWebProblemDetailsTests')?.addEventListener('click', () => runWebProblemDetailsTests());
     document.getElementById('btnReadAllWebEnrollmentPages')?.addEventListener('click', () => readAllWebEnrollmentPages());

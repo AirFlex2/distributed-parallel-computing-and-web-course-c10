@@ -221,7 +221,8 @@
                 <input type="text" id="traceparentInput" value="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01">
             </div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
-                <button class="teal" id="btnCreateWebEnrollment">Записатися: POST /v1/enrollments (201 Created)</button>
+                <button class="teal" id="btnCreateWebEnrollment">1. Записатися: POST /v1/enrollments (201 Created)</button>
+                <button class="teal" id="btnRegisterWebEnrollmentToRoster" style="display: none; background-color: #0d9488;">2. Зареєструвати створений запис у відомості (POST /registrations)</button>
                 <button class="secondary" id="btnRunWebBoundaryTests">Автотест Д1.1/Д1.5 (Вікно [opens_at, closes_at) + ЄКТС 30.0 vs 30.5)</button>
                 <button class="danger" id="btnRunWebProblemDetailsTests">Автотест Problem Details (400 / 404 / 409 / 422)</button>
             </div>

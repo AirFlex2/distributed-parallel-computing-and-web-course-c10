@@ -204,7 +204,11 @@ if ($total -eq 0) {
     if ($testOut -match '(?i)(?:всього|Total)\s*[:=]\s*(\d+)') { $total = [int]$Matches[1] }
 }
 
-if ($testExit -eq 0 -and $failed -eq 0 -and $skipped -eq 0 -and $passed -ge 114) {
+if ($testExit -eq 0 -and
+    $failed -eq 0 -and
+    $skipped -eq 0 -and
+    $passed -ge 140 -and
+    $total -ge 140) {
     Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
     if ($skipped -gt 0) {
@@ -1147,8 +1151,8 @@ try {
 
     # 10.13.3 Повторний Idempotency-Key з іншим тілом -> 422 Unprocessable Content (О2.2 Web)
     $ikTestKey = "ik-diff-body-" + [guid]::NewGuid().ToString("N")
-    $ikFirstRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
-    $ikSecondRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
+    $ikFirstRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-DB-01"}' -SkipHttpErrorCheck
+    $ikSecondRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-AI-02"}' -SkipHttpErrorCheck
     $ikSecondJson = (Get-ResponseText $ikSecondRes) | ConvertFrom-Json
     if ([int]$ikSecondRes.StatusCode -eq 422 -and $ikSecondJson.error_code -eq "idempotency_key_payload_mismatch") {
         Write-Pass "Web О2.2: Повторний Idempotency-Key з іншим тілом повернув HTTP 422 Unprocessable Content (error_code=idempotency_key_payload_mismatch)"
