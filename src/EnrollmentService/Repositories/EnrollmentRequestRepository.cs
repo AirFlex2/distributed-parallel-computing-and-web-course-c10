@@ -274,7 +274,7 @@ public sealed class EnrollmentRequestRepository
         }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
         {
-            // Унікальний конфлікт по student_id + idempotency_key
+            // Глобальний унікальний конфлікт по idempotency_key (idx_enrollment_requests_idempotency_global)
             return false;
         }
     }

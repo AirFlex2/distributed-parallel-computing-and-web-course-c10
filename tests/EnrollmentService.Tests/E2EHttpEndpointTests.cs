@@ -3296,14 +3296,20 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
 
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
 
+        var options = _factory.Services.GetRequiredService<ServiceOptions>();
+        bool originalAllowOverrides = options.AllowTestOverrides;
+        options.AllowTestOverrides = true;
+
         var processor = _factory.Services.GetRequiredService<EnrollmentRequestProcessor>();
         var requestRepo = _factory.Services.GetRequiredService<EnrollmentRequestRepository>();
+        var hookEnteredTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var pauseTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         processor.TestPreProcessingHookAsync = async item =>
         {
             if (item.StudentId == studentId)
             {
+                hookEnteredTcs.TrySetResult(true);
                 await pauseTcs.Task;
             }
         };
@@ -3333,6 +3339,10 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Guid reqId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
             string loc1 = resp1.Headers.Location?.ToString() ?? "";
 
+            // Очікуємо, що воркер гарантовано підхопив заявку і зупинився в TestPreProcessingHookAsync:
+            await hookEnteredTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(hookEnteredTcs.Task.IsCompletedSuccessfully, "Воркер мав обов'язково зайти в TestPreProcessingHookAsync і призупинити обробку");
+
             // Гарантуємо, що воркер ще не встиг завершити обробку заявки:
             var reqRecord = await requestRepo.GetStatusByIdAsync(reqId1);
             Assert.NotNull(reqRecord);
@@ -3355,6 +3365,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         {
             pauseTcs.TrySetResult(true);
             processor.TestPreProcessingHookAsync = null;
+            options.AllowTestOverrides = originalAllowOverrides;
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
         }
     }
@@ -3609,6 +3620,132 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         finally
         {
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Registrations_Idempotency_ConcurrentTwoDifferentStudents_OneAcceptedOneConflict()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string student1 = "stud-cross-ik-1";
+        string student2 = "stud-cross-ik-2";
+        string groupId1 = "GRP-CROSS-IK-1";
+        string groupId2 = "GRP-CROSS-IK-2";
+        string discId1 = "DISC-CROSS-IK-1";
+        string discId2 = "DISC-CROSS-IK-2";
+        string sharedIk = $"ik-cross-{Guid.NewGuid():N}";
+
+        await TestEnvironment.CleanupTestDataAsync(student1, groupId1, discId1);
+        await TestEnvironment.CleanupTestDataAsync(student2, groupId2, discId2);
+
+        try
+        {
+            await EnsureTestStudentAsync(student1, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestStudentAsync(student2, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId1, discId1, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+            await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            // Створюємо enrollment для студента 1
+            var client1 = _factory.CreateClient();
+            client1.DefaultRequestHeaders.Add("X-User-Id", student1);
+            client1.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+            var postResp1 = await client1.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp1.StatusCode);
+            var json1 = await postResp1.Content.ReadAsStringAsync();
+            using var doc1 = JsonDocument.Parse(json1);
+            Guid enrollmentId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
+
+            // Створюємо enrollment для студента 2
+            var client2 = _factory.CreateClient();
+            client2.DefaultRequestHeaders.Add("X-User-Id", student2);
+            client2.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+            var postResp2 = await client2.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId2}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp2.StatusCode);
+            var json2 = await postResp2.Content.ReadAsStringAsync();
+            using var doc2 = JsonDocument.Parse(json2);
+            Guid enrollmentId2 = Guid.Parse(doc2.RootElement.GetProperty("id").GetString()!);
+
+            // Одночасно відправляємо POST /v1/enrollments/{id}/registrations зі спільним Idempotency-Key для двох різних студентів
+            using var regClient1 = _factory.CreateClient();
+            regClient1.DefaultRequestHeaders.Add("X-User-Id", student1);
+            using var regReq1 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId1}/registrations");
+            regReq1.Headers.Add("Idempotency-Key", sharedIk);
+
+            using var regClient2 = _factory.CreateClient();
+            regClient2.DefaultRequestHeaders.Add("X-User-Id", student2);
+            using var regReq2 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId2}/registrations");
+            regReq2.Headers.Add("Idempotency-Key", sharedIk);
+
+            var task1 = regClient1.SendAsync(regReq1);
+            var task2 = regClient2.SendAsync(regReq2);
+
+            var responses = await Task.WhenAll(task1, task2);
+            var statuses = responses.Select(r => r.StatusCode).ToList();
+
+            // Завдяки глобальному унікальному індексу idx_enrollment_requests_idempotency_global:
+            // Рівно один студент отримує 202 Accepted, а другий — 409 Conflict (idempotency_conflict)
+            Assert.Contains(HttpStatusCode.Accepted, statuses);
+            Assert.Contains(HttpStatusCode.Conflict, statuses);
+
+            var conflictResp = responses.First(r => r.StatusCode == HttpStatusCode.Conflict);
+            var conflictJson = await conflictResp.Content.ReadAsStringAsync();
+            using var conflictDoc = JsonDocument.Parse(conflictJson);
+            Assert.Equal("idempotency_conflict", conflictDoc.RootElement.GetProperty("error_code").GetString());
+
+            var acceptedResp = responses.First(r => r.StatusCode == HttpStatusCode.Accepted);
+            var acceptedJson = await acceptedResp.Content.ReadAsStringAsync();
+            using var acceptedDoc = JsonDocument.Parse(acceptedJson);
+            Guid acceptedReqId = Guid.Parse(acceptedDoc.RootElement.GetProperty("id").GetString()!);
+            string acceptedStudent = acceptedDoc.RootElement.GetProperty("student_id").GetString()!;
+
+            // Очікуємо завершення обробки прийнятої заявки
+            var dpcClient = _factory.CreateClient();
+            dpcClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            bool isDone = false;
+            for (int i = 0; i < 40 && !isDone; i++)
+            {
+                await Task.Delay(100);
+                var getResp = await dpcClient.GetAsync($"/v1/enrollment-requests/{acceptedReqId}");
+                if (getResp.StatusCode == HttpStatusCode.OK)
+                {
+                    var getJson = await getResp.Content.ReadAsStringAsync();
+                    using var getDoc = JsonDocument.Parse(getJson);
+                    if (getDoc.RootElement.GetProperty("status").GetString() == "done")
+                    {
+                        isDone = true;
+                    }
+                }
+            }
+            Assert.True(isDone, "Прийнята заявка мала успішно перейти у статус done");
+
+            // Перевіряємо базу даних
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                // 1. Рівно ОДНА заявка в enrollment_requests з цим ключем
+                await using var cmdCount = new NpgsqlCommand("SELECT COUNT(*) FROM enrollment_requests WHERE idempotency_key = @ik;", conn);
+                cmdCount.Parameters.AddWithValue("ik", sharedIk);
+                long reqCount = (long)(await cmdCount.ExecuteScalarAsync())!;
+                Assert.Equal(1L, reqCount);
+
+                // 2. Власник заявки відповідає прийнятому студенту
+                await using var cmdOwner = new NpgsqlCommand("SELECT student_id FROM enrollment_requests WHERE idempotency_key = @ik;", conn);
+                cmdOwner.Parameters.AddWithValue("ik", sharedIk);
+                string ownerInDb = (string)(await cmdOwner.ExecuteScalarAsync())!;
+                Assert.Equal(acceptedStudent, ownerInDb);
+
+                // 3. У decanate_roster створено рівно один запис для цієї заявки
+                await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE request_id = @rid;", conn);
+                cmdRoster.Parameters.AddWithValue("rid", acceptedReqId);
+                long rosterCount = (long)(await cmdRoster.ExecuteScalarAsync())!;
+                Assert.Equal(1L, rosterCount);
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(student1, groupId1, discId1);
+            await TestEnvironment.CleanupTestDataAsync(student2, groupId2, discId2);
         }
     }
 
