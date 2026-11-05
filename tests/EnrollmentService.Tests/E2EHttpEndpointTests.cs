@@ -3314,12 +3314,14 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             }
         };
 
+        Guid? reqId1 = null;
+        var client = _factory.CreateClient();
+
         try
         {
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client = _factory.CreateClient();
             client.DefaultRequestHeaders.Add("X-User-Id", studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
@@ -3336,7 +3338,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Assert.Equal(HttpStatusCode.Accepted, resp1.StatusCode);
             var json1 = await resp1.Content.ReadAsStringAsync();
             using var doc1 = JsonDocument.Parse(json1);
-            Guid reqId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
+            reqId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
             string loc1 = resp1.Headers.Location?.ToString() ?? "";
 
             // Очікуємо, що воркер гарантовано підхопив заявку і зупинився в TestPreProcessingHookAsync:
@@ -3344,7 +3346,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Assert.True(hookEnteredTcs.Task.IsCompletedSuccessfully, "Воркер мав обов'язково зайти в TestPreProcessingHookAsync і призупинити обробку");
 
             // Гарантуємо, що воркер ще не встиг завершити обробку заявки:
-            var reqRecord = await requestRepo.GetStatusByIdAsync(reqId1);
+            var reqRecord = await requestRepo.GetStatusByIdAsync(reqId1.Value);
             Assert.NotNull(reqRecord);
             Assert.NotEqual("done", reqRecord.Status);
 
@@ -3358,7 +3360,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             Guid reqId2 = Guid.Parse(doc2.RootElement.GetProperty("id").GetString()!);
             string loc2 = resp2.Headers.Location?.ToString() ?? "";
 
-            Assert.Equal(reqId1, reqId2);
+            Assert.Equal(reqId1.Value, reqId2);
             Assert.Equal(loc1, loc2);
         }
         finally
@@ -3366,6 +3368,19 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             pauseTcs.TrySetResult(true);
             processor.TestPreProcessingHookAsync = null;
             options.AllowTestOverrides = originalAllowOverrides;
+
+            if (reqId1.HasValue)
+            {
+                try
+                {
+                    await WaitForTerminalStatusAsync(client, reqId1.Value);
+                }
+                catch
+                {
+                    // Запобігаємо маскуванню первинної помилки тесту в разі таймауту або аварійного завершення
+                }
+            }
+
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
         }
     }
