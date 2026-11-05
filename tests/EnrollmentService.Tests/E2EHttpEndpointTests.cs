@@ -86,6 +86,11 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         Guid requestId,
         CancellationToken cancellationToken = default)
     {
+        if (client.DefaultRequestHeaders.Authorization == null)
+        {
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+        }
+
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
 
@@ -3315,13 +3320,14 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         };
 
         Guid? reqId1 = null;
-        var client = _factory.CreateClient();
+        using var client = _factory.CreateClient();
 
         try
         {
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
             client.DefaultRequestHeaders.Add("X-User-Id", studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
@@ -3369,16 +3375,12 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             processor.TestPreProcessingHookAsync = null;
             options.AllowTestOverrides = originalAllowOverrides;
 
+            // Якщо заявку було створено, очікуємо її переходу в термінальний стан (done, rejected або failed).
+            // У разі таймауту виключення не приглушується: помилка фіксується явно, а CleanupTestDataAsync
+            // НЕ викликається, щоб запобігти гонитві з воркером та зберегти дані для діагностики.
             if (reqId1.HasValue)
             {
-                try
-                {
-                    await WaitForTerminalStatusAsync(client, reqId1.Value);
-                }
-                catch
-                {
-                    // Запобігаємо маскуванню первинної помилки тесту в разі таймауту або аварійного завершення
-                }
+                await WaitForTerminalStatusAsync(client, reqId1.Value);
             }
 
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
