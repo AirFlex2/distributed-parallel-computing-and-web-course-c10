@@ -256,6 +256,11 @@ async function cancelWebEnrollment(enrollmentId) {
         const body = await res.json().catch(() => ({}));
         if (res.ok) {
             appendWebOpLog(`[200 OK] Запис ${enrollmentId} скасовано (status="${body.status}", місце в групі ${body.group_id} повернуто).`);
+            if (enrollmentId === lastCreatedHeldEnrollmentId) {
+                const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
+                if (btnReg) btnReg.style.display = 'none';
+                lastCreatedHeldEnrollmentId = null;
+            }
         } else {
             appendWebOpLog(`[HTTP ${res.status}] Помилка скасування: ${body.detail || body.title}`);
         }
@@ -266,17 +271,35 @@ async function cancelWebEnrollment(enrollmentId) {
 }
 
 let lastCreatedHeldEnrollmentId = null;
+const activeRegistrations = new Set();
 
 // Наскрізна асинхронна реєстрація Web-запису у відомості деканату через чергу РПО (Web C10: held -> черга РПО -> decanate_roster -> confirmed)
-async function registerWebEnrollmentToRoster(enrollmentId = null) {
+async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = null) {
     const targetId = enrollmentId || lastCreatedHeldEnrollmentId;
     if (!targetId) {
         appendWebOpLog('Помилка: не вказано ідентифікатор Web-запису для реєстрації.');
         return;
     }
+
+    if (activeRegistrations.has(targetId)) {
+        appendWebOpLog(`Реєстрація для запису ${targetId} вже виконується. Зачекайте завершення.`);
+        return;
+    }
+    activeRegistrations.add(targetId);
+
+    const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
+    const isTargetTopBtn = (targetId === lastCreatedHeldEnrollmentId);
+
+    if (triggerBtn) {
+        triggerBtn.disabled = true;
+    }
+    if (btnReg && isTargetTopBtn) {
+        btnReg.disabled = true;
+    }
+
     appendWebOpLog(`[1/3] Реєстрація Web-запису ${targetId} у відомості деканату (POST /v1/enrollments/${targetId}/registrations)...`);
     try {
-        const ik = `ik-reg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const ik = `ik-reg-${targetId}`;
         const headers = getAuthHeaders();
         headers['Idempotency-Key'] = ik;
 
@@ -298,14 +321,54 @@ async function registerWebEnrollmentToRoster(enrollmentId = null) {
 
         // Опитування стану через GET /v1/enrollment-requests/{requestId}
         let isDone = false;
+        let pollBody = null;
+        let transientErrorCount = 0;
         const startTime = Date.now();
+
         while (!isDone && (Date.now() - startTime < 30000)) {
             await new Promise(r => setTimeout(r, 200));
-            const pollRes = await fetch(`${getApiBase()}/v1/enrollment-requests/${requestId}`, {
-                headers: getAuthHeaders()
-            });
-            if (!pollRes.ok) continue;
-            const pollBody = await pollRes.json();
+
+            let pollRes;
+            try {
+                pollRes = await fetch(`${getApiBase()}/v1/enrollment-requests/${requestId}`, {
+                    headers: getAuthHeaders()
+                });
+            } catch (netErr) {
+                transientErrorCount++;
+                if (transientErrorCount > 5) {
+                    appendWebOpLog(`Помилка мережі при опитуванні черги: ${netErr.message}`);
+                    await refreshAll();
+                    return;
+                }
+                continue;
+            }
+
+            if (!pollRes.ok) {
+                // Тимчасові помилки (429, 502, 503, 504) дозволяють повторне опитування
+                if (pollRes.status === 429 || pollRes.status === 502 || pollRes.status === 503 || pollRes.status === 504) {
+                    transientErrorCount++;
+                    if (transientErrorCount > 5) {
+                        appendWebOpLog(`Перевищено ліміт тимчасових помилок шлюзу (HTTP ${pollRes.status}).`);
+                        await refreshAll();
+                        return;
+                    }
+                    continue;
+                }
+
+                // Постійні помилки (404 Not Found, 400 Bad Request, 401/403, 500 тощо) показуємо користувачеві та перериваємо опрос
+                const errBody = await pollRes.json().catch(() => ({}));
+                appendWebOpLog(
+                    `Помилка опитування черги (HTTP ${pollRes.status}): ${errBody.detail || errBody.title || pollRes.statusText}`
+                );
+                await refreshAll();
+                return;
+            }
+
+            transientErrorCount = 0;
+            const currentBody = await pollRes.json().catch(() => null);
+            if (!currentBody) continue;
+
+            pollBody = currentBody;
             if (pollBody.status === 'done' || pollBody.status === 'rejected' || pollBody.status === 'failed') {
                 isDone = true;
                 appendWebOpLog(`  Статус заявки в черзі РПО: status="${pollBody.status}", recorded_in_roster=${pollBody.recorded_in_roster}.`);
@@ -313,24 +376,60 @@ async function registerWebEnrollmentToRoster(enrollmentId = null) {
             }
         }
 
+        if (!isDone) {
+            appendWebOpLog('Реєстрація ще обробляється. Остаточний результат не отримано.');
+            return;
+        }
+
+        if (pollBody.status !== 'done' ||
+            pollBody.recorded_in_roster !== true) {
+            appendWebOpLog(
+                `Помилка реєстрації: status=${pollBody.status}, ` +
+                `recorded_in_roster=${pollBody.recorded_in_roster}`
+            );
+            await refreshAll();
+            return;
+        }
+
         // Отримуємо оновлений Web-запис
         const webEnrRes = await fetch(`${getApiBase()}/v1/enrollments/${targetId}`, {
             headers: getAuthHeaders()
         });
-        if (webEnrRes.ok) {
-            const webEnr = await webEnrRes.json();
-            appendWebOpLog(`[3/3 Успіх] Наскрізний сценарій завершено! Web-запис ${targetId} підтверджено у відомості деканату.\n  Статус="${webEnr.status}", версія=${webEnr.version}.`);
+        if (!webEnrRes.ok) {
+            const errWeb = await webEnrRes.json().catch(() => ({}));
+            appendWebOpLog(`Помилка отримання оновленого запису (HTTP ${webEnrRes.status}): ${errWeb.detail || errWeb.title || 'Помилка'}`);
+            await refreshAll();
+            return;
         }
 
-        const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
-        if (btnReg) {
+        const webEnr = await webEnrRes.json();
+        if (webEnr.status !== 'confirmed') {
+            appendWebOpLog(
+                `Помилка: очікувався confirmed, отримано ${webEnr.status}`
+            );
+            return;
+        }
+
+        appendWebOpLog(`[3/3 Успіх] Наскрізний сценарій завершено! Web-запис ${targetId} підтверджено у відомості деканату.\n  Статус="${webEnr.status}", версія=${webEnr.version}.`);
+
+        if (btnReg && isTargetTopBtn) {
             btnReg.style.display = 'none';
         }
-        lastCreatedHeldEnrollmentId = null;
+        if (isTargetTopBtn) {
+            lastCreatedHeldEnrollmentId = null;
+        }
 
         await refreshAll();
     } catch (err) {
         appendWebOpLog(`Помилка реєстрації у відомості: ${err.message}`);
+    } finally {
+        activeRegistrations.delete(targetId);
+        if (triggerBtn) {
+            triggerBtn.disabled = false;
+        }
+        if (btnReg && isTargetTopBtn) {
+            btnReg.disabled = false;
+        }
     }
 }
 
@@ -344,6 +443,11 @@ async function confirmWebEnrollment(enrollmentId) {
         const body = await res.json().catch(() => ({}));
         if (res.ok) {
             appendWebOpLog(`[200 OK] Запис ${enrollmentId} успішно підтверджено (status="${body.status}").`);
+            if (enrollmentId === lastCreatedHeldEnrollmentId) {
+                const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
+                if (btnReg) btnReg.style.display = 'none';
+                lastCreatedHeldEnrollmentId = null;
+            }
         } else {
             appendWebOpLog(`[HTTP ${res.status}] Помилка підтвердження: ${body.detail || body.title}`);
         }
@@ -482,7 +586,7 @@ async function readAllWebEnrollmentPages() {
             btnRoster.style.marginRight = '4px';
             btnRoster.textContent = 'У відомість';
             btnRoster.title = 'Зареєструвати у відомості деканату через чергу РПО (POST /registrations -> 202 Accepted)';
-            btnRoster.addEventListener('click', () => registerWebEnrollmentToRoster(item.id));
+            btnRoster.addEventListener('click', () => registerWebEnrollmentToRoster(item.id, btnRoster));
             tdActions.appendChild(btnRoster);
 
             const btnConfirm = document.createElement('button');
@@ -938,7 +1042,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // Прив'язка обробників подій до кнопок та селектів без inline обробників (О1.7, Д1.2)
     document.getElementById('btnRefreshAll')?.addEventListener('click', () => refreshAll());
     document.getElementById('btnCreateWebEnrollment')?.addEventListener('click', () => createWebEnrollment());
-    document.getElementById('btnRegisterWebEnrollmentToRoster')?.addEventListener('click', () => registerWebEnrollmentToRoster());
+    document.getElementById('btnRegisterWebEnrollmentToRoster')?.addEventListener('click', (e) => registerWebEnrollmentToRoster(null, e.currentTarget));
     document.getElementById('btnRunWebBoundaryTests')?.addEventListener('click', () => runWebBoundaryTests());
     document.getElementById('btnRunWebProblemDetailsTests')?.addEventListener('click', () => runWebProblemDetailsTests());
     document.getElementById('btnReadAllWebEnrollmentPages')?.addEventListener('click', () => readAllWebEnrollmentPages());
