@@ -156,28 +156,35 @@ $reportComposite | ForEach-Object { Write-Host "  $_" }
 $null = docker compose exec -T app-a rm -f /tmp/c10_naive.nettrace /tmp/c10_composite.nettrace
 
 Write-Host "`n--- 3.2. Відтворюване порівняння ДО та ПІСЛЯ оптимізації БЕЗ профайлера (3 прогони POST /v1/compute) ---" -ForegroundColor Yellow
-Write-Host "Умови: Release-контейнер app-a, POST /v1/compute, n = $BenchN, [a, b] = [0, 60], 3 незалежні прогони кожного варіанта без інструментації профайлера."
+Write-Host "Умови: Release-контейнер app-a, POST /v1/compute, n = $BenchN, [a, b] = [0, 60], по 3 свіжі незалежні прогони для naive та composite без інструментації профайлера (чередування для нівелювання температурного впливу та прогріву)."
 
 foreach ($wOpt in @(1, 4)) {
     $naiveRuns = @()
-    $naiveVal = 0.0
+    $compRuns  = @()
+    $naiveVal  = 0.0
+    $compVal   = 0.0
+
+    # Чередуємо запуски naive та composite у кожному з 3 раундів вимірювання
     for ($rIdx = 1; $rIdx -le 3; $rIdx++) {
         $rn = Invoke-Compute -a 0.0 -b 60.0 -n $BenchN -workers $wOpt -mode "local" -kernel "naive"
         $naiveRuns += [double]$rn.wall_s
         $naiveVal = [double]$rn.value
-    }
-    $naiveSt = Get-RunStats -runs $naiveRuns
 
-    # Для composite використовуємо ті самі 3 прогони без профайлера (або виконуємо 3 прогони в ідентичних умовах)
-    $compSt = $statsByWorkers[$wOpt]
+        $rc = Invoke-Compute -a 0.0 -b 60.0 -n $BenchN -workers $wOpt -mode "local" -kernel "composite"
+        $compRuns += [double]$rc.wall_s
+        $compVal = [double]$rc.value
+    }
+
+    $naiveSt  = Get-RunStats -runs $naiveRuns
+    $compSt   = Get-RunStats -runs $compRuns
     $gainMed  = $naiveSt.Median / $compSt.Median
     $gainMean = $naiveSt.Mean / $compSt.Mean
 
     Write-Host ("`n  Конфігурація workers = {0} (n = {1}):" -f $wOpt, $BenchN) -ForegroundColor Green
     Write-Host ("    ДО оптимізації (kernel=naive)     : runs=[{0:F4}s, {1:F4}s, {2:F4}s] | median={3:F4}s | mean={4:F4}s | spread={5:F4}s ({6:F2}%) | value={7:F10}" -f `
         $naiveRuns[0], $naiveRuns[1], $naiveRuns[2], $naiveSt.Median, $naiveSt.Mean, $naiveSt.SpreadAbs, $naiveSt.SpreadPct, $naiveVal)
-    Write-Host ("    ПІСЛЯ оптимізації (kernel=composite): runs=[{0:F4}s, {1:F4}s, {2:F4}s] | median={3:F4}s | mean={4:F4}s | spread={5:F4}s ({6:F2}%)" -f `
-        $compSt.Runs[0], $compSt.Runs[1], $compSt.Runs[2], $compSt.Median, $compSt.Mean, $compSt.SpreadAbs, $compSt.SpreadPct)
+    Write-Host ("    ПІСЛЯ оптимізації (kernel=composite): runs=[{0:F4}s, {1:F4}s, {2:F4}s] | median={3:F4}s | mean={4:F4}s | spread={5:F4}s ({6:F2}%) | value={7:F10}" -f `
+        $compRuns[0], $compRuns[1], $compRuns[2], $compSt.Median, $compSt.Mean, $compSt.SpreadAbs, $compSt.SpreadPct, $compVal)
     Write-Host ("    Ефект оптимізації (workers={0})    : прискорення за медіаною = {1:F3}x ({2:F4}s -> {3:F4}s), за середнім = {4:F3}x ({5:F4}s -> {6:F4}s)" -f `
         $wOpt, $gainMed, $naiveSt.Median, $compSt.Median, $gainMean, $naiveSt.Mean, $compSt.Mean)
 }
