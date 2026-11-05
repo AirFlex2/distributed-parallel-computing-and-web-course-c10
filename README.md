@@ -17,7 +17,7 @@
   - База даних: `PostgreSQL 16 Alpine` (реляційна схема з обмеженнями цілісності, контрольованою денормалізацією та версіонованими міграціями SQL з контролем контрольних сум SHA-256).
   - Балансування та мережа: `Nginx 1.27 Alpine` (алгоритм балансування `least_conn`, проксі для Web API, виділений маршрут `/health-app-a`, маршрутизація `/registrations` та черги РПО на `dpc_backend`).
   - Клієнт: `JavaScript ES6+ / HTML5 / CSS3` (без сторонніх бібліотек чи фреймворків, порт 3000).
-  - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (140 тестових випадків: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
+  - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (157 тестових випадків: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
 
 ---
 
@@ -399,11 +399,22 @@ project/
 │               └── EnrollmentRequestProcessor.cs  # Єдиний процесор обробки заявок (безпечний FOR UPDATE та UNSAFE)
 └── tests/
     └── EnrollmentService.Tests/
-        ├── DomainAndQueueTests.cs                 # 23 тестові випадки xUnit (15 [Fact] та 8 [InlineData] у межах [Theory])
+        ├── DomainAndQueueTests.Domain.cs          # 6 модульних тестів предметної області (вікна, ЄКТС, ліміти K, часові пояси)
+        ├── DomainAndQueueTests.Queue.cs           # 3 тести черг (MonitorRequestQueue, слоти, багатопотоковість)
+        ├── DomainAndQueueTests.Metrics.cs         # 13 тестів метрик (курсори, traceparent, Problem Details, закон Літтла, 8 InlineData)
+        ├── DomainAndQueueTests.Workers.cs         # 6 тестів пулу воркерів (BearerAuth, Graceful Shutdown 503, WebEnrollmentNotifier, воркери)
         ├── BusinessErrorStatusTests.cs            # 9 тестів відповідності бізнес-відмов HTTP-статусам (400/404/409/422)
-        ├── FirstReadTimeTrackingTests.cs          # 11 тестів атомарної фіксації t4 first_read_at (усі 8 сценаріїв О1.5 DPC + детермінований тест гонки COMMIT/finish + відкат)
-        ├── RestartAndRecoveryTests.cs             # 9 тестів відновлення queued/processing із PostgreSQL при старті та захисту режимів
-        ├── E2EHttpEndpointTests.cs                # 65 наскрізних E2E HTTP-тестів через WebApplicationFactory і PostgreSQL
+        ├── FirstReadTimeTrackingTests.cs          # 11 тестів атомарної фіксації t4 first_read_at (усі 8 сценаріїв О1.5 DPC + COMMIT/finish + відкат)
+        ├── RestartAndRecoveryTests.Startup.cs     # 3 тести відновлення queued-заявок із PostgreSQL при старті та дозавантаження
+        ├── RestartAndRecoveryTests.Shutdown.cs    # 2 тести Graceful Shutdown (Drain при заповненій БД та зупинка app-b без воркерів)
+        ├── RestartAndRecoveryTests.CrashRecovery.cs # 11 тестів аварійного відновлення (5 станів ідемпотентності, збої до/після коміту, гонитва)
+        ├── E2EHttpEndpointTests.Fixture.cs        # Спільна тестова фікстура WebApplicationFactory, хелпери перевірок та очищення
+        ├── E2EHttpEndpointTests.Enrollment.cs     # 24 наскрізні E2E HTTP-тести Web-контуру (CRUD, вікна, ліміти, скасування, автентифікація)
+        ├── E2EHttpEndpointTests.DpcQueue.cs       # 4 E2E HTTP-тести черги РПО (прийом 202, опитування, пісочниця, реєстрація Web)
+        ├── E2EHttpEndpointTests.Idempotency.cs    # 22 E2E HTTP-тести ідемпотентності (5 станів РПО, дублікати, конфлікти тіла, конкурентність)
+        ├── E2EHttpEndpointTests.JointRegistration.cs # 8 наскрізних E2E-тестів спільного сценарію Web + DPC (held -> confirmed, каскадні зв'язки)
+        ├── E2EHttpEndpointTests.Migrations.cs      # 5 E2E-тестів перевірки схеми та міграцій БД (007, 008, 009, 010)
+        ├── E2EHttpEndpointTests.RepositoryAndWorker.cs # 7 тестів репозиторіїв та воркера (резервне заповнення requested_enrollment_id, хуки, унікальність)
         ├── TestEnvironmentSafetyTests.cs          # 23 тести перевірки ізоляції тестового середовища, створення dpc_c10_test, перевірки SQLSTATE 42501/28P01 та блокування dpc_c10
         ├── TestEnvironment.cs                    # Виділена конфігурація тестового середовища (dpc_c10_test) та очищення даних
         ├── TestCollectionOrder.cs                # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])
@@ -418,7 +429,7 @@ project/
 - **Операційна система**: Windows 10/11 (з WSL2), Ubuntu 22.04+, macOS 13+.
 - **Процесор і ресурси**: $\ge 4$ CPU ядра, не менше 4 ГБ вільної оперативної пам'яті (RAM).
 - **Платформи розробки та виконання**:
-  - **.NET 8.0 SDK** (для збирання проєкту та запуску повного набору xUnit-тестів; поточний набір — 140 тестових випадків).
+  - **.NET 8.0 SDK** (для збирання проєкту та запуску повного набору xUnit-тестів; поточний набір — 157 тестових випадків).
   - **PowerShell 7+ (`pwsh`)** (для кросплатформенного запуску сценарію атестації `verify_all.ps1`).
   - **Node.js 18+ / npm** (для валідації специфікації лінтером `@stoplight/spectral-cli` та локального клієнта).
 - **Контейнеризація**:
@@ -559,7 +570,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 
 | Пункт | Формулювання вимоги | Де реалізовано у коді | Як перевірити автоматично |
 | :--- | :--- | :--- | :--- |
-| **О1.1** | Модель області: сутності, стани (`held -> confirmed / expired / cancelled`), ліміти $K=5$, 30.0 ЄКТС | [EnrollmentPolicy.cs](src/EnrollmentService/Domain/EnrollmentPolicy.cs), [EnrollmentService.cs](src/EnrollmentService/Services/EnrollmentService.cs) | `pwsh scripts/verify_all.ps1` (Етап 10), `DomainAndQueueTests.cs` |
+| **О1.1** | Модель області: сутності, стани (`held -> confirmed / expired / cancelled`), ліміти $K=5$, 30.0 ЄКТС | [EnrollmentPolicy.cs](src/EnrollmentService/Domain/EnrollmentPolicy.cs), [EnrollmentService.cs](src/EnrollmentService/Services/EnrollmentService.cs) | `pwsh scripts/verify_all.ps1` (Етап 10), `DomainAndQueueTests.Domain.cs` |
 | **О1.2** | Схема БД з обмеженнями цілісності: PK/FK, NOT NULL, CHECK, UNIQUE, композитні ключі, версіоновані міграції | [001_init_c10_schema.sql](migrations/001_init_c10_schema.sql), [DatabaseInitializer.cs](src/EnrollmentService/Services/DatabaseInitializer.cs) | `pwsh scripts/verify_all.ps1` (Етапи 0, 10) |
 | **О1.3** | Контракт API OpenAPI 3.1: examples, Problem Details (RFC 9457), лінтування Spectral | [openapi.yaml](openapi.yaml), [ProblemDetailsMapper.cs](src/EnrollmentService/Http/ProblemDetailsMapper.cs) | `npx @stoplight/spectral-cli lint openapi.yaml`, `verify_all.ps1` |
 | **О1.4** | Головна операція: перевірка, декремент місць та створення запису в одній транзакції (201 Created) | [EnrollmentService.cs](src/EnrollmentService/Services/EnrollmentService.cs) (оркестрація бізнес-транзакції), [EnrollmentRepository.cs](src/EnrollmentService/Repositories/EnrollmentRepository.cs) (атомарні SQL-операції `FOR UPDATE`) | `pwsh scripts/verify_all.ps1` (Етап 10) |
@@ -568,7 +579,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | **О1.7** | Клієнт: виконання операцій вибору, показ Problem Details, толерантність до нових полів сервера | [client/api.js](client/api.js), [client/index.html](client/index.html) | Браузер: `http://localhost:3000` |
 | **Д1.1** *(Бонус 1)* | Правило за часом — чиста функція, що отримує поточний час параметром | [EnrollmentDomainRules.cs](src/EnrollmentService/Domain/EnrollmentDomainRules.cs) (`IsWithinEnrollmentWindow`) | `dotnet test` (тест `IsWithinEnrollmentWindow_EnforcesHalfOpenIntervalBoundaries`) |
 | **Д1.2** *(Бонус 2)* | Клієнт іншою мовою програмування (JavaScript ES6+ проти C# сервера) | [client/api.js](client/api.js), [client/index.html](client/index.html) | `pwsh client/start_client.ps1` |
-| **Д1.3** *(Бонус 3)* | Одне правило RFC 9457 у формі автоматизованого тесту | [ProblemDetailsMapper.cs](src/EnrollmentService/Http/ProblemDetailsMapper.cs), [DomainAndQueueTests.cs](tests/EnrollmentService.Tests/DomainAndQueueTests.cs) | `dotnet test` (тест `Web_D13_Rfc9457_ProblemDetails_ContractCompliance`) |
+| **Д1.3** *(Бонус 3)* | Одне правило RFC 9457 у формі автоматизованого тесту | [ProblemDetailsMapper.cs](src/EnrollmentService/Http/ProblemDetailsMapper.cs), [DomainAndQueueTests.Metrics.cs](tests/EnrollmentService.Tests/DomainAndQueueTests.Metrics.cs) | `dotnet test` (тест `Web_D13_Rfc9457_ProblemDetails_ContractCompliance`) |
 | **Д1.4** *(Бонус 4)* | Перевірений traceparent записується в журнал як trace_id | [RequestIdentityMiddleware.cs](src/EnrollmentService/Http/RequestIdentityMiddleware.cs) | `pwsh scripts/verify_all.ps1` (Етап 2: валідація W3C traceparent, виділення trace_id та перевірка в JSON-логах app-a/app-b) |
 | **Д1.5** *(Бонус 5)* | Точні величини й час: дробові кредити ЄКТС (`NUMERIC(3,1)`), UTC `timestamptz`, часовий пояс `Europe/Kyiv` | [EnrollmentDomainRules.cs](src/EnrollmentService/Domain/EnrollmentDomainRules.cs) | `dotnet test` (тест `CanEnrollWithEcts_AllowsExact30AndRejects30Point5`) |
 
@@ -757,6 +768,6 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
   6. **Інфраструктура, тестування та автоматизація**:
      - Конфігурація багатоконтейнерного середовища Docker Compose (вузли `app-a`, `app-b`, `nginx`, `postgres`).
      - Налаштування балансувальника Nginx за алгоритмом `least_conn`.
-     - Написання 140 тестових випадків модульного, інтеграційного та наскрізного E2E-тестування на базі xUnit, що перевіряють бізнес-правила, HTTP API, ідемпотентність, конкурентний доступ до спільних ресурсів, паралельну обробку запитів, міграції бази даних та безпеку тестового середовища.
+     - Написання 157 тестових випадків модульного, інтеграційного та наскрізного E2E-тестування на базі xUnit, що перевіряють бізнес-правила, HTTP API, ідемпотентність, конкурентний доступ до спільних ресурсів, паралельну обробку запитів, міграції бази даних та безпеку тестового середовища.
      - Розробка комплексного автоматизованого сценарію атестації `verify_all.ps1`.
 
