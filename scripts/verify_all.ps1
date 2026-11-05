@@ -207,8 +207,8 @@ if ($total -eq 0) {
 if ($testExit -eq 0 -and
     $failed -eq 0 -and
     $skipped -eq 0 -and
-    $passed -ge 157 -and
-    $total -ge 157) {
+    $passed -ge 184 -and
+    $total -ge 184) {
     Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
     if ($skipped -gt 0) {
@@ -1183,13 +1183,164 @@ try {
         Write-Info "Зафіксовано відповіді від вузлів: $($instancesObserved -join ', ')"
     }
 
+    # --------------------------------------------------------------------------
+    # 11. Пункти ЛР2 курсу Web (О2.1, О2.2, О2.3, О2.4)
+    # --------------------------------------------------------------------------
+    Write-Header "11. Курс «Web» ЛР2: Конкурентність на 2 примірниках (О2.1), ідемпотентність (О2.2), відмова після COMMIT (О2.3) та повтори клієнта (О2.4)"
+
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+
+    # 11.1 Web О2.1: Пряме конкурентне надсилання 45 запитів одночасно на app-a (8001) та app-b (8002) у групу на 25 місць
+    $concGroupId = "22222222-2222-2222-2222-222222222209"
+    $concTotal = 45
+    $concSeats = 25
+    Write-Info "Крок 11.1 (Web О2.1): Надсилання $concTotal одночасних POST /v1/enrollments безпосередньо на app-a (:8001) та app-b (:8002) для групи $concGroupId ($concSeats місць)..."
+
+    $concTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    for ($cIdx = 1; $cIdx -le $concTotal; $cIdx++) {
+        $stConc = "student-web-conc-$("{0:D2}" -f $cIdx)"
+        $targetPort = if ($cIdx % 2 -eq 1) { 8001 } else { 8002 }
+        $reqMsg = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "http://localhost:$targetPort/v1/enrollments")
+        $reqMsg.Headers.Add("X-User-Id", $stConc)
+        $reqMsg.Headers.Add("Idempotency-Key", "idem-conc-o21-$stConc")
+        $reqMsg.Content = [System.Net.Http.StringContent]::new("{`"group_id`":`"$concGroupId`"}", [System.Text.Encoding]::UTF8, "application/json")
+        $concTasks.Add($httpClient.SendAsync($reqMsg))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($concTasks.ToArray())
+
+    $conc201 = 0
+    $conc409 = 0
+    foreach ($ct in $concTasks) {
+        $code = [int]$ct.Result.StatusCode
+        if ($code -eq 201) { $conc201++ }
+        elseif ($code -eq 409) { $conc409++ }
+    }
+
+    $concGroupState = Invoke-RestMethod -Uri "$BaseUrl/v1/group-seats/$concGroupId" -Method Get -Headers $Headers
+    if ($conc201 -eq $concSeats -and $conc409 -eq ($concTotal - $concSeats) -and $concGroupState.taken -eq $concSeats -and $concGroupState.free_seats -eq 0 -and $concGroupState.invariant_holds -eq $true) {
+        Write-Pass "Web О2.1: Із $concTotal одночасних запитів на app-a (:8001) та app-b (:8002) рівно $conc201 отримали 201 Created, $conc409 отримали 409 Conflict (available=0, taken=$($concGroupState.taken)/$($concGroupState.seats), invariant_holds=true)."
+    } else {
+        Write-Fail "Порушення Web О2.1: 201=$conc201, 409=$conc409, taken=$($concGroupState.taken), free=$($concGroupState.free_seats)"
+    }
+
+    # 11.2 Web О2.2: Збережена початкова HTTP-відповідь при повторі Idempotency-Key між app-a та app-b навіть після підтвердження запису
+    $o22Key = "idem-verify-o22-" + [guid]::NewGuid().ToString("N")
+    $o22First = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $o22Key } -Body '{  "group_id" : "DISC-WEB-01"  }'
+    $null = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments/$($o22First.id)/confirm" -Method Post -Headers @{ "X-User-Id" = "student-1" }
+    $o22ReplayOnB = Invoke-RestMethod -Uri "http://localhost:8002/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $o22Key } -Body '{"group_id":"DISC-WEB-01"}'
+
+    if ($o22ReplayOnB.id -eq $o22First.id -and $o22ReplayOnB.status -eq "held" -and $o22ReplayOnB.version -eq 1 -and $o22ReplayOnB.instance_id -eq "app-a") {
+        Write-Pass "Web О2.2: Повтор із тим самим Idempotency-Key на примірнику app-b повернув збережену початкову відповідь (id=$($o22ReplayOnB.id), status='held', version=1, instance_id='app-a')"
+    } else {
+        Write-Fail "Помилка Web О2.2: очікувалася збережена початкова відповідь (held, v1, app-a), отримано status=$($o22ReplayOnB.status), v=$($o22ReplayOnB.version), inst=$($o22ReplayOnB.instance_id)"
+    }
+
+    # 11.3 Web О2.3: Реальне спрацювання /faults/after_commit_before_response у контейнері app-a (FAULTS=on) та повтор через app-b
+    Write-Info "Крок 11.3 (Web О2.3): Запуск app-a та app-b з FAULTS=on і активація прапорця /faults/after_commit_before_response..."
+    $env:FAULTS = "on"
+    $env:ALLOW_TEST_OVERRIDES = "true"
+    & $DockerExe compose up -d --force-recreate app-a app-b | Out-Null
+    & $DockerExe compose restart nginx | Out-Null
+    Remove-Item Env:FAULTS -ErrorAction SilentlyContinue
+    Remove-Item Env:ALLOW_TEST_OVERRIDES -ErrorAction SilentlyContinue
+
+    for ($w = 0; $w -lt 40; $w++) {
+        Start-Sleep -Milliseconds 300
+        try {
+            $ha = Invoke-RestMethod -Uri "http://localhost:8001/health" -Method Get -TimeoutSec 2
+            $hb = Invoke-RestMethod -Uri "http://localhost:8002/health" -Method Get -TimeoutSec 2
+            if ($ha.status -eq "ok" -and $hb.status -eq "ok") { break }
+        } catch {}
+    }
+
+    $faultFileHost = Join-Path $RepoRoot "faults/after_commit_before_response"
+    Set-Content -Path $faultFileHost -Value "1" -Encoding UTF8
+    $faultKey = "idem-verify-o23-" + [guid]::NewGuid().ToString("N")
+    $faultSinceUtc = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    $lostResponseObserved = $false
+    try {
+        $null = Invoke-WebRequest -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "Idempotency-Key" = $faultKey } -Body '{"group_id":"DISC-WEB-01"}' -TimeoutSec 5
+    } catch {
+        $lostResponseObserved = $true
+    }
+
+    Start-Sleep -Milliseconds 500
+    $faultLogs = (& $DockerExe logs --since $faultSinceUtc dpc-c10-api 2>&1) -join "`n"
+    $hasFaultHitLog = $faultLogs -match '"event"\s*:\s*"fault\.hit"' -and $faultLogs -match 'after_commit_before_response'
+    $flagRemoved = -not (Test-Path $faultFileHost)
+
+    # Повтор клієнта з ТИМ САМИМ Idempotency-Key через балансувальник Nginx (який направляє запит на живий app-b)
+    $retryAfterFaultRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "Idempotency-Key" = $faultKey } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $retryAfterFaultBody = (Get-ResponseText $retryAfterFaultRes) | ConvertFrom-Json
+
+    if ($lostResponseObserved -and $hasFaultHitLog -and $flagRemoved -and [int]$retryAfterFaultRes.StatusCode -eq 201 -and $retryAfterFaultBody.student_id -eq "student-2") {
+        Write-Pass "Web О2.3 та О2.4: Перший запит обірвався після COMMIT (event='fault.hit', прапорець видалено), а повтор із тим самим Idempotency-Key через другий примірник повернув збережений 201 Created (id=$($retryAfterFaultBody.id)) без дубля!"
+    } else {
+        Write-Fail "Помилка Web О2.3: lost=$lostResponseObserved, log=$hasFaultHitLog, flagRemoved=$flagRemoved, retryStatus=$([int]$retryAfterFaultRes.StatusCode)"
+    }
+
+    # Відновлюємо контейнер app-a з FAULTS=off
+    $env:FAULTS = "off"
+    $env:ALLOW_TEST_OVERRIDES = "true"
+    & $DockerExe compose up -d --force-recreate app-a app-b | Out-Null
+    & $DockerExe compose restart nginx | Out-Null
+    Remove-Item Env:FAULTS -ErrorAction SilentlyContinue
+    Remove-Item Env:ALLOW_TEST_OVERRIDES -ErrorAction SilentlyContinue
+
+    for ($w = 0; $w -lt 40; $w++) {
+        Start-Sleep -Milliseconds 300
+        try {
+            $ha = Invoke-RestMethod -Uri "http://localhost:8001/health" -Method Get -TimeoutSec 2
+            if ($ha.status -eq "ok") { break }
+        } catch {}
+    }
+
+    # --------------------------------------------------------------------------
+    # 12. Пункти ЛР2 курсу РПО (О2.1, О2.2, О2.3, О2.4): POST /v1/compute
+    # --------------------------------------------------------------------------
+    Write-Header "12. Курс «РПО» ЛР2: Паралельне чисельне інтегрування POST /v1/compute (О2.1–О2.4)"
+
+    $dpcBaseUrl = "http://localhost:8000"
+
+    # 12.1 О2.1 та О2.2: Перевірка точності методу трапецій при n та 2n і збігу з аналітичним інтегралом на 1, 2, 4 процесах
+    $compN1 = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":1000,"workers":2,"method":"trapezoid","order":"natural","mode":"local"}'
+    $compN2 = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000,"workers":2,"method":"trapezoid","order":"natural","mode":"local"}'
+    $errRatio = $compN1.abs_error / $compN2.abs_error
+
+    if ($errRatio -ge 3.9 -and $errRatio -le 4.1 -and $compN2.abs_error -lt $compN1.abs_error) {
+        Write-Pass "РПО О2.2: При подвоєнні n (1000 -> 2000) абсолютна похибка зменшилася у $([Math]::Round($errRatio, 4)) раза (порядок точності O(h^2))."
+    } else {
+        Write-Fail "Помилка перевірки порядку точності РПО О2.2: ratio=$errRatio"
+    }
+
+    foreach ($wCount in @(1, 2, 4)) {
+        $cRes = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body "{`"a`":0.0,`"b`":60.0,`"n`":200000,`"workers`":$wCount,`"method`":`"trapezoid`",`"order`":`"natural`",`"mode`":`"local`"}"
+        if ($cRes.abs_error -le 1.0e-6 -and $cRes.workers -eq $wCount) {
+            Write-Pass "РПО О2.1 (workers=$wCount): value=$([Math]::Round($cRes.value, 8)), reference=$([Math]::Round($cRes.reference, 8)), abs_error=$($cRes.abs_error.ToString('E3')) <= 1e-6, wall_s=$([Math]::Round($cRes.wall_s, 4))s"
+        } else {
+            Write-Fail "Помилка РПО О2.1 для workers=${wCount}: abs_error=$($cRes.abs_error)"
+        }
+    }
+
+    # 12.2 О2.4: Порівняння режимів none, lock, local на 4 процесах
+    $cNone = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"none"}'
+    $cLock = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"lock"}'
+    $cLocal = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"local"}'
+
+    if ($cLocal.abs_error -le 1.0e-6 -and $cLock.abs_error -le 1.0e-6 -and $cNone.abs_error -gt 1.0) {
+        Write-Pass "РПО О2.4 (workers=4): local (abs_err=$($cLocal.abs_error.ToString('E2')), wall=$($cLocal.wall_s.ToString('F3'))s) та lock (abs_err=$($cLock.abs_error.ToString('E2')), wall=$($cLock.wall_s.ToString('F3'))s) точні, а none демонструє втрату оновлень (value=$([Math]::Round($cNone.value, 2)) замість $([Math]::Round($cNone.reference, 2)), abs_err=$([Math]::Round($cNone.abs_error, 2)))."
+    } else {
+        Write-Fail "Помилка РПО О2.4: local_err=$($cLocal.abs_error), lock_err=$($cLock.abs_error), none_err=$($cNone.abs_error)"
+    }
+
 } finally {
     Write-Info "Повернення середовища у штатно-захищений режим ALLOW_TEST_OVERRIDES=false..."
     $null = Set-TestOverridesMode -enable $false
     Write-Pass "Захищений режим ALLOW_TEST_OVERRIDES=false успішно відновлено."
 }
 
-Write-Header "РЕЗУЛЬТАТ ПЕРЕВІРКИ ЛР1"
+Write-Header "РЕЗУЛЬТАТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1 + ЛР2"
 if ($script:ErrorCount -eq 0) {
     Write-Host "`n  Всі перевірки пройдено успішно (0 помилок).`n" -ForegroundColor Green
 } else {

@@ -1,8 +1,43 @@
+using System.Text.Json;
 using EnrollmentService.Domain;
 using EnrollmentService.Services;
 using Npgsql;
 
 namespace EnrollmentService.Repositories;
+
+public sealed record WebIdempotencyRecord(
+    Guid EnrollmentId,
+    string StudentId,
+    string Operation,
+    string State,
+    string? RequestPayloadHash,
+    int ResponseStatus,
+    string? ResponseBodyJson,
+    string? ResponseLocation,
+    DateTimeOffset? IdempotencyExpiresAt,
+    WebEnrollmentResponseDto FallbackEnrollment)
+{
+    public WebEnrollmentResponseDto GetSavedOrFallbackResponse()
+    {
+        if (!string.IsNullOrWhiteSpace(ResponseBodyJson))
+        {
+            try
+            {
+                var saved = JsonSerializer.Deserialize<WebEnrollmentResponseDto>(ResponseBodyJson);
+                if (saved != null)
+                {
+                    return saved;
+                }
+            }
+            catch
+            {
+                // Якщо збережений JSON пошкоджений, повертаємо реконструйоване представлення
+            }
+        }
+
+        return FallbackEnrollment;
+    }
+}
 
 public sealed class EnrollmentRepository
 {
@@ -434,7 +469,37 @@ public sealed class EnrollmentRepository
         return MapEnrollment(reader);
     }
 
-    public async Task<(WebEnrollmentResponseDto Enrollment, string? RequestPayloadHash, string StudentId)?> GetEnrollmentByIdempotencyKeyAsync(
+    public async Task<bool> TryAcquireIdempotencyKeyLockAsync(
+        string idempotencyKey,
+        NpgsqlConnection conn,
+        NpgsqlTransaction tx,
+        int maxWaitMs = 150,
+        CancellationToken cancellationToken = default)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            await using var cmd = new NpgsqlCommand(
+                "SELECT pg_try_advisory_xact_lock(202610, hashtext(@idempotencyKey));",
+                conn,
+                tx);
+            cmd.Parameters.AddWithValue("idempotencyKey", idempotencyKey);
+            var res = await cmd.ExecuteScalarAsync(cancellationToken);
+            if (res is true)
+            {
+                return true;
+            }
+
+            if (sw.ElapsedMilliseconds >= maxWaitMs)
+            {
+                return false;
+            }
+
+            await Task.Delay(15, cancellationToken);
+        }
+    }
+
+    public async Task<WebIdempotencyRecord?> GetIdempotencyRecordByKeyAsync(
         string idempotencyKey,
         NpgsqlConnection conn,
         NpgsqlTransaction? tx = null,
@@ -443,7 +508,9 @@ public sealed class EnrollmentRepository
         await using var cmd = new NpgsqlCommand(@"
             SELECT e.id, e.student_id, e.group_id, e.discipline_id, d.title, d.ects,
                    e.status, e.version, e.created_at, e.expires_at, g.university_tz,
-                   e.request_payload_hash
+                   e.request_payload_hash, e.idempotency_operation, e.idempotency_state,
+                   e.idempotency_response_status, e.idempotency_response_body,
+                   e.idempotency_response_location, e.idempotency_expires_at
             FROM enrollment e
             JOIN discipline d ON d.id = e.discipline_id
             JOIN discipline_group g ON g.id = e.group_id
@@ -456,10 +523,91 @@ public sealed class EnrollmentRepository
             return null;
         }
 
-        var dto = MapEnrollment(reader);
-        string? hash = reader.IsDBNull(11) ? null : reader.GetString(11);
+        var fallbackDto = MapEnrollment(reader);
+        Guid rowId = reader.GetGuid(0);
         string sId = reader.GetString(1);
-        return (dto, hash, sId);
+        string? hash = reader.IsDBNull(11) ? null : reader.GetString(11);
+        string op = reader.IsDBNull(12) ? EnrollmentDomainRules.CreateEnrollmentOperation : reader.GetString(12);
+        string state = reader.IsDBNull(13) ? "completed" : reader.GetString(13);
+        int respStatus = reader.IsDBNull(14) ? 201 : reader.GetInt32(14);
+        string? respBody = reader.IsDBNull(15) ? null : reader.GetString(15);
+        string? respLoc = reader.IsDBNull(16) ? $"/v1/enrollments/{rowId:D}" : reader.GetString(16);
+        DateTimeOffset? idemExpiresAt = reader.IsDBNull(17)
+            ? null
+            : reader.GetFieldValue<DateTimeOffset>(17);
+
+        return new WebIdempotencyRecord(
+            rowId,
+            sId,
+            op,
+            state,
+            hash,
+            respStatus,
+            respBody,
+            respLoc,
+            idemExpiresAt,
+            fallbackDto);
+    }
+
+    public async Task<(WebEnrollmentResponseDto Enrollment, string? RequestPayloadHash, string StudentId)?> GetEnrollmentByIdempotencyKeyAsync(
+        string idempotencyKey,
+        NpgsqlConnection conn,
+        NpgsqlTransaction? tx = null,
+        CancellationToken cancellationToken = default)
+    {
+        var record = await GetIdempotencyRecordByKeyAsync(idempotencyKey, conn, tx, cancellationToken);
+        if (record == null)
+        {
+            return null;
+        }
+
+        return (record.GetSavedOrFallbackResponse(), record.RequestPayloadHash, record.StudentId);
+    }
+
+    public async Task ClearExpiredIdempotencyKeyOnEnrollmentAsync(
+        Guid enrollmentId,
+        NpgsqlConnection conn,
+        NpgsqlTransaction tx,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE enrollment
+            SET idempotency_key = NULL,
+                request_payload_hash = NULL,
+                idempotency_response_body = NULL,
+                idempotency_response_location = NULL,
+                idempotency_expires_at = NULL
+            WHERE id = @id;", conn, tx);
+        cmd.Parameters.AddWithValue("id", enrollmentId);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<int> CleanupExpiredIdempotencyKeysBatchAsync(
+        int batchSize = 100,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(@"
+            WITH expired_batch AS (
+                SELECT id
+                FROM enrollment
+                WHERE idempotency_key IS NOT NULL
+                  AND idempotency_expires_at IS NOT NULL
+                  AND idempotency_expires_at < NOW()
+                ORDER BY idempotency_expires_at ASC
+                LIMIT @batchSize
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE enrollment e
+            SET idempotency_key = NULL,
+                request_payload_hash = NULL,
+                idempotency_response_body = NULL,
+                idempotency_response_location = NULL,
+                idempotency_expires_at = NULL
+            FROM expired_batch b
+            WHERE e.id = b.id;", conn);
+        cmd.Parameters.AddWithValue("batchSize", Math.Max(1, batchSize));
+        return await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task CreateEnrollmentAsync(
@@ -475,15 +623,25 @@ public sealed class EnrollmentRepository
         string? requestPayloadHash,
         NpgsqlConnection conn,
         NpgsqlTransaction tx,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string idempotencyOperation = EnrollmentDomainRules.CreateEnrollmentOperation,
+        string idempotencyState = "completed",
+        int idempotencyResponseStatus = 201,
+        string? idempotencyResponseBody = null,
+        string? idempotencyResponseLocation = null,
+        DateTimeOffset? idempotencyExpiresAt = null)
     {
         await using var cmd = new NpgsqlCommand(@"
             INSERT INTO enrollment (
                 id, student_id, group_id, discipline_id, status, version, created_at, expires_at,
-                idempotency_key, request_payload_hash
+                idempotency_key, request_payload_hash,
+                idempotency_operation, idempotency_state, idempotency_response_status,
+                idempotency_response_body, idempotency_response_location, idempotency_expires_at
             ) VALUES (
                 @id, @studentId, @groupId, @disciplineId, @status, @version, @createdAt, @expiresAt,
-                @idempotencyKey, @payloadHash
+                @idempotencyKey, @payloadHash,
+                @idempotencyOperation, @idempotencyState, @idempotencyResponseStatus,
+                @idempotencyResponseBody, @idempotencyResponseLocation, @idempotencyExpiresAt
             );", conn, tx);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("studentId", studentId);
@@ -500,6 +658,21 @@ public sealed class EnrollmentRepository
         cmd.Parameters.Add(new NpgsqlParameter("payloadHash", NpgsqlTypes.NpgsqlDbType.Text)
         {
             Value = (object?)requestPayloadHash ?? DBNull.Value
+        });
+        cmd.Parameters.AddWithValue("idempotencyOperation", idempotencyOperation);
+        cmd.Parameters.AddWithValue("idempotencyState", idempotencyState);
+        cmd.Parameters.AddWithValue("idempotencyResponseStatus", idempotencyResponseStatus);
+        cmd.Parameters.Add(new NpgsqlParameter("idempotencyResponseBody", NpgsqlTypes.NpgsqlDbType.Text)
+        {
+            Value = (object?)idempotencyResponseBody ?? DBNull.Value
+        });
+        cmd.Parameters.Add(new NpgsqlParameter("idempotencyResponseLocation", NpgsqlTypes.NpgsqlDbType.Text)
+        {
+            Value = (object?)idempotencyResponseLocation ?? DBNull.Value
+        });
+        cmd.Parameters.Add(new NpgsqlParameter("idempotencyExpiresAt", NpgsqlTypes.NpgsqlDbType.TimestampTz)
+        {
+            Value = idempotencyExpiresAt.HasValue ? idempotencyExpiresAt.Value : DBNull.Value
         });
 
         await cmd.ExecuteNonQueryAsync(cancellationToken);

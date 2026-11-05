@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using EnrollmentService.Domain;
 using EnrollmentService.Repositories;
 using Npgsql;
@@ -44,27 +45,49 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
         }
 
         string groupId = dto.GroupId.Trim();
-        string payloadFingerprint = $"{studentId}:{groupId}";
+        string payloadFingerprint = EnrollmentDomainRules.ComputeWebEnrollmentFingerprint(
+            studentId,
+            groupId,
+            EnrollmentDomainRules.CreateEnrollmentOperation);
 
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
 
-        // О2.2 / О1.4 Web: перевірка повторного надсилання з тим самим Idempotency-Key
+        // О2.2 / О1.4 Web: швидка перевірка повторного надсилання з тим самим Idempotency-Key (для вже завершених і не прострочених ключів)
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
         {
-            var existing = await _enrollmentRepo.GetEnrollmentByIdempotencyKeyAsync(idempotencyKey, conn, null, cancellationToken);
+            var existing = await _enrollmentRepo.GetIdempotencyRecordByKeyAsync(idempotencyKey, conn, null, cancellationToken);
             if (existing != null)
             {
-                if (!string.Equals(existing.Value.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                    !string.Equals(existing.Value.StudentId, studentId, StringComparison.Ordinal))
-                {
-                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                        StatusCodes.Status422UnprocessableEntity,
-                        "idempotency_key_payload_mismatch",
-                        "Невідповідність корисного навантаження ключа ідемпотентності",
-                        "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
-                }
+                bool isExpired = existing.IdempotencyExpiresAt.HasValue
+                    && existing.IdempotencyExpiresAt.Value <= DateTimeOffset.UtcNow;
 
-                return ServiceResult<WebEnrollmentResponseDto>.Ok(existing.Value.Enrollment);
+                if (!isExpired)
+                {
+                    if (string.Equals(existing.State, "processing", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                            StatusCodes.Status409Conflict,
+                            "idempotency_key_in_progress",
+                            "Операція за цим ключем ідемпотентності вже виконується",
+                            "Запит із вказаним Idempotency-Key наразі перебуває в стані обробки (processing). Повторіть спробу пізніше.");
+                    }
+
+                    if (!EnrollmentDomainRules.IsMatchingWebEnrollmentFingerprint(
+                            existing.RequestPayloadHash,
+                            existing.StudentId,
+                            existing.Operation,
+                            studentId,
+                            groupId))
+                    {
+                        return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                            StatusCodes.Status422UnprocessableEntity,
+                            "idempotency_key_payload_mismatch",
+                            "Невідповідність корисного навантаження ключа ідемпотентності",
+                            "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
+                    }
+
+                    return ServiceResult<WebEnrollmentResponseDto>.Ok(existing.GetSavedOrFallbackResponse());
+                }
             }
         }
 
@@ -72,6 +95,73 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
 
         try
         {
+            // О2.2: Транзакційна синхронізація за Idempotency-Key між примірниками app-a та app-b.
+            // Якщо інша транзакція вже утримує блокування на цей ключ понад вікно очікування або запис у стані 'processing', повертаємо 409.
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                bool keyLockAcquired = await _enrollmentRepo.TryAcquireIdempotencyKeyLockAsync(
+                    idempotencyKey,
+                    conn,
+                    tx,
+                    maxWaitMs: 150,
+                    cancellationToken: cancellationToken);
+
+                if (!keyLockAcquired)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                        StatusCodes.Status409Conflict,
+                        "idempotency_key_in_progress",
+                        "Операція за цим ключем ідемпотентності вже виконується",
+                        "Запит із вказаним Idempotency-Key наразі обробляється паралельною транзакцією. Повторіть спробу пізніше.");
+                }
+
+                var existingInTx = await _enrollmentRepo.GetIdempotencyRecordByKeyAsync(idempotencyKey, conn, tx, cancellationToken);
+                if (existingInTx != null)
+                {
+                    bool isExpiredInTx = existingInTx.IdempotencyExpiresAt.HasValue
+                        && existingInTx.IdempotencyExpiresAt.Value <= DateTimeOffset.UtcNow;
+
+                    if (isExpiredInTx)
+                    {
+                        await _enrollmentRepo.ClearExpiredIdempotencyKeyOnEnrollmentAsync(
+                            existingInTx.EnrollmentId,
+                            conn,
+                            tx,
+                            cancellationToken);
+                    }
+                    else
+                    {
+                        await tx.RollbackAsync(cancellationToken);
+
+                        if (string.Equals(existingInTx.State, "processing", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                                StatusCodes.Status409Conflict,
+                                "idempotency_key_in_progress",
+                                "Операція за цим ключем ідемпотентності вже виконується",
+                                "Запит із вказаним Idempotency-Key наразі перебуває в стані обробки (processing). Повторіть спробу пізніше.");
+                        }
+
+                        if (!EnrollmentDomainRules.IsMatchingWebEnrollmentFingerprint(
+                                existingInTx.RequestPayloadHash,
+                                existingInTx.StudentId,
+                                existingInTx.Operation,
+                                studentId,
+                                groupId))
+                        {
+                            return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                                StatusCodes.Status422UnprocessableEntity,
+                                "idempotency_key_payload_mismatch",
+                                "Невідповідність корисного навантаження ключа ідемпотентності",
+                                "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
+                        }
+
+                        return ServiceResult<WebEnrollmentResponseDto>.Ok(existingInTx.GetSavedOrFallbackResponse());
+                    }
+                }
+            }
+
             var student = await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
             if (student == null)
             {
@@ -99,27 +189,6 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
             string disciplineTitle = groupWithDisc.Value.DisciplineTitle;
             decimal disciplineEcts = groupWithDisc.Value.DisciplineEcts;
 
-            // Повторна перевірка ідемпотентності під транзакційним блокуванням (на випадок конкурентного надсилання)
-            if (!string.IsNullOrWhiteSpace(idempotencyKey))
-            {
-                var existingInTx = await _enrollmentRepo.GetEnrollmentByIdempotencyKeyAsync(idempotencyKey, conn, tx, cancellationToken);
-                if (existingInTx != null)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    if (!string.Equals(existingInTx.Value.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                        !string.Equals(existingInTx.Value.StudentId, studentId, StringComparison.Ordinal))
-                    {
-                        return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                            StatusCodes.Status422UnprocessableEntity,
-                            "idempotency_key_payload_mismatch",
-                            "Невідповідність корисного навантаження ключа ідемпотентності",
-                            "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
-                    }
-
-                    return ServiceResult<WebEnrollmentResponseDto>.Ok(existingInTx.Value.Enrollment);
-                }
-            }
-
             bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(studentId, disciplineId, conn, tx, cancellationToken);
 
             // Фіксуємо точний час безпосередньо перед перевіркою правил після отримання блокувань студента і групи
@@ -138,7 +207,7 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
             var enrollmentId = Guid.NewGuid();
             var expiresAtUtc = nowUtc.AddMinutes(15);
 
-            // П. 2: Перевірка результату декременту available
+            // П. 2 (О2.1): Атомарне умовне зменшення available у межах транзакції PostgreSQL
             bool decremented = await _groupRepo.DecrementAvailableAsync(groupId, conn, tx, cancellationToken);
             if (!decremented)
             {
@@ -151,23 +220,6 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
             }
 
             await _enrollmentRepo.UpdateStudentStatsAsync(studentId, +1, disciplineEcts, conn, tx, cancellationToken);
-
-            await _enrollmentRepo.CreateEnrollmentAsync(
-                enrollmentId,
-                studentId,
-                groupId,
-                disciplineId,
-                "held",
-                1,
-                nowUtc,
-                expiresAtUtc,
-                idempotencyKey,
-                payloadFingerprint,
-                conn,
-                tx,
-                cancellationToken);
-
-            await tx.CommitAsync(cancellationToken);
 
             var responseDto = new WebEnrollmentResponseDto(
                 enrollmentId.ToString("D"),
@@ -185,16 +237,65 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                 group.UniversityTz,
                 _options.InstanceId);
 
+            string? savedResponseJson = !string.IsNullOrWhiteSpace(idempotencyKey)
+                ? JsonSerializer.Serialize(responseDto)
+                : null;
+            string? savedLocation = !string.IsNullOrWhiteSpace(idempotencyKey)
+                ? $"/v1/enrollments/{enrollmentId:D}"
+                : null;
+            DateTimeOffset? idempotencyExpiresAt = !string.IsNullOrWhiteSpace(idempotencyKey)
+                ? nowUtc.AddMinutes(Math.Max(1, _options.IdempotencyKeyTtlMinutes))
+                : null;
+
+            await _enrollmentRepo.CreateEnrollmentAsync(
+                enrollmentId,
+                studentId,
+                groupId,
+                disciplineId,
+                "held",
+                1,
+                nowUtc,
+                expiresAtUtc,
+                idempotencyKey,
+                !string.IsNullOrWhiteSpace(idempotencyKey) ? payloadFingerprint : null,
+                conn,
+                tx,
+                cancellationToken,
+                EnrollmentDomainRules.CreateEnrollmentOperation,
+                "completed",
+                StatusCodes.Status201Created,
+                savedResponseJson,
+                savedLocation,
+                idempotencyExpiresAt);
+
+            await tx.CommitAsync(cancellationToken);
+
+            // О2.3: Контрольована відмова після COMMIT, але до відправлення HTTP-відповіді клієнту
+            FaultInjector.MaybeTriggerAfterCommitBeforeResponse(_options, enrollmentId, studentId, idempotencyKey);
+
             return ServiceResult<WebEnrollmentResponseDto>.Ok(responseDto);
         }
         catch (PostgresException pex) when (pex.SqlState == "23505" && !string.IsNullOrWhiteSpace(idempotencyKey))
         {
             await tx.RollbackAsync(cancellationToken);
-            var existing = await _enrollmentRepo.GetEnrollmentByIdempotencyKeyAsync(idempotencyKey, conn, null, cancellationToken);
+            var existing = await _enrollmentRepo.GetIdempotencyRecordByKeyAsync(idempotencyKey, conn, null, cancellationToken);
             if (existing != null)
             {
-                if (!string.Equals(existing.Value.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                    !string.Equals(existing.Value.StudentId, studentId, StringComparison.Ordinal))
+                if (string.Equals(existing.State, "processing", StringComparison.OrdinalIgnoreCase))
+                {
+                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                        StatusCodes.Status409Conflict,
+                        "idempotency_key_in_progress",
+                        "Операція за цим ключем ідемпотентності вже виконується",
+                        "Запит із вказаним Idempotency-Key наразі перебуває в стані обробки (processing). Повторіть спробу пізніше.");
+                }
+
+                if (!EnrollmentDomainRules.IsMatchingWebEnrollmentFingerprint(
+                        existing.RequestPayloadHash,
+                        existing.StudentId,
+                        existing.Operation,
+                        studentId,
+                        groupId))
                 {
                     return ServiceResult<WebEnrollmentResponseDto>.Failure(
                         StatusCodes.Status422UnprocessableEntity,
@@ -203,7 +304,7 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                         "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
                 }
 
-                return ServiceResult<WebEnrollmentResponseDto>.Ok(existing.Value.Enrollment);
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(existing.GetSavedOrFallbackResponse());
             }
             throw;
         }
@@ -754,5 +855,16 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
         }
 
         return ServiceResult<WebDisciplineListResponseDto>.Ok(new WebDisciplineListResponseDto(disciplineDtos, nextCursor));
+    }
+
+    // О2.2: Пакетне очищення прострочених ключів ідемпотентності невеликими порціями (FOR UPDATE SKIP LOCKED)
+    public Task<int> CleanupExpiredIdempotencyKeysAsync(
+        int? batchSize = null,
+        CancellationToken cancellationToken = default)
+    {
+        int effectiveBatch = batchSize.HasValue && batchSize.Value > 0
+            ? batchSize.Value
+            : Math.Max(1, _options.IdempotencyCleanupBatchSize);
+        return _enrollmentRepo.CleanupExpiredIdempotencyKeysBatchAsync(effectiveBatch, cancellationToken);
     }
 }

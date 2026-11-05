@@ -4,6 +4,16 @@ using EnrollmentService.Endpoints;
 using EnrollmentService.Extensions;
 using EnrollmentService.Http;
 using EnrollmentService.Services;
+using EnrollmentService.Services.Compute;
+
+// РПО ЛР2 (О2.1, О2.4): Якщо процес запущено як дочірній воркер обчислення інтеграла (--compute-worker),
+// виконуємо чисельне інтегрування на виділеному піддіапазоні та завершуємо процес без старту веб-сервера Kestrel.
+if (args.Length > 0 && string.Equals(args[0], ComputeWorkerProcess.WorkerArgFlag, StringComparison.Ordinal))
+{
+    int exitCode = ComputeWorkerProcess.Run(args);
+    Environment.Exit(exitCode);
+    return;
+}
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -125,6 +135,7 @@ app.MapEnrollmentEndpoints();
 app.MapEnrollmentRequestEndpoints();
 app.MapGroupEndpoints();
 app.MapAdminEndpoints();
+app.MapComputeEndpoints();
 
 app.Run();
 

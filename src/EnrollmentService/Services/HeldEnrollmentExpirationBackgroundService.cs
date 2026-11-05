@@ -30,6 +30,9 @@ public sealed class HeldEnrollmentExpirationBackgroundService : BackgroundServic
                 await timer.WaitForNextTickAsync(stoppingToken);
                 await _enrollmentService.ReconcilePendingRosterConfirmationsAsync(stoppingToken);
                 await _repo.ExpireStaleHeldEnrollmentsAsync(stoppingToken);
+                await _enrollmentService.CleanupExpiredIdempotencyKeysAsync(
+                    _options.IdempotencyCleanupBatchSize,
+                    stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

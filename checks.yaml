@@ -1,4 +1,4 @@
-# Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1)
+# Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1 + ЛР2)
 # Створено суворо на основі joint/checks-template.yaml та специфікацій checks.example.yaml обох курсів.
 
 # ==============================================================================
@@ -11,6 +11,8 @@ web:
     - О1.5   # Список із курсором (GET /v1/enrollments?limit=...&cursor=...)
     - О1.6   # Система, /health, журнал JSON
     - Д1.4   # traceparent -> trace_id у структурованому журналі JSON
+    - О2.3   # Повтор після втраченої відповіді (/faults/after_commit_before_response)
+    - О2.4   # Повторні спроби в клієнті (exponential backoff + jitter + Retry-After)
   instances:
     app-a: "http://localhost:8001"
     app-b: "http://localhost:8002"
@@ -35,6 +37,7 @@ dpc:
   items:
     - О1.5   # Час виконання, перцентилі p50/p95/p99 та метрики черги Літтла
     - Д1.4   # Graceful Shutdown (SIGTERM) із вивантаженням повної черги
+    - О2.2   # Дослідження точності чисельного інтегрування (n та 2n)
   services:
     api: app-a
     postgres: postgres
@@ -46,6 +49,12 @@ dpc:
     - queue_length
     - in_flight
     - rejected
+  compute:
+    tolerance: 1.0e-6
+    bench_n: 250000000
+    modes:
+      param: mode
+      values: [none, lock, local]
 
 # ==============================================================================
 # Спільний сценарій наскрізної перевірки взаємодії двох контурів (Scenario)

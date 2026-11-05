@@ -2,6 +2,7 @@ using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
 using EnrollmentService.Services;
+using EnrollmentService.Services.Compute;
 using EnrollmentService.Services.Processing;
 
 namespace EnrollmentService.Extensions;
@@ -46,6 +47,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<EnrollmentService.Services.EnrollmentService>();
         services.AddSingleton<IWebEnrollmentConfirmationService>(sp => sp.GetRequiredService<EnrollmentService.Services.EnrollmentService>());
         services.AddSingleton<IWebEnrollmentNotifier, WebEnrollmentNotifier>();
+        services.AddSingleton<ParallelComputeService>();
         return services;
     }
 

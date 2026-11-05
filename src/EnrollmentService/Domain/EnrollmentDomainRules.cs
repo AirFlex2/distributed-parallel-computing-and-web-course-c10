@@ -1,13 +1,64 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
 namespace EnrollmentService.Services;
 
-// Чисті функції предметної області для курсу «Обмін даними у Web-застосунках» (О1.1, О1.5, Д1.1, Д1.4, Д1.5)
+// Чисті функції предметної області для курсу «Обмін даними у Web-застосунках» (О1.1, О1.5, Д1.1, Д1.4, Д1.5, О2.2)
 public static partial class EnrollmentDomainRules
 {
     public const decimal MaxSemesterEcts = 30.0m;
+    public const string CreateEnrollmentOperation = "POST /v1/enrollments";
+
+    // О2.2: Обчислення канонічного відбитка (SHA-256) нормалізованого тіла запиту та контексту ідемпотентної операції.
+    // Порядок ключів у вхідному JSON або пробіли не впливають на відбиток, оскільки канонічне представлення
+    // будується з нормалізованих предметних полів (користувач, операція, group_id).
+    public static string ComputeWebEnrollmentFingerprint(
+        string? studentId,
+        string? groupId,
+        string? operation = CreateEnrollmentOperation)
+    {
+        string normStudent = (studentId ?? string.Empty).Trim();
+        string normGroup = (groupId ?? string.Empty).Trim();
+        string normOp = (operation ?? CreateEnrollmentOperation).Trim();
+        string canonical = $"c10-idem-v2|op={normOp}|student_id={normStudent}|group_id={normGroup}";
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
+        return $"sha256:{Convert.ToHexString(hash).ToLowerInvariant()}";
+    }
+
+    // О2.2: Перевірка збігу збереженого відбитка запиту із поточними нормалізованими параметрами
+    public static bool IsMatchingWebEnrollmentFingerprint(
+        string? storedHash,
+        string? storedStudentId,
+        string? storedOperation,
+        string currentStudentId,
+        string currentGroupId,
+        string currentOperation = CreateEnrollmentOperation)
+    {
+        if (!string.Equals(storedStudentId?.Trim(), currentStudentId?.Trim(), StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        string effectiveStoredOp = string.IsNullOrWhiteSpace(storedOperation)
+            ? CreateEnrollmentOperation
+            : storedOperation.Trim();
+        if (!string.Equals(effectiveStoredOp, currentOperation.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        string expectedFingerprint = ComputeWebEnrollmentFingerprint(currentStudentId, currentGroupId, currentOperation);
+        if (string.Equals(storedHash, expectedFingerprint, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Зворотна сумісність із записами ЛР1 форматів "{studentId}:{groupId}"
+        string legacyHash = $"{currentStudentId?.Trim()}:{currentGroupId?.Trim()}";
+        return string.Equals(storedHash, legacyHash, StringComparison.Ordinal);
+    }
 
     // Д1.1 та Д1.5: Чиста функція перевірки часового вікна запису [opens_at, closes_at).
     // Поточний час now передається параметром (без звернення до системного годинника всередині функції).

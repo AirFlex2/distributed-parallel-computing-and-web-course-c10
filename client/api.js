@@ -188,61 +188,191 @@ async function loadWebDisciplines() {
     }
 }
 
-// Головна операція (О1.4, О1.7): POST /v1/enrollments із відображенням 201 Created або Problem Details
-async function createWebEnrollment(overrideGroupId = null, overrideStudentId = null) {
-    const groupId = overrideGroupId || document.getElementById('webGroupIdSelect').value;
-    const headers = getAuthHeaders();
-    if (overrideStudentId) {
-        headers['X-User-Id'] = overrideStudentId;
+// Web О2.4: Політика повторних спроб клієнта для POST /v1/enrollments
+const WEB_ENROLLMENT_RETRY_POLICY = {
+    maxAttempts: 4,      // 1 початкова спроба + до 3 повторів
+    baseDelayMs: 200,    // початкова затримка експоненційного відступу
+    maxDelayMs: 2500,    // верхня межа експоненційного відступу
+    totalBudgetMs: 8000  // загальний бюджет часу на логічну операцію
+};
+
+function generateWebIdempotencyKey() {
+    const rand = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+        ? crypto.randomUUID()
+        : `${Math.random().toString(36).slice(2)}-${Date.now()}`;
+    return `idem-web-${Date.now()}-${rand}`;
+}
+
+function parseRetryAfterMs(retryAfterHeader, nowMs = Date.now()) {
+    if (!retryAfterHeader) {
+        return 0;
     }
+    const trimmed = String(retryAfterHeader).trim();
+    if (!trimmed) {
+        return 0;
+    }
+    const seconds = Number(trimmed);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.ceil(seconds * 1000);
+    }
+    const parsedDateMs = Date.parse(trimmed);
+    if (!Number.isNaN(parsedDateMs)) {
+        return Math.max(0, parsedDateMs - nowMs);
+    }
+    return 0;
+}
 
+function computeWebRetryDelayMs(attemptNumber, retryAfterHeader = null, policy = WEB_ENROLLMENT_RETRY_POLICY) {
+    const expDelay = Math.min(policy.maxDelayMs, policy.baseDelayMs * Math.pow(2, Math.max(0, attemptNumber - 1)));
+    const jitter = Math.floor(Math.random() * policy.baseDelayMs);
+    const computedBackoffWithJitter = expDelay + jitter;
+    const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
+    // О2.4: Фактична пауза ніколи не менша за значення заголовка Retry-After
+    return Math.max(computedBackoffWithJitter, retryAfterMs);
+}
+
+function isRetryableWebEnrollmentResponse(status, errorBody) {
+    // 429 Too Many Requests та тимчасова недоступність 503 Service Unavailable (або 502/504 від шлюзу при аварії вузла О2.3)
+    if (status === 429 || status === 503 || status === 502 || status === 504) {
+        return true;
+    }
+    // 409 Conflict повторюється ТІЛЬКИ якщо ключ ідемпотентності ще обробляється (idempotency_key_in_progress).
+    // Предметні конфлікти (group_full, duplicate_discipline_enrollment тощо) та постійні помилки (400, 401, 403, 404, 422) НЕ повторюються!
+    if (status === 409) {
+        const errorCode = errorBody && typeof errorBody.error_code === 'string'
+            ? errorBody.error_code
+            : '';
+        return errorCode === 'idempotency_key_in_progress' || errorCode === 'concurrency_conflict';
+    }
+    return false;
+}
+
+function sleepMs(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Головна операція (О1.4, О1.7, О2.2, О2.4): POST /v1/enrollments із Idempotency-Key,
+// повторними спробами (exponential backoff + jitter + Retry-After) та захистом від хибного успіху («Результат невідомий»).
+async function createWebEnrollment(overrideGroupId = null, overrideStudentId = null, customOptions = {}) {
+    const groupId = overrideGroupId !== null
+        ? overrideGroupId
+        : document.getElementById('webGroupIdSelect').value;
+
+    // Один логічний запит генерує один Idempotency-Key і зберігає те саме тіло у всіх повторних спробах
+    const idempotencyKey = customOptions.idempotencyKey || generateWebIdempotencyKey();
     const payload = { group_id: groupId };
+    const serializedBody = JSON.stringify(payload);
 
-    try {
-        const res = await fetch(`${getApiBase()}/v1/enrollments`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(payload)
-        });
+    const policy = {
+        ...WEB_ENROLLMENT_RETRY_POLICY,
+        ...(customOptions.retryPolicy || {})
+    };
+    const fetchFn = customOptions.fetchImpl || fetch;
+    const startedAtMs = Date.now();
+    let attempt = 0;
+    let lastUnknownReason = '';
 
-        const reqIdHeader = res.headers.get('X-Request-ID') || '—';
-        const instanceHeader = res.headers.get('X-Instance-Id') || '—';
-        const locationHeader = res.headers.get('Location') || '—';
-        const rawBody = await res.json().catch(() => ({}));
+    while (attempt < policy.maxAttempts) {
+        attempt++;
+        const headers = getAuthHeaders();
+        if (overrideStudentId) {
+            headers['X-User-Id'] = overrideStudentId;
+        }
+        headers['Idempotency-Key'] = idempotencyKey;
 
-        if (res.status === 201) {
-            const safeModel = parseWebEnrollmentDtoSafely(rawBody);
-            lastCreatedHeldEnrollmentId = safeModel.id;
-            const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
-            if (btnReg) {
-                btnReg.style.display = 'inline-block';
-                btnReg.textContent = `2. Зареєструвати запис у відомості (POST /registrations)`;
+        try {
+            const res = await fetchFn(`${getApiBase()}/v1/enrollments`, {
+                method: 'POST',
+                headers,
+                body: serializedBody
+            });
+
+            const reqIdHeader = res.headers.get('X-Request-ID') || '—';
+            const instanceHeader = res.headers.get('X-Instance-Id') || '—';
+            const locationHeader = res.headers.get('Location') || '—';
+            const retryAfterHeader = res.headers.get('Retry-After');
+            const rawBody = await res.json().catch(() => ({}));
+
+            if (res.status === 201) {
+                const safeModel = parseWebEnrollmentDtoSafely(rawBody);
+                lastCreatedHeldEnrollmentId = safeModel.id;
+                const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');
+                if (btnReg) {
+                    btnReg.style.display = 'inline-block';
+                    btnReg.textContent = `2. Зареєструвати запис у відомості (POST /registrations)`;
+                }
+                appendWebOpLog(
+                    `[201 Created] Запис створено успішно (після COMMIT у PostgreSQL, спроба ${attempt}/${policy.maxAttempts}, Idempotency-Key="${idempotencyKey}")!\n` +
+                    `  Location: ${locationHeader} | Вузол за Nginx: ${instanceHeader} | X-Request-ID: ${reqIdHeader}\n` +
+                    `  id="${safeModel.id}", student_id="${safeModel.student_id}", group_id="${safeModel.group_id}", ` +
+                    `ects=${safeModel.ects.toFixed(1)}, status="${safeModel.status}", created_at_local="${safeModel.created_at_local}"\n` +
+                    `  (Перевірка О1.7: зайве поле сервера extra_server_field="${rawBody.extra_server_field}" безпечно проігноровано клієнтом).`
+                );
+                await refreshAll();
+                return { status: res.status, body: rawBody, headers: res.headers, idempotencyKey, attempts: attempt };
             }
-            appendWebOpLog(
-                `[201 Created] Запис створено успішно (після COMMIT у PostgreSQL)!\n` +
-                `  Location: ${locationHeader} | Вузол за Nginx: ${instanceHeader} | X-Request-ID: ${reqIdHeader}\n` +
-                `  id="${safeModel.id}", student_id="${safeModel.student_id}", group_id="${safeModel.group_id}", ` +
-                `ects=${safeModel.ects.toFixed(1)}, status="${safeModel.status}", created_at_local="${safeModel.created_at_local}"\n` +
-                `  (Перевірка О1.7: зайве поле сервера extra_server_field="${rawBody.extra_server_field}" безпечно проігноровано клієнтом).`
-            );
-        } else {
+
+            if (isRetryableWebEnrollmentResponse(res.status, rawBody)) {
+                lastUnknownReason = `HTTP ${res.status} (${rawBody.error_code || rawBody.title || 'тимчасова помилка'})`;
+                const elapsedMs = Date.now() - startedAtMs;
+                const delayMs = computeWebRetryDelayMs(attempt, retryAfterHeader, policy);
+
+                if (attempt < policy.maxAttempts && (elapsedMs + delayMs) <= policy.totalBudgetMs) {
+                    appendWebOpLog(
+                        `[Повтор О2.4 | Спроба ${attempt}/${policy.maxAttempts}] Отримано ${lastUnknownReason}. ` +
+                        `Пауза ${delayMs} мс перед повтором із тим самим Idempotency-Key="${idempotencyKey}"...`
+                    );
+                    await sleepMs(delayMs);
+                    continue;
+                }
+
+                // Вичерпано спроби або бюджет часу на тимчасовій помилці (429 / 503 / 409 idempotency_key_in_progress)
+                appendWebOpLog(
+                    `Результат невідомий: вичерпано ліміт повторних спроб (${attempt}/${policy.maxAttempts}) або бюджет часу (${policy.totalBudgetMs} мс) після ${lastUnknownReason}.\n` +
+                    `  Idempotency-Key: "${idempotencyKey}" (хибне повідомлення про успіх заблоковано).`
+                );
+                await refreshAll();
+                return { status: res.status, body: rawBody, headers: res.headers, idempotencyKey, attempts: attempt, outcomeUnknown: true };
+            }
+
+            // Постійна помилка (400, 401, 403, 404, 422 або предметний 409 Conflict) — без повторних спроб!
             appendWebOpLog(
                 `[HTTP ${res.status} Problem Details] (${res.headers.get('Content-Type')})\n` +
-                `  Вузол: ${instanceHeader} | X-Request-ID: ${reqIdHeader}\n` +
+                `  Вузол: ${instanceHeader} | X-Request-ID: ${reqIdHeader} | Спроб виконано: ${attempt} (постійна помилка не повторюється)\n` +
                 `  type: ${rawBody.type}\n` +
                 `  title: ${rawBody.title}\n` +
                 `  status: ${rawBody.status}\n` +
                 `  detail: ${rawBody.detail}\n` +
                 `  error_code: ${rawBody.error_code || '—'}`
             );
-        }
+            await refreshAll();
+            return { status: res.status, body: rawBody, headers: res.headers, idempotencyKey, attempts: attempt };
+        } catch (err) {
+            lastUnknownReason = `мережевий збій / втрачена відповідь (${err.message})`;
+            const elapsedMs = Date.now() - startedAtMs;
+            const delayMs = computeWebRetryDelayMs(attempt, null, policy);
 
-        await refreshAll();
-        return { status: res.status, body: rawBody, headers: res.headers };
-    } catch (err) {
-        appendWebOpLog(`Мережева помилка POST /v1/enrollments: ${err.message}`);
-        return null;
+            if (attempt < policy.maxAttempts && (elapsedMs + delayMs) <= policy.totalBudgetMs) {
+                appendWebOpLog(
+                    `[Повтор О2.4 | Спроба ${attempt}/${policy.maxAttempts}] Мережева помилка або втрачена відповідь (${err.message}). ` +
+                    `Пауза ${delayMs} мс перед повтором із тим самим Idempotency-Key="${idempotencyKey}"...`
+                );
+                await sleepMs(delayMs);
+                continue;
+            }
+
+            appendWebOpLog(
+                `Результат невідомий: відповідь сервера не отримано після ${attempt} спроб (${lastUnknownReason}).\n` +
+                `  Idempotency-Key: "${idempotencyKey}" (операція могла бути зафіксована на сервері, але підтвердження не надійшло).`
+            );
+            return { status: 0, body: null, headers: null, idempotencyKey, attempts: attempt, outcomeUnknown: true };
+        }
     }
+
+    appendWebOpLog(
+        `Результат невідомий: вичерпано бюджет повторних спроб для Idempotency-Key="${idempotencyKey}" (${lastUnknownReason}).`
+    );
+    return { status: 0, body: null, headers: null, idempotencyKey, attempts: attempt, outcomeUnknown: true };
 }
 
 // Скасування запису студентом: POST /v1/enrollments/{id}/cancel

@@ -506,6 +506,163 @@ components:
         littles_law:
           type: object
 
+    ComputeRequest:
+      type: object
+      description: Параметри паралельного чисельного інтегрування функції інтенсивності потоку заявок C10 λ(t) = B + A·exp(-t/τ) (РПО О2.1–О2.4)
+      required: [a, b, n, workers]
+      properties:
+        a:
+          type: number
+          description: Нижня межа інтервалу інтегрування [a, b]
+          example: 0.0
+        b:
+          type: number
+          description: Верхня межа інтервалу інтегрування [a, b]
+          example: 1.0
+        n:
+          type: integer
+          minimum: 1
+          description: Кількість підінтервалів розбиття методу трапецій
+          example: 100000
+        workers:
+          type: integer
+          enum: [1, 2, 4]
+          description: Кількість окремих процесів ОС для паралельного обчислення (1, 2 або 4)
+          example: 2
+        method:
+          type: string
+          enum: [trapezoid]
+          default: trapezoid
+          description: Чисельний метод інтегрування (для ЛР2 — виключно trapezoid)
+          example: "trapezoid"
+        order:
+          type: string
+          enum: [natural]
+          default: natural
+          description: Порядок підсумовування елементів (для ЛР2 — виключно natural, за зростанням індексу зліва направо)
+          example: "natural"
+        mode:
+          type: string
+          enum: [none, lock, local]
+          default: local
+          description: Режим агрегації результатів між процесами для О2.4 (none — спільна сума без синхронізації, lock — спільна сума під блокуванням, local — локальні суми процесів)
+          example: "local"
+        model_a:
+          type: number
+          minimum: 0
+          description: Амплітуда початкового сплеску інтенсивності потоку заявок A (за замовчуванням із конфігурації сервісу)
+          example: 50.0
+        model_b:
+          type: number
+          minimum: 0
+          description: Фонова базова інтенсивність потоку заявок B (за замовчуванням із конфігурації сервісу)
+          example: 5.0
+        model_tau:
+          type: number
+          exclusiveMinimum: 0
+          description: Характерний час загасання початкового сплеску τ > 0 (за замовчуванням із конфігурації сервісу)
+          example: 10.0
+        model_t:
+          type: number
+          exclusiveMinimum: 0
+          description: Горизонт вікна запису T > 0 (за замовчуванням із конфігурації сервісу)
+          example: 60.0
+
+    ComputeResultDetails:
+      type: object
+      description: Вкладені деталі результату обчислення для сумісності з шаблоном автоперевірки РПО
+      required: [value, reference, abs_error, error, rel_error, wall_s, duration_ms, workers, method, n, order, mode]
+      properties:
+        value:
+          type: number
+          description: Обчислене чисельне значення інтеграла I_n
+        reference:
+          type: number
+          description: Аналітичне еталонне значення інтеграла I(a, b) = F(b) - F(a)
+        abs_error:
+          type: number
+          description: Абсолютна похибка |I_n - I(a, b)|
+        error:
+          type: number
+          description: Синонім абсолютної похибки |I_n - I(a, b)|
+        rel_error:
+          type: number
+          description: Відносна похибка |I_n - I(a, b)| / max(|I(a, b)|, 1e-15)
+        wall_s:
+          type: number
+          description: Повний час виконання обчислення в секундах (включно зі створенням процесів, IPC та збором результатів)
+        duration_ms:
+          type: number
+          description: Повний час виконання обчислення в мілісекундах
+        workers:
+          type: integer
+          enum: [1, 2, 4]
+        method:
+          type: string
+          enum: [trapezoid]
+        n:
+          type: integer
+          minimum: 1
+        order:
+          type: string
+          enum: [natural]
+        mode:
+          type: string
+          enum: [none, lock, local]
+
+    ComputeResponse:
+      type: object
+      description: Відповідь синхронного паралельного чисельного інтегрування POST /v1/compute (РПО О2.1–О2.4)
+      required: [value, reference, abs_error, error, rel_error, wall_s, duration_ms, workers, method, n, order, mode, a, b, state, instance_id, result]
+      properties:
+        value:
+          type: number
+          description: Обчислене чисельне значення інтеграла I_n
+        reference:
+          type: number
+          description: Аналітичне еталонне значення інтеграла I(a, b) = F(b) - F(a)
+        abs_error:
+          type: number
+          description: Абсолютна похибка |I_n - I(a, b)|
+        error:
+          type: number
+          description: Синонім абсолютної похибки |I_n - I(a, b)|
+        rel_error:
+          type: number
+          description: Відносна похибка |I_n - I(a, b)| / max(|I(a, b)|, 1e-15)
+        wall_s:
+          type: number
+          description: Повний час виконання обчислення в секундах
+        duration_ms:
+          type: number
+          description: Повний час виконання обчислення в мілісекундах
+        workers:
+          type: integer
+          enum: [1, 2, 4]
+        method:
+          type: string
+          enum: [trapezoid]
+        n:
+          type: integer
+          minimum: 1
+        order:
+          type: string
+          enum: [natural]
+        mode:
+          type: string
+          enum: [none, lock, local]
+        a:
+          type: number
+        b:
+          type: number
+        state:
+          type: string
+          enum: [done]
+        instance_id:
+          type: string
+        result:
+          $ref: "#/components/schemas/ComputeResultDetails"
+
 paths:
   /:
     get:
@@ -879,19 +1036,32 @@ paths:
                 error_code: "group_not_found"
                 request_id: "req-404-demo"
         "409":
-          description: Конфлікт стану (немає вільних місць у групі або повторний запис на ту саму дисципліну)
+          description: Конфлікт стану (немає вільних місць у групі, повторний запис на ту саму дисципліну або операція за вказаним Idempotency-Key ще обробляється — idempotency_key_in_progress, Web О2.1, О2.2)
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
-              example:
-                type: "https://urn.c10.edu.ua/problems/group_full"
-                title: "У групі немає вільних місць"
-                status: 409
-                detail: "Вичерпано ліміт місць у навчальній групі 'DISC-WEB-01' (доступно 0 місць)."
-                instance: "/v1/enrollments"
-                error_code: "group_full"
-                request_id: "req-409-demo"
+              examples:
+                group_full:
+                  summary: У групі немає вільних місць
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/group_full"
+                    title: "У групі немає вільних місць"
+                    status: 409
+                    detail: "Вичерпано ліміт місць у навчальній групі 'DISC-WEB-01' (доступно 0 місць)."
+                    instance: "/v1/enrollments"
+                    error_code: "group_full"
+                    request_id: "req-409-demo"
+                idempotency_in_progress:
+                  summary: Операція з тим самим Idempotency-Key ще обробляється (Web О2.2)
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/idempotency_key_in_progress"
+                    title: "Операція за цим ключем ідемпотентності вже виконується"
+                    status: 409
+                    detail: "Запит із вказаним Idempotency-Key наразі перебуває в стані обробки (processing). Повторіть спробу пізніше."
+                    instance: "/v1/enrollments"
+                    error_code: "idempotency_key_in_progress"
+                    request_id: "req-409-idem-in-progress"
         "422":
           description: Семантична неможливість обробки (перевищення семестрового ліміту ЄКТС або кількості дисциплін, запит поза часовим вікном, закрита група, невалідні поля або невідповідність корисного навантаження ключа Idempotency-Key О2.2)
           content:
@@ -1758,6 +1928,132 @@ paths:
                   queue_is_bounded: true
         "401":
           description: Відсутній або недійсний Bearer-токен
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/compute:
+    post:
+      operationId: computeIntensityIntegral
+      tags: [DPC]
+      summary: Паралельне чисельне інтегрування функції інтенсивності потоку заявок C10 методом трапецій (О2.1–О2.4 РПО)
+      description: >-
+        Обчислює визначений інтеграл функції інтенсивності потоку заявок λ(t) = B + A·exp(-t/τ) на відрізку [a, b]
+        складеною формулою трапецій із розбиттям на n підінтервалів між workers (1, 2 або 4) окремими процесами ОС.
+        Повертає чисельне значення інтеграла value, аналітичний еталон reference, абсолютну (abs_error) і відносну (rel_error) похибки
+        та повний час виконання wall_s (duration_ms). Підтримує режими агрегації результатів О2.4: local, lock, none.
+      x-course: compute
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComputeRequest"
+            examples:
+              default_local:
+                summary: Паралельне обчислення методу трапецій у режимі локальних сум (local)
+                value:
+                  a: 0.0
+                  b: 1.0
+                  n: 100000
+                  workers: 2
+                  method: "trapezoid"
+                  order: "natural"
+                  mode: "local"
+              shared_lock:
+                summary: Оновлення спільної суми у міжпроцесній пам'яті під блокуванням (lock, О2.4)
+                value:
+                  a: 0.0
+                  b: 1.0
+                  n: 100000
+                  workers: 4
+                  method: "trapezoid"
+                  order: "natural"
+                  mode: "lock"
+              shared_none:
+                summary: Незахищене оновлення спільної суми у міжпроцесній пам'яті без синхронізації (none, О2.4)
+                value:
+                  a: 0.0
+                  b: 1.0
+                  n: 100000
+                  workers: 4
+                  method: "trapezoid"
+                  order: "natural"
+                  mode: "none"
+      responses:
+        "200":
+          description: Результат паралельного чисельного інтегрування та порівняння з аналітичним еталоном
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIdResponseHeader"
+            X-Instance-Id:
+              $ref: "#/components/headers/XInstanceIdResponseHeader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeResponse"
+              example:
+                value: 52.58129098040162
+                reference: 52.581290980397654
+                abs_error: 3.9648e-12
+                error: 3.9648e-12
+                rel_error: 7.5403e-14
+                wall_s: 0.0852
+                duration_ms: 85.2
+                workers: 2
+                method: "trapezoid"
+                n: 100000
+                order: "natural"
+                mode: "local"
+                a: 0.0
+                b: 1.0
+                state: "done"
+                instance_id: "app-a"
+                result:
+                  value: 52.58129098040162
+                  reference: 52.581290980397654
+                  abs_error: 3.9648e-12
+                  error: 3.9648e-12
+                  rel_error: 7.5403e-14
+                  wall_s: 0.0852
+                  duration_ms: 85.2
+                  workers: 2
+                  method: "trapezoid"
+                  n: 100000
+                  order: "natural"
+                  mode: "local"
+        "400":
+          description: Синтаксично некоректний JSON або некоректні параметри обчислення (n < 1, workers не в {1, 2, 4}, a > b, непідтримуваний method/order/mode)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "https://urn.c10.edu.ua/problems/invalid_workers"
+                title: "Непідтримувана кількість процесів-працівників"
+                status: 400
+                detail: "Параметр 'workers' є обов'язковим і приймає лише значення 1, 2 або 4."
+                instance: "/v1/compute"
+                error_code: "invalid_workers"
+                request_id: "req-compute-400-demo"
+        "401":
+          description: Передано недійсний Bearer-токен у заголовку Authorization
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "500":
+          description: Внутрішня помилка дочірнього процесу обчислення
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "504":
+          description: Перевищено час очікування завершення дочірніх процесів обчислення
           content:
             application/problem+json:
               schema:

@@ -89,3 +89,75 @@ public sealed class QueuedRequestItem
     public bool IsRecoveredFromDb { get; init; }
     public double RecoveredQueueWaitMs;
 }
+
+// РПО ЛР2 (О2.1–О2.4): Запит і відповідь чисельного інтегрування функції інтенсивності потоку заявок C10 POST /v1/compute
+public sealed class ComputeRequestDto
+{
+    [JsonPropertyName("a")]
+    public double? A { get; set; }
+
+    [JsonPropertyName("b")]
+    public double? B { get; set; }
+
+    [JsonPropertyName("n")]
+    public long? N { get; set; }
+
+    [JsonPropertyName("workers")]
+    public int? Workers { get; set; }
+
+    [JsonPropertyName("method")]
+    public string? Method { get; set; }
+
+    [JsonPropertyName("order")]
+    public string? Order { get; set; }
+
+    [JsonPropertyName("mode")]
+    public string? Mode { get; set; }
+
+    [JsonPropertyName("model_a")]
+    public double? ModelA { get; set; }
+
+    [JsonPropertyName("model_b")]
+    public double? ModelB { get; set; }
+
+    [JsonPropertyName("model_tau")]
+    public double? ModelTau { get; set; }
+
+    [JsonPropertyName("model_t")]
+    public double? ModelT { get; set; }
+}
+
+public sealed record ComputeResultDetailsDto(
+    [property: JsonPropertyName("value")] double Value,
+    [property: JsonPropertyName("reference")] double Reference,
+    [property: JsonPropertyName("abs_error")] double AbsError,
+    [property: JsonPropertyName("error")] double Error,
+    [property: JsonPropertyName("rel_error")] double RelError,
+    [property: JsonPropertyName("wall_s")] double WallS,
+    [property: JsonPropertyName("duration_ms")] double DurationMs,
+    [property: JsonPropertyName("workers")] int Workers,
+    [property: JsonPropertyName("method")] string Method,
+    [property: JsonPropertyName("n")] long N,
+    [property: JsonPropertyName("order")] string Order,
+    [property: JsonPropertyName("mode")] string Mode
+);
+
+public sealed record ComputeResponseDto(
+    [property: JsonPropertyName("value")] double Value,
+    [property: JsonPropertyName("reference")] double Reference,
+    [property: JsonPropertyName("abs_error")] double AbsError,
+    [property: JsonPropertyName("error")] double Error,
+    [property: JsonPropertyName("rel_error")] double RelError,
+    [property: JsonPropertyName("wall_s")] double WallS,
+    [property: JsonPropertyName("duration_ms")] double DurationMs,
+    [property: JsonPropertyName("workers")] int Workers,
+    [property: JsonPropertyName("method")] string Method,
+    [property: JsonPropertyName("n")] long N,
+    [property: JsonPropertyName("order")] string Order,
+    [property: JsonPropertyName("mode")] string Mode,
+    [property: JsonPropertyName("a")] double A,
+    [property: JsonPropertyName("b")] double B,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("instance_id")] string InstanceId,
+    [property: JsonPropertyName("result")] ComputeResultDetailsDto Result
+);

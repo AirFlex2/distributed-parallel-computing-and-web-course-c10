@@ -48,6 +48,11 @@ services:
       SLOW_CALL_MAX_MS: "${SLOW_CALL_MAX_MS:-700}"
       ALLOW_TEST_OVERRIDES: "${ALLOW_TEST_OVERRIDES:-false}"
       ENABLE_WORKERS: "true"
+      FAULTS: "${FAULTS:-off}"
+      FAULTS_DIR: "/faults"
+      IDEMPOTENCY_KEY_TTL_MINUTES: "${IDEMPOTENCY_KEY_TTL_MINUTES:-1440}"
+    volumes:
+      - ./faults:/faults
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 2s
@@ -86,6 +91,11 @@ services:
       SLOW_CALL_MAX_MS: "${SLOW_CALL_MAX_MS:-700}"
       ALLOW_TEST_OVERRIDES: "${ALLOW_TEST_OVERRIDES:-false}"
       ENABLE_WORKERS: "false"
+      FAULTS: "${FAULTS:-off}"
+      FAULTS_DIR: "/faults"
+      IDEMPOTENCY_KEY_TTL_MINUTES: "${IDEMPOTENCY_KEY_TTL_MINUTES:-1440}"
+    volumes:
+      - ./faults:/faults
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 2s
