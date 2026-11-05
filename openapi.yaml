@@ -508,16 +508,18 @@ components:
 
     ComputeRequest:
       type: object
-      description: Параметри паралельного чисельного інтегрування функції інтенсивності потоку заявок C10 λ(t) = B + A·exp(-t/τ) (РПО О2.1–О2.4)
+      description: Параметри паралельного чисельного інтегрування функції інтенсивності потоку заявок C10 λ(t) = B + A·exp(-t/τ) на області визначення 0 <= a <= b <= T (РПО О2.1–О2.4)
       required: [a, b, n, workers]
       properties:
         a:
           type: number
-          description: Нижня межа інтервалу інтегрування [a, b]
+          minimum: 0
+          description: Нижня межа інтервалу інтегрування [a, b] у межах області визначення моделі C10 (0 <= a <= b <= T)
           example: 0.0
         b:
           type: number
-          description: Верхня межа інтервалу інтегрування [a, b]
+          minimum: 0
+          description: Верхня межа інтервалу інтегрування [a, b] у межах області визначення моделі C10 (0 <= a <= b <= T)
           example: 1.0
         n:
           type: integer
@@ -1939,11 +1941,13 @@ paths:
       tags: [DPC]
       summary: Паралельне чисельне інтегрування функції інтенсивності потоку заявок C10 методом трапецій (О2.1–О2.4 РПО)
       description: >-
-        Обчислює визначений інтеграл функції інтенсивності потоку заявок λ(t) = B + A·exp(-t/τ) на відрізку [a, b]
+        Обчислює визначений інтеграл функції інтенсивності потоку заявок λ(t) = B + A·exp(-t/τ) на відрізку [a, b] (де 0 <= a <= b <= T)
         складеною формулою трапецій із розбиттям на n підінтервалів між workers (1, 2 або 4) окремими процесами ОС.
         Повертає чисельне значення інтеграла value, аналітичний еталон reference, абсолютну (abs_error) і відносну (rel_error) похибки
         та повний час виконання wall_s (duration_ms). Підтримує режими агрегації результатів О2.4: local, lock, none.
       x-course: compute
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
@@ -2027,7 +2031,7 @@ paths:
                   order: "natural"
                   mode: "local"
         "400":
-          description: Синтаксично некоректний JSON або некоректні параметри обчислення (n < 1, workers не в {1, 2, 4}, a > b, непідтримуваний method/order/mode)
+          description: Синтаксично некоректний JSON або некоректні параметри обчислення (n < 1, workers не в {1, 2, 4}, a > b, інтервал поза [0, T], непідтримуваний method/order/mode)
           content:
             application/problem+json:
               schema:
@@ -2041,7 +2045,7 @@ paths:
                 error_code: "invalid_workers"
                 request_id: "req-compute-400-demo"
         "401":
-          description: Передано недійсний Bearer-токен у заголовку Authorization
+          description: Відсутній або недійсний Bearer-токен у заголовку Authorization
           content:
             application/problem+json:
               schema:

@@ -40,6 +40,24 @@ public sealed class ParallelComputeService
 
         double a = request.A.Value;
         double b = request.B.Value;
+
+        double modelA = request.ModelA ?? _options.ComputeModelA;
+        double modelB = request.ModelB ?? _options.ComputeModelB;
+        double modelTau = request.ModelTau ?? _options.ComputeModelTau;
+        double modelT = request.ModelT ?? _options.ComputeModelT;
+
+        if (double.IsNaN(modelA) || double.IsInfinity(modelA) || modelA < 0.0 ||
+            double.IsNaN(modelB) || double.IsInfinity(modelB) || modelB < 0.0 ||
+            double.IsNaN(modelTau) || double.IsInfinity(modelTau) || modelTau <= 0.0 ||
+            double.IsNaN(modelT) || double.IsInfinity(modelT) || modelT <= 0.0)
+        {
+            return ServiceResult<ComputeResponseDto>.Failure(
+                StatusCodes.Status400BadRequest,
+                "invalid_model_parameters",
+                "Некоректні параметри математичної моделі C10",
+                "Параметри моделі повинні задовольняти умови: A >= 0, B >= 0, τ > 0, T > 0.");
+        }
+
         if (a > b)
         {
             return ServiceResult<ComputeResponseDto>.Failure(
@@ -47,6 +65,15 @@ public sealed class ParallelComputeService
                 "invalid_interval_order",
                 "Некоректний інтервал інтегрування",
                 $"Нижня межа інтегрування a ({a.ToString(CultureInfo.InvariantCulture)}) не може перевищувати верхню межу b ({b.ToString(CultureInfo.InvariantCulture)}).");
+        }
+
+        if (a < 0.0 || b > modelT)
+        {
+            return ServiceResult<ComputeResponseDto>.Failure(
+                StatusCodes.Status400BadRequest,
+                "invalid_interval_bounds",
+                "Межі інтегрування поза областю визначення моделі C10",
+                $"За карткою теми C10 функція інтенсивності λ(t) визначена на відрізку [0, T]. Має виконуватися умова 0 <= a <= b <= T (T = {modelT.ToString(CultureInfo.InvariantCulture)}), але передано [{a.ToString(CultureInfo.InvariantCulture)}, {b.ToString(CultureInfo.InvariantCulture)}].");
         }
 
         if (!request.N.HasValue || request.N.Value < 1 || request.N.Value > 2_000_000_000L)
@@ -105,23 +132,6 @@ public sealed class ParallelComputeService
                 "unsupported_mode",
                 "Непідтримуваний режим агрегації результатів",
                 $"Режим '{request.Mode}' не підтримується. Допустимі значення: 'local', 'lock', 'none'.");
-        }
-
-        double modelA = request.ModelA ?? _options.ComputeModelA;
-        double modelB = request.ModelB ?? _options.ComputeModelB;
-        double modelTau = request.ModelTau ?? _options.ComputeModelTau;
-        double modelT = request.ModelT ?? _options.ComputeModelT;
-
-        if (double.IsNaN(modelA) || double.IsInfinity(modelA) || modelA < 0.0 ||
-            double.IsNaN(modelB) || double.IsInfinity(modelB) || modelB < 0.0 ||
-            double.IsNaN(modelTau) || double.IsInfinity(modelTau) || modelTau <= 0.0 ||
-            double.IsNaN(modelT) || double.IsInfinity(modelT) || modelT <= 0.0)
-        {
-            return ServiceResult<ComputeResponseDto>.Failure(
-                StatusCodes.Status400BadRequest,
-                "invalid_model_parameters",
-                "Некоректні параметри математичної моделі C10",
-                "Параметри моделі повинні задовольняти умови: A >= 0, B >= 0, τ > 0, T > 0.");
         }
 
         string? sharedFilePath = null;

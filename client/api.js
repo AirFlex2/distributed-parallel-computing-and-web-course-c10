@@ -190,10 +190,11 @@ async function loadWebDisciplines() {
 
 // Web О2.4: Політика повторних спроб клієнта для POST /v1/enrollments
 const WEB_ENROLLMENT_RETRY_POLICY = {
-    maxAttempts: 4,      // 1 початкова спроба + до 3 повторів
-    baseDelayMs: 200,    // початкова затримка експоненційного відступу
-    maxDelayMs: 2500,    // верхня межа експоненційного відступу
-    totalBudgetMs: 8000  // загальний бюджет часу на логічну операцію
+    maxAttempts: 4,          // 1 початкова спроба + до 3 повторів
+    baseDelayMs: 200,        // початкова затримка експоненційного відступу
+    maxDelayMs: 2500,        // верхня межа експоненційного відступу
+    attemptTimeoutMs: 3500,  // ліміт часу очікування однієї спроби fetch через AbortController
+    totalBudgetMs: 8000      // загальний гарантований бюджет часу на всю логічну операцію
 };
 
 function generateWebIdempotencyKey() {
@@ -273,6 +274,16 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
     let lastUnknownReason = '';
 
     while (attempt < policy.maxAttempts) {
+        const elapsedBeforeAttemptMs = Date.now() - startedAtMs;
+        const remainingBudgetMs = policy.totalBudgetMs - elapsedBeforeAttemptMs;
+        if (remainingBudgetMs <= 0) {
+            appendWebOpLog(
+                `Результат невідомий: загальний бюджет часу (${policy.totalBudgetMs} мс) вичерпано перед спробою ${attempt + 1}/${policy.maxAttempts}.\n` +
+                `  Idempotency-Key: "${idempotencyKey}" (${lastUnknownReason || 'перевищено ліміт часу очікування'}).`
+            );
+            return { status: 0, body: null, headers: null, idempotencyKey, attempts: attempt, outcomeUnknown: true };
+        }
+
         attempt++;
         const headers = getAuthHeaders();
         if (overrideStudentId) {
@@ -280,11 +291,25 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
         }
         headers['Idempotency-Key'] = idempotencyKey;
 
+        // О2.4: Гарантоване обмеження часу виконання як окремої спроби, так і загального бюджету операції через AbortController.
+        // Якщо запит буде перервано за тайм-аутом, наступна спроба (у межах залишку бюджету) використає ТОЙ САМИЙ Idempotency-Key і ТЕ САМЕ тіло.
+        const controller = new AbortController();
+        const perAttemptLimitMs = Number.isFinite(policy.attemptTimeoutMs) && policy.attemptTimeoutMs > 0
+            ? policy.attemptTimeoutMs
+            : policy.totalBudgetMs;
+        const effectiveTimeoutMs = Math.max(1, Math.min(perAttemptLimitMs, remainingBudgetMs));
+        let abortedByTimeout = false;
+        const timeoutHandle = setTimeout(() => {
+            abortedByTimeout = true;
+            controller.abort(new Error(`Перевищено тайм-аут спроби (${effectiveTimeoutMs} мс)`));
+        }, effectiveTimeoutMs);
+
         try {
             const res = await fetchFn(`${getApiBase()}/v1/enrollments`, {
                 method: 'POST',
                 headers,
-                body: serializedBody
+                body: serializedBody,
+                signal: controller.signal
             });
 
             const reqIdHeader = res.headers.get('X-Request-ID') || '—';
@@ -292,6 +317,8 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
             const locationHeader = res.headers.get('Location') || '—';
             const retryAfterHeader = res.headers.get('Retry-After');
             const rawBody = await res.json().catch(() => ({}));
+
+            clearTimeout(timeoutHandle);
 
             if (res.status === 201) {
                 const safeModel = parseWebEnrollmentDtoSafely(rawBody);
@@ -317,7 +344,7 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
                 const elapsedMs = Date.now() - startedAtMs;
                 const delayMs = computeWebRetryDelayMs(attempt, retryAfterHeader, policy);
 
-                if (attempt < policy.maxAttempts && (elapsedMs + delayMs) <= policy.totalBudgetMs) {
+                if (attempt < policy.maxAttempts && (elapsedMs + delayMs) < policy.totalBudgetMs) {
                     appendWebOpLog(
                         `[Повтор О2.4 | Спроба ${attempt}/${policy.maxAttempts}] Отримано ${lastUnknownReason}. ` +
                         `Пауза ${delayMs} мс перед повтором із тим самим Idempotency-Key="${idempotencyKey}"...`
@@ -348,13 +375,17 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
             await refreshAll();
             return { status: res.status, body: rawBody, headers: res.headers, idempotencyKey, attempts: attempt };
         } catch (err) {
-            lastUnknownReason = `мережевий збій / втрачена відповідь (${err.message})`;
+            clearTimeout(timeoutHandle);
+            const errMsg = abortedByTimeout
+                ? `перевищено тайм-аут очікування відповіді (${effectiveTimeoutMs} мс, AbortController)`
+                : (err && err.message ? err.message : String(err));
+            lastUnknownReason = `мережевий збій / втрачена відповідь (${errMsg})`;
             const elapsedMs = Date.now() - startedAtMs;
             const delayMs = computeWebRetryDelayMs(attempt, null, policy);
 
-            if (attempt < policy.maxAttempts && (elapsedMs + delayMs) <= policy.totalBudgetMs) {
+            if (attempt < policy.maxAttempts && (elapsedMs + delayMs) < policy.totalBudgetMs) {
                 appendWebOpLog(
-                    `[Повтор О2.4 | Спроба ${attempt}/${policy.maxAttempts}] Мережева помилка або втрачена відповідь (${err.message}). ` +
+                    `[Повтор О2.4 | Спроба ${attempt}/${policy.maxAttempts}] Мережева помилка або втрачена відповідь (${errMsg}). ` +
                     `Пауза ${delayMs} мс перед повтором із тим самим Idempotency-Key="${idempotencyKey}"...`
                 );
                 await sleepMs(delayMs);
@@ -362,7 +393,7 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
             }
 
             appendWebOpLog(
-                `Результат невідомий: відповідь сервера не отримано після ${attempt} спроб (${lastUnknownReason}).\n` +
+                `Результат невідомий: відповідь сервера не отримано після ${attempt} спроб у межах бюджету ${policy.totalBudgetMs} мс (${lastUnknownReason}).\n` +
                 `  Idempotency-Key: "${idempotencyKey}" (операція могла бути зафіксована на сервері, але підтвердження не надійшло).`
             );
             return { status: 0, body: null, headers: null, idempotencyKey, attempts: attempt, outcomeUnknown: true };

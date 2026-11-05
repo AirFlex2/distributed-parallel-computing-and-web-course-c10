@@ -1303,9 +1303,26 @@ try {
 
     $dpcBaseUrl = "http://localhost:8000"
 
+    # 12.0 Перевірка обов'язкової Bearer-автентифікації та валідації меж 0 <= a <= b <= T на POST /v1/compute
+    $compNoAuthRes = Invoke-WebRequest -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":10.0,"n":100,"workers":1,"method":"trapezoid","order":"natural","mode":"local"}' -SkipHttpErrorCheck
+    $compBadAuthRes = Invoke-WebRequest -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer invalid-token-xyz" } -Body '{"a":0.0,"b":10.0,"n":100,"workers":1,"method":"trapezoid","order":"natural","mode":"local"}' -SkipHttpErrorCheck
+    if ([int]$compNoAuthRes.StatusCode -eq 401 -and [int]$compBadAuthRes.StatusCode -eq 401) {
+        Write-Pass "РПО О2.1: POST /v1/compute вимагає обов'язкову Bearer-авторизацію (відсутній та недійсний токени відхилено з HTTP 401 Unauthorized)."
+    } else {
+        Write-Fail "Помилка перевірки авторизації POST /v1/compute: noAuth=$([int]$compNoAuthRes.StatusCode), badAuth=$([int]$compBadAuthRes.StatusCode)"
+    }
+
+    $compOutOfBoundsRes = Invoke-WebRequest -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"a":0.0,"b":65.0,"n":100,"workers":1,"method":"trapezoid","order":"natural","mode":"local"}' -SkipHttpErrorCheck
+    $compOutOfBoundsJson = (Get-ResponseText $compOutOfBoundsRes) | ConvertFrom-Json
+    if ([int]$compOutOfBoundsRes.StatusCode -eq 400 -and $compOutOfBoundsJson.error_code -eq "invalid_interval_bounds") {
+        Write-Pass "РПО О2.1 (C10): Інтервал за межами [0, T] (b=65 > T=60) відхилено з HTTP 400 Bad Request (error_code=invalid_interval_bounds)."
+    } else {
+        Write-Fail "Помилка перевірки меж 0 <= a <= b <= T: status=$([int]$compOutOfBoundsRes.StatusCode)"
+    }
+
     # 12.1 О2.1 та О2.2: Перевірка точності методу трапецій при n та 2n і збігу з аналітичним інтегралом на 1, 2, 4 процесах
-    $compN1 = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":1000,"workers":2,"method":"trapezoid","order":"natural","mode":"local"}'
-    $compN2 = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000,"workers":2,"method":"trapezoid","order":"natural","mode":"local"}'
+    $compN1 = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":1000,"workers":2,"method":"trapezoid","order":"natural","mode":"local"}'
+    $compN2 = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000,"workers":2,"method":"trapezoid","order":"natural","mode":"local"}'
     $errRatio = $compN1.abs_error / $compN2.abs_error
 
     if ($errRatio -ge 3.9 -and $errRatio -le 4.1 -and $compN2.abs_error -lt $compN1.abs_error) {
@@ -1315,7 +1332,7 @@ try {
     }
 
     foreach ($wCount in @(1, 2, 4)) {
-        $cRes = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body "{`"a`":0.0,`"b`":60.0,`"n`":200000,`"workers`":$wCount,`"method`":`"trapezoid`",`"order`":`"natural`",`"mode`":`"local`"}"
+        $cRes = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body "{`"a`":0.0,`"b`":60.0,`"n`":200000,`"workers`":$wCount,`"method`":`"trapezoid`",`"order`":`"natural`",`"mode`":`"local`"}"
         if ($cRes.abs_error -le 1.0e-6 -and $cRes.workers -eq $wCount) {
             Write-Pass "РПО О2.1 (workers=$wCount): value=$([Math]::Round($cRes.value, 8)), reference=$([Math]::Round($cRes.reference, 8)), abs_error=$($cRes.abs_error.ToString('E3')) <= 1e-6, wall_s=$([Math]::Round($cRes.wall_s, 4))s"
         } else {
@@ -1324,9 +1341,9 @@ try {
     }
 
     # 12.2 О2.4: Порівняння режимів none, lock, local на 4 процесах
-    $cNone = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"none"}'
-    $cLock = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"lock"}'
-    $cLocal = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"local"}'
+    $cNone = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"none"}'
+    $cLock = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"lock"}'
+    $cLocal = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/compute" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"a":0.0,"b":60.0,"n":2000000,"workers":4,"method":"trapezoid","order":"natural","mode":"local"}'
 
     if ($cLocal.abs_error -le 1.0e-6 -and $cLock.abs_error -le 1.0e-6 -and $cNone.abs_error -gt 1.0) {
         Write-Pass "РПО О2.4 (workers=4): local (abs_err=$($cLocal.abs_error.ToString('E2')), wall=$($cLocal.wall_s.ToString('F3'))s) та lock (abs_err=$($cLock.abs_error.ToString('E2')), wall=$($cLock.wall_s.ToString('F3'))s) точні, а none демонструє втрату оновлень (value=$([Math]::Round($cNone.value, 2)) замість $([Math]::Round($cNone.reference, 2)), abs_err=$([Math]::Round($cNone.abs_error, 2)))."

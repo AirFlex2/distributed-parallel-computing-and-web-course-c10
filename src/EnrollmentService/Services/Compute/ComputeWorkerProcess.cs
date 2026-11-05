@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
+using System.Text.Json;
 
 namespace EnrollmentService.Services.Compute;
 
@@ -9,6 +10,7 @@ namespace EnrollmentService.Services.Compute;
 public static class ComputeWorkerProcess
 {
     public const string WorkerArgFlag = "--compute-worker";
+    public const string ProfileO23Flag = "--profile-o23";
     public const int SharedMemoryByteSize = 64;
     private const long MaxSharedMemoryUpdatesPerWorker = 4_000_000L;
 
@@ -16,6 +18,11 @@ public static class ComputeWorkerProcess
     {
         try
         {
+            if (args.Any(a => string.Equals(a, ProfileO23Flag, StringComparison.OrdinalIgnoreCase)))
+            {
+                return RunProfileAndHypothesisVerification(args);
+            }
+
             double a = 0.0;
             double b = 1.0;
             long n = 1;
@@ -222,5 +229,80 @@ public static class ComputeWorkerProcess
                 accessor.SafeMemoryMappedViewHandle.ReleasePointer();
             }
         }
+    }
+
+    // РПО О2.3: Відтворюваний профайлер фаз виконання та перевірка гіпотези оптимізації гарячого циклу
+    // в ідентичному середовищі виконання (Release-контейнер).
+    private static int RunProfileAndHypothesisVerification(string[] args)
+    {
+        long benchN = 250_000_000L;
+        double a = 0.0;
+        double b = 60.0;
+        double modelA = 50.0;
+        double modelB = 5.0;
+        double modelTau = 10.0;
+
+        for (int i = 1; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--n", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                benchN = long.Parse(args[++i], CultureInfo.InvariantCulture);
+            }
+        }
+
+        // Розігрів JIT-компілятора перед заміром
+        _ = C10IntensityMath.ComputeTrapezoidSliceNaivePerSubinterval(a, b, 100_000L, 0, 100_000L, modelA, modelB, modelTau);
+        _ = C10IntensityMath.ComputeTrapezoidSliceLocal(a, b, 100_000L, 0, 100_000L, modelA, modelB, modelTau);
+
+        // 1. Замір часу ДО оптимізації (наївне поелементне обчислення трапецій: 2*n викликів Math.Exp(-t / tau))
+        var swNaive = Stopwatch.StartNew();
+        TimeSpan cpuBeforeNaive = Process.GetCurrentProcess().TotalProcessorTime;
+        double naiveValue = C10IntensityMath.ComputeTrapezoidSliceNaivePerSubinterval(
+            a, b, benchN, 0, benchN, modelA, modelB, modelTau);
+        TimeSpan cpuDeltaNaive = Process.GetCurrentProcess().TotalProcessorTime - cpuBeforeNaive;
+        swNaive.Stop();
+
+        // 2. Замір часу ПІСЛЯ оптимізації (складена формула зі спільними вузлами: n+1 викликів Math.Exp(t * invNegTau))
+        var swOpt = Stopwatch.StartNew();
+        TimeSpan cpuBeforeOpt = Process.GetCurrentProcess().TotalProcessorTime;
+        double optValue = C10IntensityMath.ComputeTrapezoidSliceLocal(
+            a, b, benchN, 0, benchN, modelA, modelB, modelTau);
+        TimeSpan cpuDeltaOpt = Process.GetCurrentProcess().TotalProcessorTime - cpuBeforeOpt;
+        swOpt.Stop();
+
+        double reference = C10IntensityMath.ComputeAnalyticalIntegral(a, b, modelA, modelB, modelTau);
+        double speedupRatio = swNaive.Elapsed.TotalSeconds / Math.Max(swOpt.Elapsed.TotalSeconds, 1e-9);
+
+        var report = new Dictionary<string, object?>
+        {
+            ["tool"] = "EnrollmentService --compute-worker --profile-o23 (Stopwatch + Process.TotalProcessorTime)",
+            ["bench_n"] = benchN,
+            ["interval"] = new[] { a, b },
+            ["reference"] = reference,
+            ["before_optimization_naive"] = new Dictionary<string, object?>
+            {
+                ["description"] = "Naive per-subinterval trapezoid (2*n Math.Exp calls + division -t/tau)",
+                ["math_exp_calls"] = 2L * benchN,
+                ["wall_s"] = Math.Round(swNaive.Elapsed.TotalSeconds, 4),
+                ["cpu_s"] = Math.Round(cpuDeltaNaive.TotalSeconds, 4),
+                ["value"] = naiveValue,
+                ["abs_error"] = Math.Abs(naiveValue - reference)
+            },
+            ["after_optimization_composite"] = new Dictionary<string, object?>
+            {
+                ["description"] = "Composite trapezoid with shared interior nodes ((n+1) Math.Exp calls + precomputed invNegTau)",
+                ["math_exp_calls"] = benchN + 1L,
+                ["wall_s"] = Math.Round(swOpt.Elapsed.TotalSeconds, 4),
+                ["cpu_s"] = Math.Round(cpuDeltaOpt.TotalSeconds, 4),
+                ["value"] = optValue,
+                ["abs_error"] = Math.Abs(optValue - reference)
+            },
+            ["kernel_speedup_factor"] = Math.Round(speedupRatio, 3),
+            ["value_difference"] = Math.Abs(optValue - naiveValue)
+        };
+
+        Console.Out.WriteLine(JsonSerializer.Serialize(report));
+        Console.Out.Flush();
+        return 0;
     }
 }

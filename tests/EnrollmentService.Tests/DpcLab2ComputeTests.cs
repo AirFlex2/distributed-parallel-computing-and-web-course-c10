@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using EnrollmentService.Services.Compute;
@@ -18,6 +19,13 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
             builder.UseSetting("DB_CONNECTION_STRING", TestEnvironment.ConnectionString);
             builder.UseSetting("API_AUTH_TOKEN", TestEnvironment.ApiAuthToken);
         });
+    }
+
+    private HttpClient CreateAuthorizedClient()
+    {
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+        return client;
     }
 
     [Fact]
@@ -119,7 +127,7 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
     {
         Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        using var client = _factory.CreateClient();
+        using var client = CreateAuthorizedClient();
         var payload = new
         {
             a = 0.0,
@@ -161,7 +169,7 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
     {
         Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        using var client = _factory.CreateClient();
+        using var client = CreateAuthorizedClient();
 
         // 1. Вузький відрізок a == b -> інтеграл 0.0
         var zeroPayload = new
@@ -212,7 +220,7 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
     {
         Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        using var client = _factory.CreateClient();
+        using var client = CreateAuthorizedClient();
 
         async Task<(double Value, double Reference, double AbsError, double WallS)> RunModeAsync(string mode)
         {
@@ -255,6 +263,8 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
 
     [SkippableTheory]
     [InlineData("{\"a\": 10, \"b\": 0, \"n\": 100, \"workers\": 1}", "invalid_interval_order")]
+    [InlineData("{\"a\": -1, \"b\": 10, \"n\": 100, \"workers\": 1}", "invalid_interval_bounds")]
+    [InlineData("{\"a\": 0, \"b\": 65, \"n\": 100, \"workers\": 1}", "invalid_interval_bounds")]
     [InlineData("{\"a\": 0, \"b\": 1, \"n\": 0, \"workers\": 1}", "invalid_subintervals")]
     [InlineData("{\"a\": 0, \"b\": 1, \"n\": 100, \"workers\": 3}", "invalid_workers")]
     [InlineData("{\"a\": 0, \"b\": 1, \"n\": 100, \"workers\": 2, \"method\": \"simpson\"}", "unsupported_method")]
@@ -265,7 +275,7 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
     {
         Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        using var client = _factory.CreateClient();
+        using var client = CreateAuthorizedClient();
         using var content = new StringContent(rawJson, Encoding.UTF8, "application/json");
         using var response = await client.PostAsync("/v1/compute", content);
 
@@ -274,5 +284,48 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal(expectedErrorCode, doc.RootElement.GetProperty("error_code").GetString());
+    }
+
+    [SkippableFact]
+    public async Task Dpc_O21_PostCompute_MissingOrInvalidBearerToken_Returns401Unauthorized()
+    {
+        Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var payload = new
+        {
+            a = 0.0,
+            b = 10.0,
+            n = 1_000,
+            workers = 2,
+            method = "trapezoid",
+            order = "natural",
+            mode = "local"
+        };
+        string jsonPayload = JsonSerializer.Serialize(payload);
+
+        // 1. Запит без заголовка Authorization -> 401 Unauthorized
+        using (var anonymousClient = _factory.CreateClient())
+        {
+            using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+            using var resMissing = await anonymousClient.PostAsync("/v1/compute", content);
+            Assert.Equal(HttpStatusCode.Unauthorized, resMissing.StatusCode);
+            Assert.Equal("application/problem+json", resMissing.Content.Headers.ContentType?.MediaType);
+
+            using var docMissing = JsonDocument.Parse(await resMissing.Content.ReadAsStringAsync());
+            Assert.Equal("unauthorized", docMissing.RootElement.GetProperty("error_code").GetString());
+        }
+
+        // 2. Запит із недійсним Bearer-токеном -> 401 Unauthorized
+        using (var wrongTokenClient = _factory.CreateClient())
+        {
+            wrongTokenClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "invalid-token-value-123");
+            using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+            using var resInvalid = await wrongTokenClient.PostAsync("/v1/compute", content);
+            Assert.Equal(HttpStatusCode.Unauthorized, resInvalid.StatusCode);
+            Assert.Equal("application/problem+json", resInvalid.Content.Headers.ContentType?.MediaType);
+
+            using var docInvalid = JsonDocument.Parse(await resInvalid.Content.ReadAsStringAsync());
+            Assert.Equal("unauthorized", docInvalid.RootElement.GetProperty("error_code").GetString());
+        }
     }
 }

@@ -24,7 +24,8 @@ public sealed class BearerAuthMiddleware
             || context.Request.Path.StartsWithSegments("/v1/group-seats")
             || context.Request.Path.StartsWithSegments("/v1/decanate-roster")
             || context.Request.Path.StartsWithSegments("/v1/admin")
-            || context.Request.Path.StartsWithSegments("/v1/groups");
+            || context.Request.Path.StartsWithSegments("/v1/groups")
+            || context.Request.Path.StartsWithSegments("/v1/compute");
 
         string authHeader = context.Request.Headers.Authorization.ToString();
         string expected = $"Bearer {_options.ApiAuthToken}";
