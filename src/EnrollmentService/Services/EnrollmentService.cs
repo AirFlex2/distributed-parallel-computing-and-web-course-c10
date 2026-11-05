@@ -600,6 +600,35 @@ public sealed class EnrollmentService
         }
     }
 
+    public async Task<int> ReconcilePendingRosterConfirmationsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var pending = await _enrollmentRepo.GetPendingRosterConfirmationsAsync(cancellationToken);
+        if (pending.Count == 0) return 0;
+
+        int reconciled = 0;
+        foreach (var (enrollmentId, requestId) in pending)
+        {
+            try
+            {
+                if (await ConfirmEnrollmentFromRosterAsync(enrollmentId, requestId, cancellationToken))
+                {
+                    reconciled++;
+                }
+            }
+            catch (Exception ex)
+            {
+                StructuredJsonLogger.LogEvent(_options.InstanceId, "roster_reconciliation_error", new Dictionary<string, object?>
+                {
+                    ["enrollment_id"] = enrollmentId,
+                    ["request_id"] = requestId,
+                    ["error"] = ex.Message
+                });
+            }
+        }
+        return reconciled;
+    }
+
     public async Task<ServiceResult<WebDisciplineListResponseDto>> GetDisciplinesAsync(
         int limit,
         string? cursorRaw,

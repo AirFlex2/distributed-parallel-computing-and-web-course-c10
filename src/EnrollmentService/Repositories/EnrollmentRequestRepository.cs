@@ -307,17 +307,27 @@ public sealed class EnrollmentRequestRepository
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
+            var createdAt = reader.GetFieldValue<DateTimeOffset>(3);
+            var elapsedSinceArrival = DateTimeOffset.UtcNow - createdAt;
+            long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            long enqueueTicks = nowTicks;
+            if (elapsedSinceArrival > TimeSpan.Zero)
+            {
+                long ticksAgo = (long)(elapsedSinceArrival.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+                enqueueTicks = Math.Max(1, nowTicks - ticksAgo);
+            }
+
             list.Add(new QueuedRequestItem
             {
                 Id = reader.GetGuid(0),
                 StudentId = reader.GetString(1),
                 GroupId = reader.GetString(2),
-                CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(3),
+                CreatedAtUtc = createdAt,
                 IdempotencyKey = reader.IsDBNull(4) ? null : reader.GetString(4),
                 RequestPayloadHash = reader.IsDBNull(5) ? null : reader.GetString(5),
                 EnrollmentId = reader.IsDBNull(6) ? null : reader.GetGuid(6),
                 RequestedEnrollmentId = reader.IsDBNull(7) ? null : reader.GetGuid(7),
-                EnqueueTimestamp = System.Diagnostics.Stopwatch.GetTimestamp()
+                EnqueueTimestamp = enqueueTicks
             });
         }
         return list;

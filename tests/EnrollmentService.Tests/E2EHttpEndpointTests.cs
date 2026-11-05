@@ -2627,6 +2627,77 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         Assert.Contains(requestId.ToString(), ex.Message);
     }
 
+    [SkippableTheory]
+    [InlineData("queued")]
+    [InlineData("processing")]
+    [InlineData("done")]
+    [InlineData("rejected")]
+    [InlineData("failed")]
+    public async Task PostEnrollmentRequests_IdempotentReplay_AcrossAllFiveStates_Returns202(string expectedStatus)
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        string studentId = "student-idemp-all-states";
+        string groupId = "DISC-DPC-01";
+        string discId = "DISC-DPC-01";
+        Guid requestId = Guid.NewGuid();
+        string ik = $"ik-all-states-{expectedStatus}-{Guid.NewGuid():N}";
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId);
+            await EnsureTestGroupAsync(groupId, discId, seats: 10, available: 10, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand(@"
+                    INSERT INTO enrollment_requests (
+                        id, student_id, group_id, status, created_at, idempotency_key, request_payload_hash
+                    ) VALUES (
+                        @id, @studentId, @groupId, @status, NOW(), @ik, @hash
+                    );", conn);
+                cmd.Parameters.AddWithValue("id", requestId);
+                cmd.Parameters.AddWithValue("studentId", studentId);
+                cmd.Parameters.AddWithValue("groupId", groupId);
+                cmd.Parameters.AddWithValue("status", expectedStatus);
+                cmd.Parameters.AddWithValue("ik", ik);
+                cmd.Parameters.AddWithValue("hash", $"{studentId}:{groupId}");
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests");
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+            req.Headers.Add("Idempotency-Key", ik);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(new { student_id = studentId, group_id = groupId }),
+                Encoding.UTF8,
+                "application/json");
+
+            var resp = await client.SendAsync(req);
+            Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
+            Assert.Equal($"/v1/enrollment-requests/{requestId}", resp.Headers.Location?.ToString());
+
+            var json = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            Assert.Equal(requestId.ToString(), root.GetProperty("id").GetString());
+            string returnedStatus = root.GetProperty("status").GetString()!;
+            if (expectedStatus == "queued")
+            {
+                Assert.True(returnedStatus is "queued" or "processing");
+            }
+            else
+            {
+                Assert.Equal(expectedStatus, returnedStatus);
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, requestId);
+        }
+    }
+
     [SkippableFact]
     public async Task Migration010_Schema_DecanateRosterUniqueConstraints()
     {

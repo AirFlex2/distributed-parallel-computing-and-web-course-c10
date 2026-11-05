@@ -1,0 +1,43 @@
+{
+  "measured_at_utc": "2026-11-05T10:25:50.594463+00:00",
+  "sample_size": 500,
+  "concurrency": 50,
+  "counters": {
+    "total_accepted": 500,
+    "total_done": 150,
+    "total_rejected": 350,
+    "total_failed": 0,
+    "monotonic_order_violations": 0
+  },
+  "http_202_ms": {
+    "p50": 4.1,
+    "p95": 72.2,
+    "p99": 76.8
+  },
+  "intervals_ms": {
+    "queue_wait_ms": {
+      "sample_count": 500,
+      "p50_ms": 6942.44,
+      "p95_ms": 7541.895,
+      "p99_ms": 7711.131
+    },
+    "processing_time_ms": {
+      "sample_count": 500,
+      "p50_ms": 442.069,
+      "p95_ms": 678.962,
+      "p99_ms": 701.154
+    },
+    "delivery_wait_ms": {
+      "sample_count": 500,
+      "p50_ms": 61.299,
+      "p95_ms": 105.363,
+      "p99_ms": 110.557
+    },
+    "full_domain_execution_ms": {
+      "sample_count": 500,
+      "p50_ms": 7397.45,
+      "p95_ms": 8035.584,
+      "p99_ms": 8288.436
+    }
+  }
+}

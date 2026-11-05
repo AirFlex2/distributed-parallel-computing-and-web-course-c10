@@ -198,6 +198,26 @@ public sealed class EnrollmentRepository
             reader.GetFieldValue<DateTimeOffset>(3));
     }
 
+    public async Task<List<(Guid EnrollmentId, Guid RequestId)>> GetPendingRosterConfirmationsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var list = new List<(Guid EnrollmentId, Guid RequestId)>();
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT e.id, dr.request_id
+            FROM enrollment e
+            JOIN decanate_roster dr ON dr.enrollment_id = e.id
+            WHERE e.status = 'held'
+            LIMIT 50;", conn);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            list.Add((reader.GetGuid(0), reader.GetGuid(1)));
+        }
+        return list;
+    }
+
     public async Task<int> ExpireStaleHeldEnrollmentsAsync(CancellationToken cancellationToken = default)
     {
         var candidates = new List<(Guid Id, string StudentId, string GroupId)>();
@@ -206,7 +226,9 @@ public sealed class EnrollmentRepository
             await using var cmd = new NpgsqlCommand(@"
                 SELECT id, student_id, group_id
                 FROM enrollment
-                WHERE status = 'held' AND expires_at < NOW()
+                WHERE status = 'held'
+                  AND expires_at < NOW()
+                  AND NOT EXISTS (SELECT 1 FROM decanate_roster dr WHERE dr.enrollment_id = enrollment.id)
                 LIMIT 50;", conn);
 
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -246,7 +268,8 @@ public sealed class EnrollmentRepository
                 decimal ects = 0;
                 bool isEligible = false;
                 await using (var lockEnrollCmd = new NpgsqlCommand(@"
-                    SELECT e.status, e.expires_at, d.ects
+                    SELECT e.status, e.expires_at, d.ects,
+                           EXISTS(SELECT 1 FROM decanate_roster dr WHERE dr.enrollment_id = e.id)
                     FROM enrollment e
                     JOIN discipline d ON d.id = e.discipline_id
                     WHERE e.id = @id
@@ -259,7 +282,8 @@ public sealed class EnrollmentRepository
                         string status = reader.GetString(0);
                         var exp = reader.GetFieldValue<DateTimeOffset>(1);
                         ects = reader.GetDecimal(2);
-                        if (status == "held" && exp < DateTimeOffset.UtcNow)
+                        bool inRoster = reader.GetBoolean(3);
+                        if (status == "held" && exp < DateTimeOffset.UtcNow && !inRoster)
                         {
                             isEligible = true;
                         }

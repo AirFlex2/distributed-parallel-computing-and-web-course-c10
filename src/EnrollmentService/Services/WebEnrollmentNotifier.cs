@@ -19,7 +19,31 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
         Guid requestId,
         CancellationToken cancellationToken = default)
     {
-        // Web самостійно виконує перехід held -> confirmed у власній транзакції
-        return await _enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, requestId, cancellationToken);
+        // Механізм повторної доставки (Retry): до 3 спроб з експоненційною затримкою (50 мс, 100 мс, 150 мс)
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                // Web самостійно виконує перехід held -> confirmed у власній транзакції
+                bool ok = await _enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, requestId, cancellationToken);
+                if (ok)
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex) when (attempt < 3 && !cancellationToken.IsCancellationRequested)
+            {
+                StructuredJsonLogger.LogEvent("web_notifier", "roster_notification_retry", new Dictionary<string, object?>
+                {
+                    ["attempt"] = attempt,
+                    ["enrollment_id"] = enrollmentId,
+                    ["request_id"] = requestId,
+                    ["error"] = ex.Message
+                });
+                await Task.Delay(50 * attempt, cancellationToken);
+            }
+        }
+
+        return false;
     }
 }

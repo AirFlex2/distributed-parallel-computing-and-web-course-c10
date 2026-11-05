@@ -309,23 +309,18 @@ public sealed class EnrollmentWorkerPool : IHostedService
                 while (true)
                 {
                     int replenished = await ReplenishQueueDuringDrainAsync();
-                    if (replenished == 0 && _queue.Count == 0)
-                    {
-                        var remaining = await _requestRepo.GetQueuedRequestsAsync(1);
-                        if (remaining.Count == 0)
-                        {
-                            break;
-                        }
-                    }
+                    var remaining = await _requestRepo.GetQueuedRequestsAsync(1);
 
-                    if (_queue.Count > 0)
-                    {
-                        await Task.Delay(50);
-                    }
-                    else
+                    // Цикл вивантаження завершується ТІЛЬКИ тоді, коли одночасно
+                    // і в БД немає збережених заявок зі статусом queued, і черга в пам'яті порожня
+                    if (remaining.Count == 0 && _queue.Count == 0)
                     {
                         break;
                     }
+
+                    // Якщо в БД ще є заявки або в черзі ще триває обробка,
+                    // робимо коротку паузу, даючи воркерам звільнити слоти та обробити завдання
+                    await Task.Delay(50);
                 }
             }
 

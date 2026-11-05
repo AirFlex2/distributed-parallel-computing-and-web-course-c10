@@ -283,6 +283,110 @@ public sealed class RestartAndRecoveryTests
         }
     }
 
+    // 3.1 Graceful Shutdown на SIGTERM, коли кількість збережених у БД заявок перевищує місткість черги в пам'яті
+    [SkippableFact]
+    public async Task GracefulShutdown_WhenQueuedRequestsExceedQueueCapacity_DrainsAllFromDbAndCompletesGracefully()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
+
+        // Створюємо 12 заявок у БД, тоді як ємність оперативної черги дорівнює лише 3 (12 > 3)
+        var ids = Enumerable.Range(1, 12).Select(_ => Guid.NewGuid()).ToList();
+
+        try
+        {
+            var baseTime = DateTimeOffset.UtcNow;
+            for (int i = 0; i < ids.Count; i++)
+            {
+                await InsertRequestWithStatusAsync(ids[i], $"student-drain-{i + 1}", "DISC-DPC-01", "queued", baseTime.AddSeconds(i));
+            }
+
+            int queueCapacity = 3;
+            var queue = new MonitorRequestQueue(capacity: queueCapacity);
+            var metrics = new MetricsCollector();
+            var options = new ServiceOptions
+            {
+                InstanceId = "app-test-drain-shutdown",
+                EnableWorkers = true,
+                Workers = 2,
+                QueueCapacity = queueCapacity,
+                SlowCallMinMs = 10,
+                SlowCallMaxMs = 20
+            };
+            var processor = new EnrollmentRequestProcessor(_requestRepo, _groupRepo, _enrollmentRepo, _decanateRepo, _factory, metrics, options);
+            var lifetime = new DummyHostLifetime();
+
+            var pool = new EnrollmentWorkerPool(queue, processor, _requestRepo, options, metrics, lifetime);
+
+            // Запускаємо пул воркерів
+            await pool.StartAsync(CancellationToken.None);
+
+            // Надсилаємо сигнал завершення (SIGTERM Graceful Shutdown)
+            pool.InitiateShutdown();
+            Assert.True(pool.IsShuttingDown);
+
+            // Очікуємо повного завершення DrainAndStopAsync через StopAsync
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await pool.StopAsync(stopCts.Token);
+
+            // ПЕРЕВІРКА ІНВАРІАНТА: абсолютно всі 12 заявок (при черзі всього 3)
+            // були вивантажені з БД і дійшли до термінального стану
+            var terminalStatuses = new List<string>();
+            foreach (var id in ids)
+            {
+                var s = await _requestRepo.GetStatusByIdAsync(id);
+                Assert.NotNull(s);
+                Assert.Contains(s.Status, new[] { "done", "rejected" });
+                terminalStatuses.Add(s.Status);
+            }
+
+            Assert.Equal(12, terminalStatuses.Count);
+        }
+        finally
+        {
+            foreach (var rId in ids) await CleanupRequestAsync(rId);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("queued")]
+    [InlineData("processing")]
+    [InlineData("done")]
+    [InlineData("rejected")]
+    [InlineData("failed")]
+    public async Task Idempotency_RepeatWithSameKey_Returns202_AcrossAllFiveStates(string state)
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
+
+        var id = Guid.NewGuid();
+        string key = $"idemp-key-state-{state}-{Guid.NewGuid():N}";
+        string studentId = $"student-idemp-{state}";
+        string groupId = "DISC-DPC-01";
+
+        try
+        {
+            await InsertRequestWithStatusAsync(id, studentId, groupId, state);
+
+            await using var conn = await _factory.OpenConnectionAsync();
+            await using var cmd = new NpgsqlCommand(@"
+                UPDATE enrollment_requests
+                SET idempotency_key = @key, request_payload_hash = @hash
+                WHERE id = @id;", conn);
+            cmd.Parameters.AddWithValue("id", id);
+            cmd.Parameters.AddWithValue("key", key);
+            cmd.Parameters.AddWithValue("hash", $"{studentId}:{groupId}");
+            await cmd.ExecuteNonQueryAsync();
+
+            var existing = await _requestRepo.GetByIdempotencyKeyAsync(key, conn);
+            Assert.NotNull(existing);
+            Assert.Equal(state, existing.Status);
+            Assert.Equal(id, existing.Id);
+        }
+        finally
+        {
+            await CleanupRequestAsync(id);
+        }
+    }
+
     // 4.1 Відновлення processing: аварія ДО транзакції (немає запису у відомості -> перехід у failed без списання місць)
     [SkippableFact]
     public async Task RecoverProcessing_CrashBeforeTransaction_SetsFailedAndLeavesSeatsUntouched()
