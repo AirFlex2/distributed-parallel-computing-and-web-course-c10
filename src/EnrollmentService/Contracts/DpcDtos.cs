@@ -52,9 +52,6 @@ public sealed record GroupSeatsResponseDto(
     [property: JsonPropertyName("roster_count")] int RosterCount = 0
 )
 {
-    [JsonPropertyName("invariant_ok")]
-    public bool InvariantOk => InvariantHolds;
-
     [JsonPropertyName("capacity")]
     public int Capacity => Seats;
 

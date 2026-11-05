@@ -411,8 +411,6 @@ components:
           type: integer
         invariant_holds:
           type: boolean
-        invariant_ok:
-          type: boolean
         capacity:
           type: integer
         used:
@@ -1577,7 +1575,6 @@ paths:
                   taken: 1
                   free_seats: 29
                   invariant_holds: true
-                  invariant_ok: true
                   capacity: 30
                   used: 1
         "401":
@@ -1592,7 +1589,7 @@ paths:
       operationId: getGroupSeatsById
       tags: [DPC]
       summary: Стан місць конкретної навчальної групи та перевірка інваріанта taken <= seats (О1.1, О1.4 РПО)
-      description: Повертає `seats`, `taken = seats - available`, `free_seats` та булевий прапорець дотримання інваріанта `invariant_holds` із представлення `VIEW group_seats`.
+      description: Повертає `seats`, `taken = GREATEST(seats - available, roster_count)`, `free_seats` та булевий прапорець дотримання інваріанта `invariant_holds` із представлення `VIEW group_seats`.
       x-course: resource-state
       security:
         - bearerAuth: []
@@ -1617,7 +1614,6 @@ paths:
                 taken: 0
                 free_seats: 30
                 invariant_holds: true
-                invariant_ok: true
                 capacity: 30
                 used: 0
         "401":

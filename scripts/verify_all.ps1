@@ -207,8 +207,8 @@ if ($total -eq 0) {
 if ($testExit -eq 0 -and
     $failed -eq 0 -and
     $skipped -eq 0 -and
-    $passed -ge 140 -and
-    $total -ge 140) {
+    $passed -ge 157 -and
+    $total -ge 157) {
     Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
     if ($skipped -gt 0) {
