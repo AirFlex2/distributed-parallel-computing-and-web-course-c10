@@ -549,6 +549,12 @@ components:
           default: local
           description: Режим агрегації результатів між процесами для О2.4 (none — спільна сума без синхронізації, lock — спільна сума під блокуванням, local — локальні суми процесів)
           example: "local"
+        kernel:
+          type: string
+          enum: [composite, naive]
+          default: composite
+          description: Варіант обчислювального ядра трапецій для експериментального порівняння О2.3 без профайлера (composite — оптимізована складена формула зі спільними вузлами за замовчуванням; naive — базове поелементне обчислення з двома викликами λ(t) на підінтервал)
+          example: "composite"
         model_a:
           type: number
           minimum: 0

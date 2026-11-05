@@ -15,6 +15,11 @@ public sealed class ParallelComputeService
         "lock",
         "none"
     };
+    private static readonly HashSet<string> AllowedKernels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "composite",
+        "naive"
+    };
 
     private readonly ServiceOptions _options;
 
@@ -134,6 +139,18 @@ public sealed class ParallelComputeService
                 $"Режим '{request.Mode}' не підтримується. Допустимі значення: 'local', 'lock', 'none'.");
         }
 
+        string kernel = string.IsNullOrWhiteSpace(request.Kernel)
+            ? "composite"
+            : request.Kernel.Trim().ToLowerInvariant();
+        if (!AllowedKernels.Contains(kernel))
+        {
+            return ServiceResult<ComputeResponseDto>.Failure(
+                StatusCodes.Status400BadRequest,
+                "unsupported_kernel",
+                "Непідтримуваний варіант обчислювального ядра",
+                $"Варіант ядра '{request.Kernel}' не підтримується. Допустимі значення: 'composite', 'naive'.");
+        }
+
         string? sharedFilePath = null;
         if (!string.Equals(mode, "local", StringComparison.Ordinal))
         {
@@ -168,7 +185,7 @@ public sealed class ParallelComputeService
                     var (startIdx, endIdx) = C10IntensityMath.GetWorkerSubintervalBounds(n, workers, w);
                     var psi = CreateWorkerStartInfo(
                         a, b, n, startIdx, endIdx, workers,
-                        modelA, modelB, modelTau, mode, sharedFilePath);
+                        modelA, modelB, modelTau, mode, kernel, sharedFilePath);
 
                     var proc = new Process { StartInfo = psi };
                     if (!proc.Start())
@@ -370,6 +387,7 @@ public sealed class ParallelComputeService
         double modelB,
         double modelTau,
         string mode,
+        string kernel,
         string? sharedFilePath)
     {
         string assemblyLocation = typeof(Program).Assembly.Location;
@@ -416,6 +434,8 @@ public sealed class ParallelComputeService
         psi.ArgumentList.Add(modelTau.ToString("R", CultureInfo.InvariantCulture));
         psi.ArgumentList.Add("--mode");
         psi.ArgumentList.Add(mode);
+        psi.ArgumentList.Add("--kernel");
+        psi.ArgumentList.Add(kernel);
 
         if (!string.IsNullOrWhiteSpace(sharedFilePath))
         {

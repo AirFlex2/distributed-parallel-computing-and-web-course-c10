@@ -14,6 +14,14 @@ public static class C10IntensityMath
         return modelB + modelA * Math.Exp(-t / modelTau);
     }
 
+    // Неінлайнений виклик функції інтенсивності λ(t) для початкового (неоптимізованого) варіанта О2.3,
+    // щоб семплюючий профайлер стека (dotnet-trace) явно відображав частку процесорного часу у викликах EvaluateLambdaNaive / Math.Exp.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static double EvaluateLambdaNaive(double t, double modelA, double modelB, double modelTau)
+    {
+        return modelB + modelA * Math.Exp(-t / modelTau);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double EvaluateAntiderivative(double t, double modelA, double modelB, double modelTau)
     {
@@ -112,8 +120,8 @@ public static class C10IntensityMath
         {
             double t0 = a + k * h;
             double t1 = a + (k + 1) * h;
-            double f0 = EvaluateLambda(t0, modelA, modelB, modelTau);
-            double f1 = EvaluateLambda(t1, modelA, modelB, modelTau);
+            double f0 = EvaluateLambdaNaive(t0, modelA, modelB, modelTau);
+            double f1 = EvaluateLambdaNaive(t1, modelA, modelB, modelTau);
             total += (f0 + f1) * halfH;
         }
 

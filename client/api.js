@@ -316,11 +316,32 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
             const instanceHeader = res.headers.get('X-Instance-Id') || '—';
             const locationHeader = res.headers.get('Location') || '—';
             const retryAfterHeader = res.headers.get('Retry-After');
-            const rawBody = await res.json().catch(() => ({}));
+
+            let rawBody;
+            try {
+                rawBody = await res.json();
+            } catch (bodyErr) {
+                // Якщо під час читання тіла спрацював AbortController або обірвалося читання тіла 201 Created,
+                // помилку не можна поглинати порожнім об'єктом — передаємо її у зовнішній catch для повтору з тим самим Idempotency-Key.
+                if (controller.signal.aborted || abortedByTimeout || (bodyErr && bodyErr.name === 'AbortError')) {
+                    throw bodyErr;
+                }
+                if (res.status === 201) {
+                    throw new Error(`Не вдалося повністю прочитати тіло відповіді 201 Created: ${bodyErr && bodyErr.message ? bodyErr.message : String(bodyErr)}`);
+                }
+                rawBody = {};
+            }
+
+            if (controller.signal.aborted || abortedByTimeout) {
+                throw controller.signal.reason || new Error(`Перевищено тайм-аут спроби (${effectiveTimeoutMs} мс)`);
+            }
 
             clearTimeout(timeoutHandle);
 
             if (res.status === 201) {
+                if (!rawBody || typeof rawBody.id !== 'string' || !rawBody.id.trim()) {
+                    throw new Error('Отримано статус 201 Created, але тіло відповіді не містить обов\'язкового підтвердження id запису');
+                }
                 const safeModel = parseWebEnrollmentDtoSafely(rawBody);
                 lastCreatedHeldEnrollmentId = safeModel.id;
                 const btnReg = document.getElementById('btnRegisterWebEnrollmentToRoster');

@@ -33,6 +33,7 @@ public static class ComputeWorkerProcess
             double modelB = 5.0;
             double modelTau = 10.0;
             string mode = "local";
+            string kernel = "composite";
             string? sharedFilePath = null;
 
             for (int i = 1; i < args.Length; i++)
@@ -76,6 +77,9 @@ public static class ComputeWorkerProcess
                     case "--mode":
                         mode = val.Trim().ToLowerInvariant();
                         break;
+                    case "--kernel":
+                        kernel = val.Trim().ToLowerInvariant();
+                        break;
                     case "--shared-file":
                         sharedFilePath = val;
                         break;
@@ -84,8 +88,11 @@ public static class ComputeWorkerProcess
 
             if (string.Equals(mode, "local", StringComparison.Ordinal))
             {
-                double partialSum = C10IntensityMath.ComputeTrapezoidSliceLocal(
-                    a, b, n, startIdx, endIdx, modelA, modelB, modelTau);
+                double partialSum = string.Equals(kernel, "naive", StringComparison.Ordinal)
+                    ? C10IntensityMath.ComputeTrapezoidSliceNaivePerSubinterval(
+                        a, b, n, startIdx, endIdx, modelA, modelB, modelTau)
+                    : C10IntensityMath.ComputeTrapezoidSliceLocal(
+                        a, b, n, startIdx, endIdx, modelA, modelB, modelTau);
 
                 Console.Out.WriteLine(partialSum.ToString("R", CultureInfo.InvariantCulture));
                 Console.Out.Flush();

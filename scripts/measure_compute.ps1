@@ -24,7 +24,8 @@ function Invoke-Compute {
         [double]$b,
         [long]$n,
         [int]$workers,
-        [string]$mode = "local"
+        [string]$mode = "local",
+        [string]$kernel = "composite"
     )
     $body = @{
         a       = $a
@@ -34,9 +35,32 @@ function Invoke-Compute {
         method  = "trapezoid"
         order   = "natural"
         mode    = $mode
+        kernel  = $kernel
     } | ConvertTo-Json -Compress
 
-    return Invoke-RestMethod -Uri "$BaseUrl/v1/compute" -Method Post -Headers $AuthHeaders -Body $body -TimeoutSec 120
+    return Invoke-RestMethod -Uri "$BaseUrl/v1/compute" -Method Post -Headers $AuthHeaders -Body $body -TimeoutSec 180
+}
+
+function Get-RunStats {
+    param([double[]]$runs)
+    $sorted = $runs | Sort-Object
+    $min = [double]$sorted[0]
+    $max = [double]$sorted[$sorted.Count - 1]
+    $median = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
+    $sum = 0.0
+    foreach ($v in $runs) { $sum += $v }
+    $mean = $sum / $runs.Count
+    $spreadAbs = $max - $min
+    $spreadPct = if ($median -gt 0) { ($spreadAbs / $median) * 100.0 } else { 0.0 }
+    return [PSCustomObject]@{
+        Runs      = $runs
+        Min       = $min
+        Max       = $max
+        Median    = $median
+        Mean      = $mean
+        SpreadAbs = $spreadAbs
+        SpreadPct = $spreadPct
+    }
 }
 
 Write-Host "==============================================================================" -ForegroundColor Cyan
@@ -64,84 +88,99 @@ foreach ($w in @(1, 2, 4)) {
 }
 
 Write-Host "`n==============================================================================" -ForegroundColor Cyan
-Write-Host " 2. ПРИСКОРЕННЯ S(p) ТА ЕФЕКТИВНІСТЬ E(p) НА 1, 2, 4 ПРОЦЕСАХ (РПО О2.3)" -ForegroundColor Cyan
-Write-Host "    bench_n = $BenchN (мінімум 3 прогони на кожну конфігурацію)" -ForegroundColor Cyan
+Write-Host " 2. ПРИСКОРЕННЯ S(p), ЕФЕКТИВНІСТЬ E(p) ТА РОЗКИД НА 1, 2, 4 ПРОЦЕСАХ (РПО О2.3)" -ForegroundColor Cyan
+Write-Host "    bench_n = $BenchN (3 незалежні прогони без профайлера на кожну конфігурацію)" -ForegroundColor Cyan
 Write-Host "==============================================================================" -ForegroundColor Cyan
 
 # Прогрів (warm-up)
-$null = Invoke-Compute -a 0.0 -b 60.0 -n 100000 -workers 4 -mode "local"
+$null = Invoke-Compute -a 0.0 -b 60.0 -n 100000 -workers 4 -mode "local" -kernel "composite"
 
-$t1Mean = 0.0
-$wallMeans = @{}
+$statsByWorkers = @{}
 foreach ($w in @(1, 2, 4)) {
     $runs = @()
     for ($run = 1; $run -le 3; $run++) {
-        $r = Invoke-Compute -a 0.0 -b 60.0 -n $BenchN -workers $w -mode "local"
+        $r = Invoke-Compute -a 0.0 -b 60.0 -n $BenchN -workers $w -mode "local" -kernel "composite"
         $runs += [double]$r.wall_s
     }
-    $sorted = $runs | Sort-Object
-    $median = $sorted[1]
-    $mean = ($runs[0] + $runs[1] + $runs[2]) / 3.0
-    $wallMeans[$w] = $mean
-    if ($w -eq 1) {
-        $t1Mean = $mean
-    }
-    $speedup = $t1Mean / $mean
-    $efficiency = $speedup / $w
-    Write-Host ("workers={0} | run1={1:F4}s, run2={2:F4}s, run3={3:F4}s | mean={4:F4}s | median={5:F4}s | S(p)={6:F3} | E(p)={7:F3}" -f `
-        $w, $runs[0], $runs[1], $runs[2], $mean, $median, $speedup, $efficiency)
+    $st = Get-RunStats -runs $runs
+    $statsByWorkers[$w] = $st
+
+    $t1Med  = $statsByWorkers[1].Median
+    $t1Mean = $statsByWorkers[1].Mean
+    $sMed   = $t1Med / $st.Median
+    $eMed   = $sMed / $w
+    $sMean  = $t1Mean / $st.Mean
+    $eMean  = $sMean / $w
+
+    Write-Host ("workers={0} | runs=[{1:F4}s, {2:F4}s, {3:F4}s] | median={4:F4}s | mean={5:F4}s | spread={6:F4}s ({7:F2}%, [{8:F4}..{9:F4}]s) | S_med={10:F3} (E_med={11:F3}) | S_mean={12:F3} (E_mean={13:F3})" -f `
+        $w, $runs[0], $runs[1], $runs[2], $st.Median, $st.Mean, $st.SpreadAbs, $st.SpreadPct, $st.Min, $st.Max, $sMed, $eMed, $sMean, $eMean)
 }
 
-Write-Host "`n==============================================================================" -ForegroundColor Cyan
-Write-Host " 3. ПРОФІЛЮВАННЯ ТА ПЕРЕВІРКА ГІПОТЕЗИ ОПТИМІЗАЦІЇ В ОДНАКОВИХ УМОВАХ (РПО О2.3)" -ForegroundColor Cyan
-Write-Host "==============================================================================" -ForegroundColor Cyan
-
-Write-Host "--- 3.1. Вимірювання інфраструктурної фази (spawn + CLR init + IPC, n = 100) ---" -ForegroundColor Yellow
-$overheadMeans = @{}
+Write-Host "`n--- 2.1. Вимірювання інфраструктурної фази (spawn + CLR init + IPC, n = 100, 3 прогони) ---" -ForegroundColor Yellow
+$overheadByWorkers = @{}
 foreach ($w in @(1, 2, 4)) {
     $smallRuns = @()
     for ($sr = 1; $sr -le 3; $sr++) {
-        $rSmall = Invoke-Compute -a 0.0 -b 60.0 -n 100 -workers $w -mode "local"
+        $rSmall = Invoke-Compute -a 0.0 -b 60.0 -n 100 -workers $w -mode "local" -kernel "composite"
         $smallRuns += [double]$rSmall.wall_s
     }
-    $ohMean = ($smallRuns[0] + $smallRuns[1] + $smallRuns[2]) / 3.0
-    $overheadMeans[$w] = $ohMean
-    $totalW = $wallMeans[$w]
-    $cpuLoopEst = [Math]::Max(0.0, $totalW - $ohMean)
-    $seqSharePct = ($ohMean / $totalW) * 100.0
-    Write-Host ("workers={0} | T_total={1:F4}s | T_spawn_ipc(n=100)={2:F4}s ({3:F2} ms) | T_compute_loop≈{4:F4}s | spawn_share={5:F2}%" -f `
-        $w, $totalW, $ohMean, ($ohMean * 1000.0), $cpuLoopEst, $seqSharePct)
+    $ohSt = Get-RunStats -runs $smallRuns
+    $overheadByWorkers[$w] = $ohSt
+    $totalMed = $statsByWorkers[$w].Median
+    $cpuLoopMed = [Math]::Max(0.0, $totalMed - $ohSt.Median)
+    $seqSharePct = ($ohSt.Median / $totalMed) * 100.0
+    Write-Host ("workers={0} | T_total_med={1:F4}s | T_spawn_ipc_med(n=100)={2:F4}s ({3:F2} ms, spread={4:F2} ms) | T_compute_loop_est≈{5:F4}s | spawn_share={6:F2}%" -f `
+        $w, $totalMed, $ohSt.Median, ($ohSt.Median * 1000.0), ($ohSt.SpreadAbs * 1000.0), $cpuLoopMed, $seqSharePct)
 }
 
-Write-Host "`n--- 3.2. Вбудований профайлер у Release-контейнері app-a (--compute-worker --profile-o23 --n $BenchN) ---" -ForegroundColor Yellow
-Write-Host "Команда: docker compose exec -T app-a dotnet /app/EnrollmentService.dll --compute-worker --profile-o23 --n $BenchN"
-$profileJsonRaw = docker compose exec -T app-a dotnet /app/EnrollmentService.dll --compute-worker --profile-o23 --n $BenchN
-$profileData = $profileJsonRaw | ConvertFrom-Json
+Write-Host "`n==============================================================================" -ForegroundColor Cyan
+Write-Host " 3. ПРОФІЛЮВАННЯ СТЕКА МЕТОДІВ (dotnet-trace) ТА БАГАТОПРОГОННА ПЕРЕВІРКА" -ForegroundColor Cyan
+Write-Host "    ГІПОТЕЗИ ОПТИМІЗАЦІЇ БЕЗ ПРОФАЙЛЕРА В ОДНАКОВИХ УМОВАХ (РПО О2.3)" -ForegroundColor Cyan
+Write-Host "==============================================================================" -ForegroundColor Cyan
 
-$naiveWall = [double]$profileData.before_optimization_naive.wall_s
-$naiveCpu  = [double]$profileData.before_optimization_naive.cpu_s
-$naiveExp  = $profileData.before_optimization_naive.math_exp_calls
-$naiveVal  = [double]$profileData.before_optimization_naive.value
+Write-Host "--- 3.1. Семплююче профілювання стека викликів CPU через dotnet-trace у контейнері app-a ---" -ForegroundColor Yellow
+Write-Host "Інструмент: dotnet-trace collect (провайдер Microsoft-DotNETCore-SampleProfiler) + dotnet-trace report topN"
 
-$optWall   = [double]$profileData.after_optimization_composite.wall_s
-$optCpu    = [double]$profileData.after_optimization_composite.cpu_s
-$optExp    = $profileData.after_optimization_composite.math_exp_calls
-$optVal    = [double]$profileData.after_optimization_composite.value
-$kSpeedup  = [double]$profileData.kernel_speedup_factor
+Write-Host "`n[Профіль 1: ДО оптимізації (--kernel naive, n = $BenchN)]" -ForegroundColor Magenta
+Write-Host "Команда: docker compose exec -T app-a dotnet-trace collect -o /tmp/c10_naive.nettrace -- dotnet /app/EnrollmentService.dll --compute-worker --a 0 --b 60 --n $BenchN --start 0 --end $BenchN --workers 1 --mode local --kernel naive"
+$null = docker compose exec -T app-a dotnet-trace collect -o /tmp/c10_naive.nettrace -- dotnet /app/EnrollmentService.dll --compute-worker --a 0 --b 60 --n $BenchN --start 0 --end $BenchN --workers 1 --mode local --kernel naive
+$reportNaive = docker compose exec -T app-a dotnet-trace report /tmp/c10_naive.nettrace topN -n 5
+$reportNaive | ForEach-Object { Write-Host "  $_" }
 
-$estFullBefore1W = $naiveWall + $overheadMeans[1]
-$estFullAfter1W  = $wallMeans[1]
-$fullEndpointSpeedup1W = $estFullBefore1W / $estFullAfter1W
+Write-Host "`n[Профіль 2: ПІСЛЯ оптимізації (--kernel composite, n = $BenchN)]" -ForegroundColor Magenta
+Write-Host "Команда: docker compose exec -T app-a dotnet-trace collect -o /tmp/c10_composite.nettrace -- dotnet /app/EnrollmentService.dll --compute-worker --a 0 --b 60 --n $BenchN --start 0 --end $BenchN --workers 1 --mode local --kernel composite"
+$null = docker compose exec -T app-a dotnet-trace collect -o /tmp/c10_composite.nettrace -- dotnet /app/EnrollmentService.dll --compute-worker --a 0 --b 60 --n $BenchN --start 0 --end $BenchN --workers 1 --mode local --kernel composite
+$reportComposite = docker compose exec -T app-a dotnet-trace report /tmp/c10_composite.nettrace topN -n 5
+$reportComposite | ForEach-Object { Write-Host "  $_" }
 
-Write-Host ("  [До оптимізації — наївна формула трапецій (2*n викликів Math.Exp + ділення -t/tau)]:")
-Write-Host ("    Math.Exp calls = {0} | pure_loop_wall = {1:F4}s (CPU = {2:F4}s) | full_1_worker_wall ≈ {3:F4}s | value = {4:F10}" -f `
-    $naiveExp, $naiveWall, $naiveCpu, $estFullBefore1W, $naiveVal)
-Write-Host ("  [Після оптимізації — складена формула зі спільними вузлами ((n+1) викликів Math.Exp + множення invNegTau)]:")
-Write-Host ("    Math.Exp calls = {0} | pure_loop_wall = {1:F4}s (CPU = {2:F4}s) | full_1_worker_wall (POST /v1/compute) = {3:F4}s | value = {4:F10}" -f `
-    $optExp, $optWall, $optCpu, $estFullAfter1W, $optVal)
-Write-Host ("  [Підсумок перевірки гіпотези в однакових умовах Release-контейнера]:")
-Write-Host ("    Прискорення обчислювального ядра: {0:F3}x ({1:F4}s -> {2:F4}s)" -f $kSpeedup, $naiveWall, $optWall)
-Write-Host ("    Прискорення повного виклику (1 процес із spawn+IPC): {0:F3}x ({1:F4}s -> {2:F4}s)" -f $fullEndpointSpeedup1W, $estFullBefore1W, $estFullAfter1W)
+$null = docker compose exec -T app-a rm -f /tmp/c10_naive.nettrace /tmp/c10_composite.nettrace
+
+Write-Host "`n--- 3.2. Відтворюване порівняння ДО та ПІСЛЯ оптимізації БЕЗ профайлера (3 прогони POST /v1/compute) ---" -ForegroundColor Yellow
+Write-Host "Умови: Release-контейнер app-a, POST /v1/compute, n = $BenchN, [a, b] = [0, 60], 3 незалежні прогони кожного варіанта без інструментації профайлера."
+
+foreach ($wOpt in @(1, 4)) {
+    $naiveRuns = @()
+    $naiveVal = 0.0
+    for ($rIdx = 1; $rIdx -le 3; $rIdx++) {
+        $rn = Invoke-Compute -a 0.0 -b 60.0 -n $BenchN -workers $wOpt -mode "local" -kernel "naive"
+        $naiveRuns += [double]$rn.wall_s
+        $naiveVal = [double]$rn.value
+    }
+    $naiveSt = Get-RunStats -runs $naiveRuns
+
+    # Для composite використовуємо ті самі 3 прогони без профайлера (або виконуємо 3 прогони в ідентичних умовах)
+    $compSt = $statsByWorkers[$wOpt]
+    $gainMed  = $naiveSt.Median / $compSt.Median
+    $gainMean = $naiveSt.Mean / $compSt.Mean
+
+    Write-Host ("`n  Конфігурація workers = {0} (n = {1}):" -f $wOpt, $BenchN) -ForegroundColor Green
+    Write-Host ("    ДО оптимізації (kernel=naive)     : runs=[{0:F4}s, {1:F4}s, {2:F4}s] | median={3:F4}s | mean={4:F4}s | spread={5:F4}s ({6:F2}%) | value={7:F10}" -f `
+        $naiveRuns[0], $naiveRuns[1], $naiveRuns[2], $naiveSt.Median, $naiveSt.Mean, $naiveSt.SpreadAbs, $naiveSt.SpreadPct, $naiveVal)
+    Write-Host ("    ПІСЛЯ оптимізації (kernel=composite): runs=[{0:F4}s, {1:F4}s, {2:F4}s] | median={3:F4}s | mean={4:F4}s | spread={5:F4}s ({6:F2}%)" -f `
+        $compSt.Runs[0], $compSt.Runs[1], $compSt.Runs[2], $compSt.Median, $compSt.Mean, $compSt.SpreadAbs, $compSt.SpreadPct)
+    Write-Host ("    Ефект оптимізації (workers={0})    : прискорення за медіаною = {1:F3}x ({2:F4}s -> {3:F4}s), за середнім = {4:F3}x ({5:F4}s -> {6:F4}s)" -f `
+        $wOpt, $gainMed, $naiveSt.Median, $compSt.Median, $gainMean, $naiveSt.Mean, $compSt.Mean)
+}
 
 Write-Host "`n==============================================================================" -ForegroundColor Cyan
 Write-Host " 4. СПІЛЬНА СУМА ТА ЛОКАЛЬНІ РЕЗУЛЬТАТИ: none vs lock vs local (РПО О2.4)" -ForegroundColor Cyan
@@ -149,7 +188,7 @@ Write-Host "====================================================================
 
 foreach ($mode in @("none", "lock", "local")) {
     foreach ($w in @(1, 2, 4)) {
-        $rm = Invoke-Compute -a 0.0 -b 60.0 -n 10000000 -workers $w -mode $mode
+        $rm = Invoke-Compute -a 0.0 -b 60.0 -n 10000000 -workers $w -mode $mode -kernel "composite"
         Write-Host ("mode={0,-5} | workers={1} | value={2,14:F6} | ref={3,14:F6} | abs_err={4:E4} | wall_s={5:F4}s" -f `
             $mode, $w, $rm.value, $rm.reference, $rm.abs_error, $rm.wall_s)
     }

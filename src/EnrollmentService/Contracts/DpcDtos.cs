@@ -114,6 +114,9 @@ public sealed class ComputeRequestDto
     [JsonPropertyName("mode")]
     public string? Mode { get; set; }
 
+    [JsonPropertyName("kernel")]
+    public string? Kernel { get; set; }
+
     [JsonPropertyName("model_a")]
     public double? ModelA { get; set; }
 
