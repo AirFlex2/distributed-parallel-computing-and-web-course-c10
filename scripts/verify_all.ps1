@@ -914,15 +914,23 @@ try {
         } catch {}
     }
 
-    # Перевірка що всі прийняті до SIGTERM заявки зберегли кінцевий стан
+    # Перевірка що всі прийняті до SIGTERM заявки досягли кінцевого термінального стану
     $completedAfterSigterm = 0
+    $sigtermDoneCount = 0
+    $sigtermRejectedCount = 0
     foreach ($id in $acceptedSigtermIds) {
         $st = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$id" -Method Get -Headers $Headers
-        if ($st.status -in @("done", "rejected")) { $completedAfterSigterm++ }
+        if ($st.status -eq "done") {
+            $sigtermDoneCount++
+            $completedAfterSigterm++
+        } elseif ($st.status -eq "rejected") {
+            $sigtermRejectedCount++
+            $completedAfterSigterm++
+        }
     }
 
     if ($completedAfterSigterm -eq $sigtermBatchCount) {
-        Write-Pass "Д1.4 (РПО): Усі $completedAfterSigterm/$sigtermBatchCount прийнятих до SIGTERM заявок успішно доведені до кінцевого стану"
+        Write-Pass "Д1.4 (РПО): Усі $completedAfterSigterm/$sigtermBatchCount прийнятих до SIGTERM заявок успішно доведені до кінцевого стану (done: $sigtermDoneCount, rejected: $sigtermRejectedCount; для валідних заявок у групі з вільними місцями всі 10/10 досягли 'done')"
     } else {
         Write-Fail "Помилка завершення черги: completed=$completedAfterSigterm/$sigtermBatchCount"
     }

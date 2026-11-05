@@ -16,7 +16,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     private readonly IDbConnectionFactory _connectionFactory;
     private readonly MetricsCollector _metrics;
     private readonly ServiceOptions _options;
-    private readonly WebEnrollmentService _enrollmentService;
+    private readonly IWebEnrollmentNotifier _webNotifier;
 
     public EnrollmentRequestProcessor(
         EnrollmentRequestRepository requestRepo,
@@ -26,7 +26,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         IDbConnectionFactory connectionFactory,
         MetricsCollector metrics,
         ServiceOptions options,
-        WebEnrollmentService? enrollmentService = null)
+        IWebEnrollmentNotifier? webNotifier = null)
     {
         _requestRepo = requestRepo;
         _groupRepo = groupRepo;
@@ -35,7 +35,8 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         _connectionFactory = connectionFactory;
         _metrics = metrics;
         _options = options;
-        _enrollmentService = enrollmentService ?? new WebEnrollmentService(groupRepo, enrollmentRepo, decanateRepo, connectionFactory, options);
+        _webNotifier = webNotifier ?? new WebEnrollmentNotifier(
+            new WebEnrollmentService(groupRepo, enrollmentRepo, decanateRepo, connectionFactory, options));
     }
 
     private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
@@ -350,9 +351,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             string? existingRosterGroup = await _decanateRepo.GetRosterGroupForRequestAsync(item.Id, conn, tx, cancellationToken);
             if (existingRosterGroup != null)
             {
-                // О1.5 DPC: час завершення обробки публікується ДО COMMIT, щоб будь-який конкурентний GET
-                // гарантовано зафіксував delivery_wait_ms на найпершому отриманні фінального результату
-                var finishedAtUtc = _metrics.MarkProcessingFinished(item);
+                var finishedAtUtc = DateTimeOffset.UtcNow;
                 await _requestRepo.UpdateStatusAsync(
                     item.Id,
                     "done",
@@ -365,6 +364,27 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 await tx.CommitAsync(cancellationToken);
                 committed = true;
 
+                // О1.5 DPC: час завершення обробки публікується СТРОГО ПІСЛЯ завершення коміту транзакції
+                _metrics.MarkProcessingFinished(item);
+
+                // Якщо це спільний запис Web + DPC, ідемпотентно повідомляємо Web
+                if (targetEnrollmentId.HasValue)
+                {
+                    try
+                    {
+                        await _webNotifier.NotifyRosterRecordedAsync(targetEnrollmentId.Value, item.Id, cancellationToken);
+                    }
+                    catch (Exception notifyEx)
+                    {
+                        StructuredJsonLogger.LogEvent(_options.InstanceId, "web_notification_failed", new Dictionary<string, object?>
+                        {
+                            ["request_id"] = item.Id,
+                            ["enrollment_id"] = targetEnrollmentId.Value,
+                            ["error"] = notifyEx.Message
+                        });
+                    }
+                }
+
                 return ("done", null, true);
             }
 
@@ -372,8 +392,9 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             {
                 // Спільний наскрізний сценарій Web + DPC (тема C10, §2.6.4):
                 // Якщо передано requested_enrollment_id (або enrollment_id), місце вже зарезервовано Web-контуром (held).
-                // Воркер РПО в безпечному режимі (SAFE) перевіряє повну валідність зв'язування, підтверджує запис (held -> confirmed)
-                // та вносить його до відомості decanate_roster без повторного списання available або кредитів студента (Сценарій Б).
+                // DPC перевіряє відповідність даних та записує студента у відомість decanate_roster у власній транзакції.
+                // Після фіксації транзакції DPC повідомляє Web через IWebEnrollmentNotifier, а Web самостійно
+                // переводить запис із held у confirmed у своїй транзакції.
                 if (targetEnrollmentId.HasValue)
                 {
                     // 1. Перевіряємо існування та блокуємо запис enrollment FOR UPDATE
@@ -421,11 +442,11 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                         return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).", false);
                     }
 
-                    var finishedAtUtcJoint = _metrics.MarkProcessingFinished(item);
+                    var finishedAtUtcJoint = DateTimeOffset.UtcNow;
 
                     try
                     {
-                        // РПО вносить запис до відомості decanate_roster у спільній транзакції
+                        // РПО вносить запис до відомості decanate_roster у транзакції DPC
                         await _decanateRepo.InsertRosterEntryAsync(
                             item.Id,
                             item.StudentId,
@@ -445,15 +466,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                         return ("rejected", ex.Message, false);
                     }
 
-                    // Web підтверджує Web-запис (held -> confirmed) в єдиній спільній транзакції
-                    bool confirmed = await _enrollmentService.ConfirmEnrollmentFromRosterAsync(
-                        targetEnrollmentId.Value, item.Id, conn, tx, cancellationToken);
-                    if (!confirmed)
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' не вдалося підтвердити у спільній транзакції.", false);
-                    }
-
                     await _requestRepo.UpdateStatusAsync(
                         item.Id,
                         "done",
@@ -466,6 +478,25 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
                     await tx.CommitAsync(cancellationToken);
                     committed = true;
+
+                    // О1.5 DPC: час завершення обробки фіксується СТРОГО ПІСЛЯ завершення коміту транзакції
+                    _metrics.MarkProcessingFinished(item);
+
+                    // Web самостійно виконує перехід held -> confirmed у власній окремій транзакції.
+                    // DPC повідомляє Web про результат через нотифікатор IWebEnrollmentNotifier.
+                    try
+                    {
+                        await _webNotifier.NotifyRosterRecordedAsync(targetEnrollmentId.Value, item.Id, cancellationToken);
+                    }
+                    catch (Exception notifyEx)
+                    {
+                        StructuredJsonLogger.LogEvent(_options.InstanceId, "web_notification_failed", new Dictionary<string, object?>
+                        {
+                            ["request_id"] = item.Id,
+                            ["enrollment_id"] = targetEnrollmentId.Value,
+                            ["error"] = notifyEx.Message
+                        });
+                    }
 
                     return ("done", null, true);
                 }
@@ -488,7 +519,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
                 // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
                 // Пряма паралельна обробка заявок черги з атомарним декрементом available під FOR UPDATE.
-                // (У цільовому Сценарії Б за подіями Web на ЛР4 первинне списання здійснює Web, а РПО веде відомість, а перерозподіл second_choice заплановано у ЛР6 (координація виконавців та захист спільного ресурсу поколінням)).
                 bool decremented = await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, tx, cancellationToken);
                 if (!decremented)
                 {
@@ -499,9 +529,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 // Оновлення кількості та кредитів студента
                 await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
 
-                // О1.5 DPC: час завершення обробки публікується ДО COMMIT, щоб будь-який конкурентний GET
-                // гарантовано зафіксував delivery_wait_ms на найпершому отриманні фінального результату
-                var finishedAtUtc = _metrics.MarkProcessingFinished(item);
+                var finishedAtUtc = DateTimeOffset.UtcNow;
 
                 try
                 {
@@ -539,6 +567,9 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 await tx.CommitAsync(cancellationToken);
                 committed = true;
 
+                // О1.5 DPC: час завершення обробки публікується СТРОГО ПІСЛЯ завершення коміту транзакції
+                _metrics.MarkProcessingFinished(item);
+
                 return ("done", null, true);
             }
             else
@@ -565,7 +596,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
                 await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
 
-                var finishedAtUtc = _metrics.MarkProcessingFinished(item);
+                var finishedAtUtc = DateTimeOffset.UtcNow;
                 try
                 {
                     await _decanateRepo.InsertRosterEntryAsync(
@@ -599,6 +630,9 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
                 await tx.CommitAsync(cancellationToken);
                 committed = true;
+
+                // О1.5 DPC: час завершення обробки публікується СТРОГО ПІСЛЯ завершення коміту транзакції
+                _metrics.MarkProcessingFinished(item);
 
                 return ("done", null, true);
             }

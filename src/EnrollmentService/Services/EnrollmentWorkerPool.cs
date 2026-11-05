@@ -283,7 +283,6 @@ public sealed class EnrollmentWorkerPool : IHostedService
         }
 
         _isShuttingDown = true;
-        _queue.Complete();
 
         StructuredJsonLogger.LogEvent(_options.InstanceId, "sigterm_received", new Dictionary<string, object?>
         {
@@ -302,6 +301,36 @@ public sealed class EnrollmentWorkerPool : IHostedService
     {
         try
         {
+            // Якщо кількість прийнятих заявок перевищує ємність черги в оперативній пам'яті,
+            // продовжуємо дозавантажувати збережені в БД заявки зі статусом queued у вільні слоти,
+            // щоб усі прийняті заявки гарантовано дійшли до термінального статусу (done / rejected).
+            if (_requestRepo != null)
+            {
+                while (true)
+                {
+                    int replenished = await ReplenishQueueDuringDrainAsync();
+                    if (replenished == 0 && _queue.Count == 0)
+                    {
+                        var remaining = await _requestRepo.GetQueuedRequestsAsync(1);
+                        if (remaining.Count == 0)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (_queue.Count > 0)
+                    {
+                        await Task.Delay(50);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+
+            _queue.Complete();
+
             if (_asyncWorkers.Count > 0)
             {
                 await Task.WhenAll(_asyncWorkers);
@@ -342,6 +371,46 @@ public sealed class EnrollmentWorkerPool : IHostedService
         {
             _lifetime.StopApplication();
         }
+    }
+
+    private async Task<int> ReplenishQueueDuringDrainAsync(CancellationToken cancellationToken = default)
+    {
+        if (_requestRepo == null) return 0;
+
+        int enqueuedCount = 0;
+        int freeSlots = _queue.Capacity - _queue.Count;
+        if (freeSlots <= 0) return 0;
+
+        var pending = await _requestRepo.GetQueuedRequestsAsync(freeSlots, cancellationToken);
+        if (pending.Count == 0) return 0;
+
+        foreach (var item in pending)
+        {
+            if (!_enqueuedItemIds.TryAdd(item.Id, 0))
+            {
+                continue;
+            }
+
+            if (!_queue.TryReserveSlot())
+            {
+                _enqueuedItemIds.TryRemove(item.Id, out _);
+                break;
+            }
+
+            bool enqueued = _metrics.TryEnqueueReservedAndRecordAccepted(_queue, item);
+            if (enqueued)
+            {
+                enqueuedCount++;
+            }
+            else
+            {
+                _queue.ReleaseSlot();
+                _enqueuedItemIds.TryRemove(item.Id, out _);
+                break;
+            }
+        }
+
+        return enqueuedCount;
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
