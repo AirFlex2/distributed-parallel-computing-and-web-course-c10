@@ -62,11 +62,11 @@ $$\Phi(t) = B t - A \tau e^{-t/\tau}$$
 stateDiagram-v2
     [*] --> held: POST /v1/enrollments<br>(вільне місце зарезервовано, expires_at = now + 15 хв)
     
-    held --> confirmed: POST /v1/enrollments/{id}/confirm<br>(студент підтвердив вибір до спливу 15 хв)
+    held --> confirmed: POST /v1/enrollments/{id}/confirm або підтвердження РПО<br>(студент зарахований, запис у відомості)
     held --> cancelled: POST /v1/enrollments/{id}/cancel<br>(студент відмовився, місце повернено в групу)
     held --> expired: Фоновий таймер або дія після expires_at<br>(місце автоматично повернено в групу)
     
-    confirmed --> cancelled: POST /v1/enrollments/{id}/cancel<br>(скасування підтвердженого запису, місце повернено)
+    confirmed --> [*]
     
     confirmed --> confirmed: Повторний POST confirm<br>(ідемпотентна відповідь 200, версія не змінюється)
     cancelled --> cancelled: Повторний POST cancel<br>(ідемпотентна відповідь 200, версія не змінюється)
@@ -83,7 +83,7 @@ stateDiagram-v2
 | `held` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | $v = v + 1$ | Не змінюється (вже зарезервовано) | Не змінюється |
 | `held` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | $v = v + 1$ | `available = available + 1` | `active_count - 1`, `active_ects - ects` |
 | `held` ($t > \text{expires\_at}$) | Фоновий таймер або дія після спливу часу | `expired` | $v = v + 1$ | `available = available + 1` (повернення) | `active_count - 1`, `active_ects - ects` |
-| `confirmed` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | $v = v + 1$ | `available = available + 1` (повернення) | `active_count - 1`, `active_ects - ects` |
+| `confirmed` | `POST /v1/enrollments/{id}/cancel` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється | 409 Conflict (`enrollment_already_confirmed`). Звичайне скасування підтвердженого запису заборонено |
 | `confirmed` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | Не змінюється | Не змінюється (ідемпотентно) | Не змінюється |
 | `cancelled` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | Не змінюється | Не змінюється (ідемпотентно) | Не змінюється |
 
@@ -603,7 +603,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
    - Запис можливий строго у межах затвердженого часового вікна `[opens_at, closes_at)` у часовому поясі університету `Europe/Kyiv`.
 3. **Ідемпотентність клієнтських дій**:
    - Контур РПО: клієнт передає заголовок `Idempotency-Key` (довільний рядок до 128 символів) або поле `request_id` (UUID). Заголовок `Idempotency-Key` має пріоритет над DTO. Ключ є глобально унікальним у системі: повторне надсилання запиту з тим самим ключем та ідентичними параметрами (`student_id` + `group_id`) повертає збережений результат `202 Accepted` без повторного взяття місць у групі; повторне використання того самого ключа з іншими параметрами (або іншим студентом) гарантовано відхиляється з кодом `409 Conflict` (`idempotency_conflict`).
-   - Web-контур: повторні виклики `POST /confirm` або `POST /cancel` є строго ідемпотентними, повертають актуальний стан запису і не збільшують номер версії `version`.
+   - Web-контур: підтримує обов'язковий заголовок `Idempotency-Key` при створенні запису (`POST /v1/enrollments`, О2.2 Web). Повторний запит із тим самим ключем і корисним навантаженням повертає збережений результат `201 Created` без повторного списання місць. Повторне надсилання того самого ключа з іншим корисним навантаженням або іншим студентом повертає `422 Unprocessable Content` (`idempotency_key_payload_mismatch`). Повторні виклики `POST /confirm` або `POST /cancel` є строго ідемпотентними, повертають актуальний стан запису і не збільшують номер версії `version`.
 4. **Коректне виведення з експлуатації (Graceful Shutdown, РПО Д1.4)**:
    - Вузол перехоплює системний сигнал `SIGTERM` через `PosixSignalRegistration.Create`.
    - Встановлюється прапорець `IsShuttingDown = true`. Усі нові HTTP-запити до черги негайно отримують **`503 Service Unavailable`** (сервер продовжує працювати і повертає коректний статус замість аварійного розриву з'єднання Nginx 502).
@@ -630,14 +630,17 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
    - `409 Conflict`: стан конфлікту на рівні розділюваного ресурсу (Resource State Conflict за RFC 9110):
      - Вичерпано вільні місця в групі при конкурентному змаганні транзакцій (`group_full`).
      - Конфлікт унікальності активного запису на ту саму дисципліну (`duplicate_discipline_enrollment`).
-     - Конфлікт параметрів при повторному використанні заголовка `Idempotency-Key` (`idempotency_conflict`).
+     - Конфлікт параметрів при повторному використанні заголовка `Idempotency-Key` у черзі (`idempotency_conflict`).
+     - Спроба скасувати підтверджений запис `confirmed` (`enrollment_already_confirmed`) або прострочений `expired` (`enrollment_expired`).
    - `422 Unprocessable Content`: порушення семантичних доменних інваріантів запиту (Domain Invariant Validation за RFC 9110 / RFC 4918), коли синтаксис і типи валідні, але стан сутності студента або правила навчального процесу не дозволяють виконання операції:
      - Перевищення семестрового ліміту кредитів ЄКТС > 30.0 (`ects_limit_exceeded`).
      - Перевищення персонального ліміту $K$ вибіркових дисциплін студента (`discipline_limit_exceeded`).
      - Подання заявки поза межами відкритого часового вікна запису (`enrollment_window_closed`).
      - Спроба запису в групу, закріплену та закриту деканатом (`group_closed`).
      - Порушення протоколу автентифікації — передача `student_id` у тілі запиту замість заголовка `X-User-Id` (`owner_in_body_forbidden`).
-10. **Авторизація за ролями для службових дій деканату (межі ЛР1 та майбутня ЛР3)**:
+     - Повторне надсилання заголовка `Idempotency-Key` з іншим корисним навантаженням або для іншого студента (`idempotency_key_payload_mismatch`, вимога Web О2.2).
+10. **Авторизація за ролями та захист персональних даних (Web О1.4, О3.2, GDPR)**:
+   - Доступ до персональних даних студентів (`GET /v1/students`, `GET /v1/students/{id}`) суворо захищено: неавтентифіковані запити повертають `401 Unauthorized`; студенти (із заголовком `X-User-Id`) мають доступ виключно до власного профілю, а спроба отримати чужі дані повертає `403 Forbidden`; персонал із дійсним Bearer-токеном має повний доступ до списку та фільтрації студентів.
    - Маршрут закриття набору в групу `/v1/groups/{id}/close` у межах ЛР1 захищений загальним службовим Bearer-токеном (`API_AUTH_TOKEN`), що валідується в `BearerAuthMiddleware`.
    - Повноцінна рольова модель (RBAC із ролями «студент», «працівник деканату», «адміністратор» та клеймами у JWT) винесена за межі ЛР1 відповідно до програми навчання і буде реалізована в ЛР3 (Web), де передбачено автентифікацію, вхід та розмежування доступу за ролями.
 

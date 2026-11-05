@@ -55,9 +55,9 @@ public sealed class EnrollmentService
                     !string.Equals(existing.Value.StudentId, studentId, StringComparison.Ordinal))
                 {
                     return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                        StatusCodes.Status409Conflict,
-                        "idempotency_key_conflict",
-                        "Конфлікт ключа ідемпотентності",
+                        StatusCodes.Status422UnprocessableEntity,
+                        "idempotency_key_payload_mismatch",
+                        "Невідповідність корисного навантаження ключа ідемпотентності",
                         "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
                 }
 
@@ -194,9 +194,9 @@ public sealed class EnrollmentService
                     !string.Equals(existing.Value.StudentId, studentId, StringComparison.Ordinal))
                 {
                     return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                        StatusCodes.Status409Conflict,
-                        "idempotency_key_conflict",
-                        "Конфлікт ключа ідемпотентності",
+                        StatusCodes.Status422UnprocessableEntity,
+                        "idempotency_key_payload_mismatch",
+                        "Невідповідність корисного навантаження ключа ідемпотентності",
                         "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента.");
                 }
 
@@ -384,10 +384,41 @@ public sealed class EnrollmentService
                     $"Запис із номером '{enrollmentId}' для студента '{studentId}' не існує.");
             }
 
-            if (enrollment.Status == "cancelled" || enrollment.Status == "expired")
+            if (enrollment.Status == "confirmed")
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_already_confirmed",
+                    "Неможливо скасувати підтверджений запис",
+                    "Підтверджений запис (confirmed) вже внесено до відомості деканату і він не підлягає скасуванню через студентський інтерфейс.");
+            }
+
+            if (enrollment.Status == "cancelled")
             {
                 await tx.CommitAsync(cancellationToken);
                 return ServiceResult<WebEnrollmentResponseDto>.Ok(enrollment);
+            }
+
+            if (enrollment.Status == "expired" || enrollment.ExpiresAt < nowUtc)
+            {
+                if (enrollment.Status != "expired")
+                {
+                    await using var expCmd = new NpgsqlCommand(
+                        "UPDATE enrollment SET status = 'expired', version = version + 1 WHERE id = @id;", conn, tx);
+                    expCmd.Parameters.AddWithValue("id", enrollmentId);
+                    await expCmd.ExecuteNonQueryAsync(cancellationToken);
+
+                    await _groupRepo.IncrementAvailableAsync(enrollment.GroupId, conn, tx, cancellationToken);
+                    await _enrollmentRepo.UpdateStudentStatsAsync(studentId, -1, -enrollment.Ects, conn, tx, cancellationToken);
+                }
+                await tx.CommitAsync(cancellationToken);
+
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_expired",
+                    "Термін резервування сплив",
+                    "Час утримання місця (held) завершився, запис перейшов у стан 'expired' і не підлягає скасуванню.");
             }
 
             int newVersion = enrollment.Version + 1;
@@ -475,7 +506,83 @@ public sealed class EnrollmentService
                 $"Запис '{enrollmentId}' для студента '{studentId}' не існує.");
         }
 
-        return ServiceResult<WebEnrollmentResponseDto>.Ok(item);
+        if (item.Status == "held")
+        {
+            await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+            await using var cmd = new NpgsqlCommand(
+                "SELECT request_id FROM decanate_roster WHERE enrollment_id = @eid LIMIT 1;", conn);
+            cmd.Parameters.AddWithValue("eid", enrollmentId);
+            var reqIdObj = await cmd.ExecuteScalarAsync(cancellationToken);
+            if (reqIdObj is Guid reqId)
+            {
+                await ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId, cancellationToken);
+                item = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
+            }
+        }
+
+        return ServiceResult<WebEnrollmentResponseDto>.Ok(item!);
+    }
+
+    public async Task<bool> ConfirmEnrollmentFromRosterAsync(
+        Guid enrollmentId,
+        Guid requestId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            await using var chkCmd = new NpgsqlCommand(
+                "SELECT status FROM enrollment WHERE id = @eid FOR UPDATE;", conn, tx);
+            chkCmd.Parameters.AddWithValue("eid", enrollmentId);
+            var statusObj = await chkCmd.ExecuteScalarAsync(cancellationToken);
+            if (statusObj is not string currentStatus)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            if (currentStatus == "confirmed")
+            {
+                await tx.CommitAsync(cancellationToken);
+                return true;
+            }
+
+            if (currentStatus != "held")
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            await using var verifyCmd = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM decanate_roster WHERE request_id = @reqId AND enrollment_id = @eid;", conn, tx);
+            verifyCmd.Parameters.AddWithValue("reqId", requestId);
+            verifyCmd.Parameters.AddWithValue("eid", enrollmentId);
+            long rosterCount = (long)(await verifyCmd.ExecuteScalarAsync(cancellationToken) ?? 0L);
+
+            if (rosterCount == 0)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            await using var updateCmd = new NpgsqlCommand(@"
+                UPDATE enrollment
+                SET status = 'confirmed',
+                    version = version + 1
+                WHERE id = @eid AND status = 'held';", conn, tx);
+            updateCmd.Parameters.AddWithValue("eid", enrollmentId);
+            int rows = await updateCmd.ExecuteNonQueryAsync(cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+            return rows > 0;
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 
     public async Task<ServiceResult<WebDisciplineListResponseDto>> GetDisciplinesAsync(

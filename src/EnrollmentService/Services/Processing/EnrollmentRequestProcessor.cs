@@ -3,6 +3,7 @@ using EnrollmentService.Domain;
 using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
+using WebEnrollmentService = global::EnrollmentService.Services.EnrollmentService;
 
 namespace EnrollmentService.Services.Processing;
 
@@ -15,6 +16,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     private readonly IDbConnectionFactory _connectionFactory;
     private readonly MetricsCollector _metrics;
     private readonly ServiceOptions _options;
+    private readonly WebEnrollmentService _enrollmentService;
 
     public EnrollmentRequestProcessor(
         EnrollmentRequestRepository requestRepo,
@@ -23,7 +25,8 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         DecanateRepository decanateRepo,
         IDbConnectionFactory connectionFactory,
         MetricsCollector metrics,
-        ServiceOptions options)
+        ServiceOptions options,
+        WebEnrollmentService? enrollmentService = null)
     {
         _requestRepo = requestRepo;
         _groupRepo = groupRepo;
@@ -32,6 +35,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         _connectionFactory = connectionFactory;
         _metrics = metrics;
         _options = options;
+        _enrollmentService = enrollmentService ?? new WebEnrollmentService(groupRepo, enrollmentRepo, connectionFactory, options);
     }
 
     private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
@@ -369,16 +373,9 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                         return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).");
                     }
 
-                    // 7. Виконуємо підтвердження через ConfirmEnrollmentHeldAsync з обов'язковою перевіркою результату
-                    bool confirmed = await _enrollmentRepo.ConfirmEnrollmentHeldAsync(targetEnrollmentId.Value, conn, tx, cancellationToken);
-                    if (!confirmed)
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Не вдалося підтвердити Web-запис '{targetEnrollmentId.Value}' (стан було змінено або запис не у стані held).");
-                    }
-
                     var finishedAtUtcJoint = _metrics.MarkProcessingFinished(item);
 
+                    // РПО атомарно фіксує результат обробки у власних таблицях (відомість decanate_roster та стан заявки)
                     await _decanateRepo.InsertRosterEntryAsync(
                         item.Id,
                         item.StudentId,
@@ -403,6 +400,10 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                         cancellationToken);
 
                     await tx.CommitAsync(cancellationToken);
+
+                    // Web самостійно переводить Web-запис у confirmed на основі зафіксованого результату РПО
+                    await _enrollmentService.ConfirmEnrollmentFromRosterAsync(
+                        targetEnrollmentId.Value, item.Id, cancellationToken);
 
                     if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
                     {
@@ -540,7 +541,14 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         catch
         {
             _metrics.ResetProcessingFinished(item);
-            await tx.RollbackAsync(cancellationToken);
+            try
+            {
+                await tx.RollbackAsync(cancellationToken);
+            }
+            catch
+            {
+                // Транзакція могла вже бути зафіксована до виникнення помилки
+            }
             throw;
         }
     }

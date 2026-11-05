@@ -616,14 +616,28 @@ paths:
     get:
       operationId: listPrecreatedStudents
       tags: [Web]
-      summary: Довідник наперед створених студентів у БД для вибору X-User-Id до введення автентифікації в ЛР3
-      description: Повертає перелік тестових і робочих профілів студентів із поточними лічильниками активних дисциплін та кредитів ЄКТС.
+      summary: Список студентів у БД із захистом персональних даних (Web О1.4, О3.2, GDPR)
+      description: |
+        Повертає перелік студентів із дотриманням рольового доступу (RBAC):
+        - Персонал (із заголовком Authorization: Bearer <token>) має право переглядати повний список студентів або фільтрувати за ?student_id=...;
+        - Студент (із заголовком X-User-Id) має доступ виключно до власного профілю (спроба отримати чужі дані через ?student_id=... повертає 403 Forbidden);
+        - Неавтентифіковані запити відхиляються зі статусом 401 Unauthorized.
+      security:
+        - bearerAuth: []
+        - {}
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdOptionalHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
+        - name: student_id
+          in: query
+          required: false
+          description: Фільтрація за ідентифікатором студента (доступно персоналу або для власного ID студента)
+          schema:
+            type: string
       responses:
         "200":
-          description: Список студентів
+          description: Список студентів (для персоналу — повний або відфільтрований, для студента — лише власний профіль)
           content:
             application/json:
               schema:
@@ -637,6 +651,74 @@ paths:
                     active_count: 1
                     active_ects: 6.0
                     max_ects: 30.0
+        "401":
+          description: Неавторизований доступ (відсутній токен або заголовок X-User-Id)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          description: Доступ заборонено (студент намагається переглянути чужі дані)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/students/{id}:
+    get:
+      operationId: getStudentById
+      tags: [Web]
+      summary: Отримання профілю конкретного студента (Web О3.2)
+      description: |
+        Повертає профіль студента за його ідентифікатором:
+        - Персонал може отримати профіль будь-якого студента;
+        - Студент може отримати виключно власний профіль (спроба запитати чуже ID повертає 403 Forbidden).
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Ідентифікатор студента
+          schema:
+            type: string
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/XUserIdOptionalHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Профіль студента
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebStudent"
+              example:
+                id: "student-1"
+                email: "timur.zinkivskyi@inf.edu.ua"
+                full_name: "Зінківський Тимур Євгенійович (ІТІНФ-23-2)"
+                max_disciplines: 5
+                active_count: 1
+                active_ects: 6.0
+                max_ects: 30.0
+        "401":
+          description: Неавторизований доступ
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          description: Доступ заборонено (спроба переглянути чужий профіль)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Студента не знайдено
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
 
   /v1/disciplines:
     get:
@@ -814,19 +896,32 @@ paths:
                 error_code: "group_full"
                 request_id: "req-409-demo"
         "422":
-          description: Семантична неможливість обробки (перевищення семестрового ліміту ЄКТС або кількості дисциплін, запит поза часовим вікном, закрита група або невалідні поля)
+          description: Семантична неможливість обробки (перевищення семестрового ліміту ЄКТС або кількості дисциплін, запит поза часовим вікном, закрита група, невалідні поля або невідповідність корисного навантаження ключа Idempotency-Key О2.2)
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
-              example:
-                type: "https://urn.c10.edu.ua/problems/ects_limit_exceeded"
-                title: "Перевищено семестровий ліміт кредитів ЄКТС"
-                status: 422
-                detail: "Сума кредитів після запису становить 30.5 ЄКТС, що перевищує максимум 30.0 ЄКТС."
-                instance: "/v1/enrollments"
-                error_code: "ects_limit_exceeded"
-                request_id: "req-422-demo"
+              examples:
+                ects_limit:
+                  summary: Перевищення ліміту ЄКТС
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/ects_limit_exceeded"
+                    title: "Перевищено семестровий ліміт кредитів ЄКТС"
+                    status: 422
+                    detail: "Сума кредитів після запису становить 30.5 ЄКТС, що перевищує максимум 30.0 ЄКТС."
+                    instance: "/v1/enrollments"
+                    error_code: "ects_limit_exceeded"
+                    request_id: "req-422-demo"
+                idempotency_payload_mismatch:
+                  summary: Повторний ключ Idempotency-Key з іншим тілом (Web О2.2)
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/idempotency_key_payload_mismatch"
+                    title: "Невідповідність корисного навантаження ключа ідемпотентності"
+                    status: 422
+                    detail: "Ключ Idempotency-Key вже використано для іншого запиту або іншого студента."
+                    instance: "/v1/enrollments"
+                    error_code: "idempotency_key_payload_mismatch"
+                    request_id: "req-422-idem-demo"
 
     get:
       operationId: listStudentEnrollments
@@ -1060,6 +1155,31 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
+        "409":
+          description: Конфлікт стану (неможливо скасувати підтверджений запис confirmed або прострочений запис expired)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                already_confirmed:
+                  summary: Підтверджений запис у відомості деканату
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/enrollment_already_confirmed"
+                    title: "Неможливо скасувати підтверджений запис"
+                    status: 409
+                    detail: "Підтверджений запис (confirmed) вже внесено до відомості деканату і він не підлягає скасуванню через студентський інтерфейс."
+                    instance: "/v1/enrollments/8f14e45f-ceea-467a-9a38-1b241d45b001/cancel"
+                    error_code: "enrollment_already_confirmed"
+                expired:
+                  summary: Термін резервування сплив
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/enrollment_expired"
+                    title: "Термін резервування сплив"
+                    status: 409
+                    detail: "Час утримання місця (held) завершився, запис перейшов у стан 'expired' і не підлягає скасуванню."
+                    instance: "/v1/enrollments/8f14e45f-ceea-467a-9a38-1b241d45b001/cancel"
+                    error_code: "enrollment_expired"
 
   /v1/groups/{id}/close:
     post:

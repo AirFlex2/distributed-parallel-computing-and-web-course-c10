@@ -10,9 +10,61 @@ public static class EnrollmentEndpoints
 {
     public static IEndpointRouteBuilder MapEnrollmentEndpoints(this IEndpointRouteBuilder app)
     {
-        // Довідковий маршрут: список студентів у БД (для вибору X-User-Id у клієнті О1.4, О1.7)
-        app.MapGet("/v1/students", async (EnrollmentRepository enrollmentRepo, HttpContext ctx) =>
+        // Довідковий маршрут: список студентів у БД із захистом персональних даних (GDPR / Web О1.4, О3.2)
+        // 401 Unauthorized — якщо немає Bearer токена або X-User-Id
+        // 403 Forbidden — якщо студент із X-User-Id намагається переглянути чужі дані через ?student_id=...
+        // 200 OK — персонал бачить усіх або фільтрованого студента; студент бачить виключно власний профіль
+        app.MapGet("/v1/students", async (EnrollmentRepository enrollmentRepo, HttpContext ctx, ServiceOptions opts) =>
         {
+            string authHeader = ctx.Request.Headers.Authorization.ToString().Trim();
+            bool isStaff = !string.IsNullOrWhiteSpace(authHeader) &&
+                string.Equals(authHeader, $"Bearer {opts.ApiAuthToken}", StringComparison.Ordinal);
+
+            bool hasStudentHeader = ctx.Request.Headers.TryGetValue("X-User-Id", out var userHeader) &&
+                !string.IsNullOrWhiteSpace(userHeader.ToString());
+            string callerStudentId = hasStudentHeader ? userHeader.ToString().Trim() : string.Empty;
+
+            if (!isStaff && !hasStudentHeader)
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status401Unauthorized,
+                    "Неавторизований доступ",
+                    "Для доступу до персональних даних студентів необхідна автентифікація (Bearer токен персоналу або заголовок X-User-Id студента).",
+                    "unauthorized");
+            }
+
+            if (!isStaff)
+            {
+                if (ctx.Request.Query.TryGetValue("student_id", out var qStudent) && !string.IsNullOrWhiteSpace(qStudent))
+                {
+                    if (!string.Equals(qStudent.ToString().Trim(), callerStudentId, StringComparison.Ordinal))
+                    {
+                        return ProblemDetailsMapper.CreateProblemResult(
+                            ctx, opts,
+                            StatusCodes.Status403Forbidden,
+                            "Доступ заборонено",
+                            "Студент не має права переглядати персональні дані інших студентів.",
+                            "forbidden");
+                    }
+                }
+
+                var self = await enrollmentRepo.GetStudentByIdAsync(callerStudentId, ctx.RequestAborted);
+                var selfItems = self != null
+                    ? new[] { new WebStudentDto(self.Id, self.Email, self.FullName, self.MaxDisciplines, self.ActiveCount, self.ActiveEcts, EnrollmentDomainRules.MaxSemesterEcts) }
+                    : Array.Empty<WebStudentDto>();
+                return Results.Ok(new { items = selfItems });
+            }
+
+            if (ctx.Request.Query.TryGetValue("student_id", out var filterStudent) && !string.IsNullOrWhiteSpace(filterStudent))
+            {
+                var s = await enrollmentRepo.GetStudentByIdAsync(filterStudent.ToString().Trim(), ctx.RequestAborted);
+                var items = s != null
+                    ? new[] { new WebStudentDto(s.Id, s.Email, s.FullName, s.MaxDisciplines, s.ActiveCount, s.ActiveEcts, EnrollmentDomainRules.MaxSemesterEcts) }
+                    : Array.Empty<WebStudentDto>();
+                return Results.Ok(new { items });
+            }
+
             var students = await enrollmentRepo.GetStudentsAsync(ctx.RequestAborted);
             var dtos = students.Select(s => new WebStudentDto(
                 s.Id,
@@ -24,6 +76,58 @@ public static class EnrollmentEndpoints
                 EnrollmentDomainRules.MaxSemesterEcts
             )).ToList();
             return Results.Ok(new { items = dtos });
+        });
+
+        // Отримання профілю конкретного студента за його ідентифікатором (Web О3.2)
+        app.MapGet("/v1/students/{id}", async (string id, EnrollmentRepository enrollmentRepo, HttpContext ctx, ServiceOptions opts) =>
+        {
+            string authHeader = ctx.Request.Headers.Authorization.ToString().Trim();
+            bool isStaff = !string.IsNullOrWhiteSpace(authHeader) &&
+                string.Equals(authHeader, $"Bearer {opts.ApiAuthToken}", StringComparison.Ordinal);
+
+            bool hasStudentHeader = ctx.Request.Headers.TryGetValue("X-User-Id", out var userHeader) &&
+                !string.IsNullOrWhiteSpace(userHeader.ToString());
+            string callerStudentId = hasStudentHeader ? userHeader.ToString().Trim() : string.Empty;
+
+            if (!isStaff && !hasStudentHeader)
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status401Unauthorized,
+                    "Неавторизований доступ",
+                    "Для доступу до персональних даних студента необхідна автентифікація.",
+                    "unauthorized");
+            }
+
+            if (!isStaff && !string.Equals(id, callerStudentId, StringComparison.Ordinal))
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status403Forbidden,
+                    "Доступ заборонено",
+                    "Студент не має права переглядати персональні дані інших студентів.",
+                    "forbidden");
+            }
+
+            var student = await enrollmentRepo.GetStudentByIdAsync(id, ctx.RequestAborted);
+            if (student == null)
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status404NotFound,
+                    "Студента не знайдено",
+                    $"Студент '{id}' не існує у системі.",
+                    "student_not_found");
+            }
+
+            return Results.Ok(new WebStudentDto(
+                student.Id,
+                student.Email,
+                student.FullName,
+                student.MaxDisciplines,
+                student.ActiveCount,
+                student.ActiveEcts,
+                EnrollmentDomainRules.MaxSemesterEcts));
         });
 
         // Маршрут С10 (Web): GET /v1/disciplines — список дисциплін із групами, вікнами запису та залишком місць

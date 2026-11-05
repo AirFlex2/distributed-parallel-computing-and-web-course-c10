@@ -1229,7 +1229,7 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
     }
 
     [SkippableFact]
-    public async Task Web_O22_IdempotencyKey_DifferentPayload_Returns409Conflict()
+    public async Task Web_O22_IdempotencyKey_DifferentPayload_Returns422UnprocessableContent()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
@@ -1271,15 +1271,16 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             var response1 = await client.PostAsync("/v1/enrollments", content1);
             Assert.Equal(HttpStatusCode.Created, response1.StatusCode);
 
-            // Другий запит із тим самим ключем, але іншою групою -> 409 Conflict
+            // Другий запит із тим самим ключем, але іншою групою -> 422 Unprocessable Content
             var content2 = new StringContent($"{{\"group_id\": \"{groupId2}\"}}", Encoding.UTF8, "application/json");
             var response2 = await client.PostAsync("/v1/enrollments", content2);
-            Assert.Equal(HttpStatusCode.Conflict, response2.StatusCode);
+            Assert.Equal(HttpStatusCode.UnprocessableEntity, response2.StatusCode);
 
             var json2 = await response2.Content.ReadAsStringAsync();
             using var doc2 = JsonDocument.Parse(json2);
             var root2 = doc2.RootElement;
-            Assert.Equal("idempotency_key_conflict", root2.GetProperty("error_code").GetString());
+            Assert.Equal(422, root2.GetProperty("status").GetInt32());
+            Assert.Equal("idempotency_key_payload_mismatch", root2.GetProperty("error_code").GetString());
         }
         finally
         {
@@ -2618,6 +2619,359 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
             processor.RegisterPreProcessingHook(requestId, _ => Task.CompletedTask));
 
         Assert.Contains(requestId.ToString(), ex.Message);
+    }
+
+    [SkippableFact]
+    public async Task Migration010_Schema_DecanateRosterUniqueConstraints()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        await using var conn = await TestEnvironment.OpenConnectionAsync();
+
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'decanate_roster'
+              AND indexname IN ('uq_decanate_roster_student_discipline', 'uq_decanate_roster_enrollment_id');", conn);
+
+        var foundIndexes = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            foundIndexes.Add(reader.GetString(0));
+        }
+
+        Assert.Contains("uq_decanate_roster_student_discipline", foundIndexes);
+        Assert.Contains("uq_decanate_roster_enrollment_id", foundIndexes);
+    }
+
+    [SkippableFact]
+    public async Task CancelEnrollment_Held_Success_Returns200AndFreesSeats()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-cancel-held";
+        string groupId = "GRP-CANCEL-HELD";
+        string discId = "DISC-CANCEL-HELD";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-held-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Перевіряємо списання місця у Web
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdSeats = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @id;", conn);
+                cmdSeats.Parameters.AddWithValue("id", groupId);
+                int avail = (int)(await cmdSeats.ExecuteScalarAsync())!;
+                Assert.Equal(4, avail);
+            }
+
+            // Скасування запису held
+            var cancelResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/cancel", null);
+            Assert.Equal(HttpStatusCode.OK, cancelResp.StatusCode);
+            var cancelJson = await cancelResp.Content.ReadAsStringAsync();
+            using var cancelDoc = JsonDocument.Parse(cancelJson);
+            Assert.Equal("cancelled", cancelDoc.RootElement.GetProperty("status").GetString());
+
+            // Місце повернуто у групу, лічильники студента зменшено
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdSeats = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @id;", conn);
+                cmdSeats.Parameters.AddWithValue("id", groupId);
+                int avail = (int)(await cmdSeats.ExecuteScalarAsync())!;
+                Assert.Equal(5, avail);
+
+                await using var cmdStud = new NpgsqlCommand("SELECT active_count, active_ects FROM student WHERE id = @id;", conn);
+                cmdStud.Parameters.AddWithValue("id", studentId);
+                await using var rdr = await cmdStud.ExecuteReaderAsync();
+                Assert.True(await rdr.ReadAsync());
+                Assert.Equal(0, rdr.GetInt32(0));
+                Assert.Equal(0.0m, rdr.GetDecimal(1));
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task CancelEnrollment_Confirmed_Returns409Conflict()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-cancel-conf";
+        string groupId = "GRP-CANCEL-CONF";
+        string discId = "DISC-CANCEL-CONF";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-conf-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Переводимо у confirmed
+            var confResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/confirm", null);
+            Assert.Equal(HttpStatusCode.OK, confResp.StatusCode);
+
+            // Спроба скасувати підтверджений запис -> 409 Conflict
+            var cancelResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/cancel", null);
+            Assert.Equal(HttpStatusCode.Conflict, cancelResp.StatusCode);
+
+            var cancelJson = await cancelResp.Content.ReadAsStringAsync();
+            using var cancelDoc = JsonDocument.Parse(cancelJson);
+            Assert.Equal("enrollment_already_confirmed", cancelDoc.RootElement.GetProperty("error_code").GetString());
+
+            // Перевіряємо, що запис залишився confirmed
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("SELECT status FROM enrollment WHERE id = @id;", conn);
+                cmd.Parameters.AddWithValue("id", enrollmentId);
+                string status = (string)(await cmd.ExecuteScalarAsync())!;
+                Assert.Equal("confirmed", status);
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task CancelEnrollment_Expired_Returns409Conflict()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-cancel-exp";
+        string groupId = "GRP-CANCEL-EXP";
+        string discId = "DISC-CANCEL-EXP";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-exp-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Симулюємо сплив часу резервування (expires_at у минулому, з дотриманням expires_at > created_at)
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("UPDATE enrollment SET created_at = NOW() - INTERVAL '20 minutes', expires_at = NOW() - INTERVAL '5 minutes' WHERE id = @id;", conn);
+                cmd.Parameters.AddWithValue("id", enrollmentId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            // Спроба скасувати прострочений запис -> 409 Conflict
+            var cancelResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/cancel", null);
+            Assert.Equal(HttpStatusCode.Conflict, cancelResp.StatusCode);
+
+            var cancelJson = await cancelResp.Content.ReadAsStringAsync();
+            using var cancelDoc = JsonDocument.Parse(cancelJson);
+            Assert.Equal("enrollment_expired", cancelDoc.RootElement.GetProperty("error_code").GetString());
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task CancelEnrollment_Cancelled_Returns200Ok_DoesNotFreeSeatsTwice()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "student-cancel-idem";
+        string groupId = "GRP-CANCEL-IDEM";
+        string discId = "DISC-CANCEL-IDEM";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-idem-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Перше скасування -> 200 OK
+            var cancelResp1 = await client.PostAsync($"/v1/enrollments/{enrollmentId}/cancel", null);
+            Assert.Equal(HttpStatusCode.OK, cancelResp1.StatusCode);
+
+            // Повторне скасування (ідемпотентне за Д2.5) -> 200 OK
+            var cancelResp2 = await client.PostAsync($"/v1/enrollments/{enrollmentId}/cancel", null);
+            Assert.Equal(HttpStatusCode.OK, cancelResp2.StatusCode);
+
+            // Перевіряємо, що місце не звільнено вдруге (available має дорівнювати 5, а не 6)
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdSeats = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @id;", conn);
+                cmdSeats.Parameters.AddWithValue("id", groupId);
+                int avail = (int)(await cmdSeats.ExecuteScalarAsync())!;
+                Assert.Equal(5, avail);
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task GetStudents_WithoutAuth_Returns401Unauthorized()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        var resp = await client.GetAsync("/v1/students");
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(401, doc.RootElement.GetProperty("status").GetInt32());
+    }
+
+    [SkippableFact]
+    public async Task GetStudents_WithBearerToken_ReturnsFullList()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+        var resp = await client.GetAsync("/v1/students");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var items = doc.RootElement.GetProperty("items");
+        Assert.True(items.GetArrayLength() > 1);
+    }
+
+    [SkippableFact]
+    public async Task GetStudents_WithStudentXUserId_ReturnsOnlyOwnData()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+
+        var resp = await client.GetAsync("/v1/students");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var items = doc.RootElement.GetProperty("items");
+        Assert.Equal(1, items.GetArrayLength());
+        Assert.Equal("student-1", items[0].GetProperty("id").GetString());
+    }
+
+    [SkippableFact]
+    public async Task GetStudents_WithStudentXUserId_AccessingOtherStudent_Returns403Forbidden()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+
+        var resp = await client.GetAsync("/v1/students?student_id=student-2");
+        Assert.Equal(HttpStatusCode.Forbidden, resp.StatusCode);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(403, doc.RootElement.GetProperty("status").GetInt32());
+    }
+
+    [SkippableFact]
+    public async Task GetStudentById_WithoutAuth_Returns401Unauthorized()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        var resp = await client.GetAsync("/v1/students/student-1");
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
+    }
+
+    [SkippableFact]
+    public async Task GetStudentById_ByStudent_OwnData_Returns200Ok()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+
+        var resp = await client.GetAsync("/v1/students/student-1");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("student-1", doc.RootElement.GetProperty("id").GetString());
+    }
+
+    [SkippableFact]
+    public async Task GetStudentById_ByStudent_OtherData_Returns403Forbidden()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+
+        var resp = await client.GetAsync("/v1/students/student-2");
+        Assert.Equal(HttpStatusCode.Forbidden, resp.StatusCode);
+    }
+
+    [SkippableFact]
+    public async Task GetStudentById_ByStaff_Returns200Ok()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+        var resp = await client.GetAsync("/v1/students/student-1");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("student-1", doc.RootElement.GetProperty("id").GetString());
     }
 
     private static string FindMigrationFile(string fileName)

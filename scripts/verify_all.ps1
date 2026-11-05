@@ -1114,6 +1114,48 @@ try {
         Write-Fail "Помилка перевірки статусу скасування: v1=$($firstCancel.version), v2=$($secondCancel.version)"
     }
 
+    # 10.13.1 Спроба скасувати підтверджений запис (confirmed) -> 409 Conflict (C10)
+    $cancelConfirmedRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$heldId/cancel" -Method Post -Headers $webHeadersStudent1 -SkipHttpErrorCheck
+    $cancelConfirmedJson = (Get-ResponseText $cancelConfirmedRes) | ConvertFrom-Json
+    if ([int]$cancelConfirmedRes.StatusCode -eq 409 -and $cancelConfirmedJson.error_code -eq "enrollment_already_confirmed") {
+        Write-Pass "Web C10: Спроба скасувати підтверджений запис (confirmed) відхилена з HTTP 409 Conflict (error_code=enrollment_already_confirmed)"
+    } else {
+        Write-Fail "Очікувався 409 enrollment_already_confirmed при скасуванні confirmed, отримано: $([int]$cancelConfirmedRes.StatusCode)"
+    }
+
+    # 10.13.2 Перевірка захисту персональних даних /v1/students (О1.4, О3.2 Web)
+    $anonStudentsRes = Invoke-WebRequest -Uri "$BaseUrl/v1/students" -Method Get -SkipHttpErrorCheck
+    if ([int]$anonStudentsRes.StatusCode -eq 401) {
+        Write-Pass "Web О3.2: Неавтентифікований запит до /v1/students відхилено з HTTP 401 Unauthorized"
+    } else {
+        Write-Fail "Очікувався 401 для анонімного GET /v1/students, отримано: $([int]$anonStudentsRes.StatusCode)"
+    }
+
+    $studentSelfRes = Invoke-RestMethod -Uri "$BaseUrl/v1/students" -Method Get -Headers @{ "X-User-Id" = "student-1" }
+    if ($studentSelfRes.items.Count -eq 1 -and $studentSelfRes.items[0].id -eq "student-1") {
+        Write-Pass "Web О3.2: Студент отримує виключно власний профіль у GET /v1/students (items count = 1)"
+    } else {
+        Write-Fail "Помилка фільтрації профілю студента: items=$($studentSelfRes.items.Count)"
+    }
+
+    $forbiddenStudentRes = Invoke-WebRequest -Uri "$BaseUrl/v1/students?student_id=student-2" -Method Get -Headers @{ "X-User-Id" = "student-1" } -SkipHttpErrorCheck
+    if ([int]$forbiddenStudentRes.StatusCode -eq 403) {
+        Write-Pass "Web О3.2: Спроба студента отримати чужі персональні дані відхилена з HTTP 403 Forbidden"
+    } else {
+        Write-Fail "Очікувався 403 при доступі до чужого профілю, отримано: $([int]$forbiddenStudentRes.StatusCode)"
+    }
+
+    # 10.13.3 Повторний Idempotency-Key з іншим тілом -> 422 Unprocessable Content (О2.2 Web)
+    $ikTestKey = "ik-diff-body-" + [guid]::NewGuid().ToString("N")
+    $ikFirstRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $ikSecondRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-SEC-03"}' -SkipHttpErrorCheck
+    $ikSecondJson = (Get-ResponseText $ikSecondRes) | ConvertFrom-Json
+    if ([int]$ikSecondRes.StatusCode -eq 422 -and $ikSecondJson.error_code -eq "idempotency_key_payload_mismatch") {
+        Write-Pass "Web О2.2: Повторний Idempotency-Key з іншим тілом повернув HTTP 422 Unprocessable Content (error_code=idempotency_key_payload_mismatch)"
+    } else {
+        Write-Fail "Очікувався 422 idempotency_key_payload_mismatch, отримано: $([int]$ikSecondRes.StatusCode)"
+    }
+
     # 10.14 Балансування least_conn між app-a та app-b (О1.6 Web)
     $instancesObserved = [System.Collections.Generic.HashSet[string]]::new()
     for ($i = 0; $i -lt 15; $i++) {
