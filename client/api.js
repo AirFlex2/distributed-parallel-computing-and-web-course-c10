@@ -413,7 +413,11 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
             } catch (netErr) {
                 transientErrorCount++;
                 if (transientErrorCount > 5) {
-                    appendWebOpLog(`Помилка мережі при опитуванні черги: ${netErr.message}`);
+                    appendWebOpLog(
+                        `Помилка мережі при опитуванні черги: ${netErr.message}.\n` +
+                        `Заявка ${requestId} зберігається як pending. Ви можете повторити перевірку.`
+                    );
+                    savePendingRegistrationsToStorage();
                     await refreshAll();
                     return;
                 }
@@ -425,7 +429,11 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
                 if (pollRes.status === 429 || pollRes.status === 502 || pollRes.status === 503 || pollRes.status === 504) {
                     transientErrorCount++;
                     if (transientErrorCount > 5) {
-                        appendWebOpLog(`Перевищено ліміт тимчасових помилок шлюзу (HTTP ${pollRes.status}).`);
+                        appendWebOpLog(
+                            `Перевищено ліміт тимчасових помилок шлюзу (HTTP ${pollRes.status}).\n` +
+                            `Заявка ${requestId} зберігається як pending. Ви можете натиснути 'Перевірити' повторно.`
+                        );
+                        savePendingRegistrationsToStorage();
                         await refreshAll();
                         return;
                     }
@@ -442,12 +450,12 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
                     continue;
                 }
 
-                // Постійні помилки (404 Not Found, 400 Bad Request, 401/403, 500 тощо)
+                // Помилка сервера при читанні стану черги (404, 400, 401/403, 500 тощо) не означає зупинки воркера!
                 const errBody = await pollRes.json().catch(() => ({}));
                 appendWebOpLog(
-                    `Помилка опитування черги (HTTP ${pollRes.status}): ${errBody.detail || errBody.title || pollRes.statusText}`
+                    `Помилка опитування черги (HTTP ${pollRes.status}): ${errBody.detail || errBody.title || pollRes.statusText}.\n` +
+                    `Заявка ${requestId} зберігається як pending для безпеки. Ви можете повторити перевірку.`
                 );
-                pendingRegistrations.delete(targetId);
                 savePendingRegistrationsToStorage();
                 await refreshAll();
                 return;
@@ -470,6 +478,7 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
                 `Реєстрація для ${targetId} ще обробляється у черзі РПО. Час очікування у клієнті вичерпано (30 с).\n` +
                 `Запис залишається заблокованим (pending), оскільки обробка воркером триває. Ви можете перевірити статус повторно.`
             );
+            savePendingRegistrationsToStorage();
             await refreshAll();
             return;
         }
@@ -552,14 +561,20 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
                 btnReg.disabled = false;
             }
         } else {
-            setEnrollmentRowButtonsDisabled(targetId, true);
+            // Розблоковуємо виключно кнопку повторної перевірки, незалежно від triggerBtn,
+            // але залишаємо заблокованими «Підтвердити» та «Скасувати».
+            const rows = document.querySelectorAll(`tr[data-enrollment-id="${targetId}"]`);
+            rows.forEach(tr => {
+                tr.querySelectorAll('button').forEach(btn => {
+                    btn.disabled = btn.dataset.action !== 'registration-check';
+                    if (btn.dataset.action === 'registration-check') {
+                        btn.textContent = 'Перевірити';
+                    }
+                });
+            });
             if (btnReg && isTargetTopBtn) {
                 btnReg.disabled = false;
                 btnReg.textContent = `2. Перевірити стан реєстрації у відомості`;
-            }
-            if (triggerBtn && triggerBtn !== btnReg) {
-                triggerBtn.disabled = false;
-                triggerBtn.textContent = 'Перевірити';
             }
         }
     }
@@ -725,6 +740,7 @@ async function readAllWebEnrollmentPages() {
             btnRoster.style.padding = '3px 7px';
             btnRoster.style.fontSize = '11px';
             btnRoster.style.marginRight = '4px';
+            btnRoster.dataset.action = 'registration-check';
             btnRoster.textContent = pendingRegistrations.has(item.id) ? 'Перевірити' : 'У відомість';
             btnRoster.title = 'Зареєструвати у відомості деканату через чергу РПО (POST /registrations -> 202 Accepted)';
             btnRoster.disabled = activeRegistrations.has(item.id);
@@ -736,6 +752,7 @@ async function readAllWebEnrollmentPages() {
             btnConfirm.style.padding = '3px 7px';
             btnConfirm.style.fontSize = '11px';
             btnConfirm.style.marginRight = '4px';
+            btnConfirm.dataset.action = 'confirm';
             btnConfirm.textContent = 'Підтвердити';
             btnConfirm.title = 'Пряме підтвердження студентом без запису до відомості (POST /confirm)';
             btnConfirm.disabled = isBusy;
@@ -747,6 +764,7 @@ async function readAllWebEnrollmentPages() {
             btnCancel.className = 'danger';
             btnCancel.style.padding = '3px 7px';
             btnCancel.style.fontSize = '11px';
+            btnCancel.dataset.action = 'cancel';
             btnCancel.textContent = 'Скасувати';
             btnCancel.disabled = isBusy;
             btnCancel.addEventListener('click', () => cancelWebEnrollment(item.id));
