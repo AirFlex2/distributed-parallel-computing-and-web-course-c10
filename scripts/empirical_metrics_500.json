@@ -1,5 +1,5 @@
 {
-  "measured_at_utc": "2026-11-05T10:25:50.594463+00:00",
+  "measured_at_utc": "2026-11-05T10:41:40.0595373+00:00",
   "sample_size": 500,
   "concurrency": 50,
   "counters": {
@@ -10,34 +10,34 @@
     "monotonic_order_violations": 0
   },
   "http_202_ms": {
-    "p50": 4.1,
-    "p95": 72.2,
-    "p99": 76.8
+    "p50": 3.1,
+    "p95": 69.8,
+    "p99": 75.9
   },
   "intervals_ms": {
     "queue_wait_ms": {
       "sample_count": 500,
-      "p50_ms": 6942.44,
-      "p95_ms": 7541.895,
-      "p99_ms": 7711.131
+      "p50_ms": 7161.856,
+      "p95_ms": 7584.202,
+      "p99_ms": 7699.5
     },
     "processing_time_ms": {
       "sample_count": 500,
-      "p50_ms": 442.069,
-      "p95_ms": 678.962,
-      "p99_ms": 701.154
+      "p50_ms": 471.14,
+      "p95_ms": 683.986,
+      "p99_ms": 698.771
     },
     "delivery_wait_ms": {
       "sample_count": 500,
-      "p50_ms": 61.299,
-      "p95_ms": 105.363,
-      "p99_ms": 110.557
+      "p50_ms": 56.451,
+      "p95_ms": 105.952,
+      "p99_ms": 109.549
     },
     "full_domain_execution_ms": {
       "sample_count": 500,
-      "p50_ms": 7397.45,
-      "p95_ms": 8035.584,
-      "p99_ms": 8288.436
+      "p50_ms": 7606.554,
+      "p95_ms": 8067.07,
+      "p99_ms": 8228.514
     }
   }
 }

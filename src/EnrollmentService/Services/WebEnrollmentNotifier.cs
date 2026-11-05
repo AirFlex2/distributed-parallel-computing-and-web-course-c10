@@ -19,16 +19,39 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
         Guid requestId,
         CancellationToken cancellationToken = default)
     {
-        // Механізм повторної доставки (Retry): до 3 спроб з експоненційною затримкою (50 мс, 100 мс, 150 мс)
+        // Механізм повторної доставки (Retry): до 3 спроб з експоненційною затримкою (50 мс, 100 мс, 200 мс)
         for (int attempt = 1; attempt <= 3; attempt++)
         {
             try
             {
                 // Web самостійно виконує перехід held -> confirmed у власній транзакції
-                bool ok = await _enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, requestId, cancellationToken);
-                if (ok)
+                var result = await _enrollmentService.ConfirmEnrollmentDetailedAsync(enrollmentId, requestId, cancellationToken);
+                switch (result)
                 {
-                    return true;
+                    case RosterConfirmationResult.Success:
+                    case RosterConfirmationResult.AlreadyConfirmed:
+                        return true;
+
+                    case RosterConfirmationResult.PermanentFailure:
+                        // Постійне порушення умов (запис не знайдено, або статус скасований чи прострочений) —
+                        // повторні спроби беззмістовні; реєструємо подію та повертаємо false без затримок.
+                        StructuredJsonLogger.LogEvent("web_notifier", "roster_confirmation_permanent_failure", new Dictionary<string, object?>
+                        {
+                            ["attempt"] = attempt,
+                            ["enrollment_id"] = enrollmentId,
+                            ["request_id"] = requestId
+                        });
+                        return false;
+
+                    case RosterConfirmationResult.TransientFailure:
+                    default:
+                        // Тимчасова неможливість підтвердження — повторюємо з експоненційною затримкою
+                        if (attempt < 3 && !cancellationToken.IsCancellationRequested)
+                        {
+                            int delayMs = 50 * (1 << (attempt - 1)); // 50, 100, 200 мс
+                            await Task.Delay(delayMs, cancellationToken);
+                        }
+                        break;
                 }
             }
             catch (Exception ex) when (attempt < 3 && !cancellationToken.IsCancellationRequested)
@@ -40,7 +63,8 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
                     ["request_id"] = requestId,
                     ["error"] = ex.Message
                 });
-                await Task.Delay(50 * attempt, cancellationToken);
+                int delayMs = 50 * (1 << (attempt - 1)); // 50, 100, 200 мс
+                await Task.Delay(delayMs, cancellationToken);
             }
         }
 

@@ -513,7 +513,7 @@ public sealed class EnrollmentService
         return ServiceResult<WebEnrollmentResponseDto>.Ok(item);
     }
 
-    public async Task<bool> ConfirmEnrollmentFromRosterAsync(
+    public async Task<RosterConfirmationResult> ConfirmEnrollmentDetailedAsync(
         Guid enrollmentId,
         Guid requestId,
         NpgsqlConnection conn,
@@ -521,7 +521,7 @@ public sealed class EnrollmentService
         CancellationToken cancellationToken = default)
     {
         // 1. Першим кроком перевіряємо наявність запису у decanate_roster за точною зв'язкою (request_id, enrollment_id).
-        // Якщо запис відсутній або прив'язаний до іншого request_id / enrollment_id — відхиляємо.
+        // Якщо запис відсутній або прив'язаний до іншого request_id / enrollment_id — відхиляємо як permanent failure.
         await using var verifyCmd = new NpgsqlCommand(
             "SELECT COUNT(*) FROM decanate_roster WHERE request_id = @reqId AND enrollment_id = @eid;", conn, tx);
         verifyCmd.Parameters.AddWithValue("reqId", requestId);
@@ -530,7 +530,7 @@ public sealed class EnrollmentService
 
         if (rosterCount == 0)
         {
-            return false;
+            return RosterConfirmationResult.PermanentFailure;
         }
 
         // 2. Блокуємо та зчитуємо поточний стан Web-запису
@@ -540,24 +540,23 @@ public sealed class EnrollmentService
         await using var reader = await chkCmd.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
         {
-            return false;
+            return RosterConfirmationResult.PermanentFailure;
         }
 
         string currentStatus = reader.GetString(0);
         DateTimeOffset expiresAt = reader.GetFieldValue<DateTimeOffset>(1);
         await reader.CloseAsync();
 
-        // 3. Тільки якщо запис дійсно присутній у відомості decanate_roster для цього request_id,
-        // дозволяємо ідемпотентний повтор для вже підтвердженого статусу (confirmed).
+        // 3. Ідемпотентний повтор для вже підтвердженого статусу (confirmed): операція вважається успішною
         if (currentStatus == "confirmed")
         {
-            return true;
+            return RosterConfirmationResult.AlreadyConfirmed;
         }
 
-        // 4. Істеклі ('expired'), скасовані ('cancelled') та прострочені записи відхиляються з false.
+        // 4. Постійні порушення: запис скасовано ('cancelled'), минув строк ('expired') або прострочений
         if (currentStatus != "held" || expiresAt <= DateTimeOffset.UtcNow)
         {
-            return false;
+            return RosterConfirmationResult.PermanentFailure;
         }
 
         // 5. Оновлюємо статус із 'held' на 'confirmed' з атомарним інкрементом version
@@ -569,10 +568,10 @@ public sealed class EnrollmentService
         updateCmd.Parameters.AddWithValue("eid", enrollmentId);
         int rows = await updateCmd.ExecuteNonQueryAsync(cancellationToken);
 
-        return rows > 0;
+        return rows > 0 ? RosterConfirmationResult.Success : RosterConfirmationResult.TransientFailure;
     }
 
-    public async Task<bool> ConfirmEnrollmentFromRosterAsync(
+    public async Task<RosterConfirmationResult> ConfirmEnrollmentDetailedAsync(
         Guid enrollmentId,
         Guid requestId,
         CancellationToken cancellationToken = default)
@@ -582,8 +581,8 @@ public sealed class EnrollmentService
 
         try
         {
-            bool result = await ConfirmEnrollmentFromRosterAsync(enrollmentId, requestId, conn, tx, cancellationToken);
-            if (result)
+            var result = await ConfirmEnrollmentDetailedAsync(enrollmentId, requestId, conn, tx, cancellationToken);
+            if (result is RosterConfirmationResult.Success or RosterConfirmationResult.AlreadyConfirmed)
             {
                 await tx.CommitAsync(cancellationToken);
             }
@@ -598,6 +597,26 @@ public sealed class EnrollmentService
             await tx.RollbackAsync(cancellationToken);
             throw;
         }
+    }
+
+    public async Task<bool> ConfirmEnrollmentFromRosterAsync(
+        Guid enrollmentId,
+        Guid requestId,
+        NpgsqlConnection conn,
+        NpgsqlTransaction tx,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await ConfirmEnrollmentDetailedAsync(enrollmentId, requestId, conn, tx, cancellationToken);
+        return result is RosterConfirmationResult.Success or RosterConfirmationResult.AlreadyConfirmed;
+    }
+
+    public async Task<bool> ConfirmEnrollmentFromRosterAsync(
+        Guid enrollmentId,
+        Guid requestId,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await ConfirmEnrollmentDetailedAsync(enrollmentId, requestId, cancellationToken);
+        return result is RosterConfirmationResult.Success or RosterConfirmationResult.AlreadyConfirmed;
     }
 
     public async Task<int> ReconcilePendingRosterConfirmationsAsync(

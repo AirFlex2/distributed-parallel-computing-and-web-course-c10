@@ -347,13 +347,15 @@ public sealed class RestartAndRecoveryTests
         }
     }
 
+    // Перевірка рівня репозиторію: пошук заявки за Idempotency-Key повертає збережений запис у кожному з 5 станів.
+    // Повноцінна перевірка HTTP-відповіді 202 Accepted здійснюється в E2EHttpEndpointTests.PostEnrollmentRequests_IdempotentReplay_AcrossAllFiveStates_Returns202.
     [SkippableTheory]
     [InlineData("queued")]
     [InlineData("processing")]
     [InlineData("done")]
     [InlineData("rejected")]
     [InlineData("failed")]
-    public async Task Idempotency_RepeatWithSameKey_Returns202_AcrossAllFiveStates(string state)
+    public async Task Repository_GetByIdempotencyKey_FindsExistingRecord_AcrossAllFiveStates(string state)
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible on localhost:5432. Integration test skipped.");
 

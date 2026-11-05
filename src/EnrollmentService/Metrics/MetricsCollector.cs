@@ -166,7 +166,19 @@ public sealed class MetricsCollector
                 _windowMaxQueueObserved = _currentQueueLength;
             }
 
-            if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
+            if (item.IsRecoveredFromDb)
+            {
+                // Для відновлених або дозавантажених із БД заявок час очікування
+                // розраховується від персистентного часу створення CreatedAtUtc
+                double waitMs = (DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds;
+                if (waitMs >= 0)
+                {
+                    AddBoundedSample(_queueWaitSamplesMs, waitMs);
+                    _windowQueueWaitSumMs += waitMs;
+                    _windowQueueWaitCount++;
+                }
+            }
+            else if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
             {
                 double waitMs = Stopwatch.GetElapsedTime(item.EnqueueTimestamp, now).TotalMilliseconds;
                 AddBoundedSample(_queueWaitSamplesMs, waitMs);
@@ -218,13 +230,21 @@ public sealed class MetricsCollector
             AddBoundedSample(_processingTimeSamplesMs, procMs);
         }
 
-        if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
+        if (item.IsRecoveredFromDb)
+        {
+            double fullMs = (DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds;
+            if (fullMs >= 0)
+            {
+                AddBoundedSample(_totalExecutionSamplesMs, fullMs);
+            }
+        }
+        else if (item.EnqueueTimestamp > 0 && now >= item.EnqueueTimestamp)
         {
             double fullMs = Stopwatch.GetElapsedTime(item.EnqueueTimestamp, now).TotalMilliseconds;
             AddBoundedSample(_totalExecutionSamplesMs, fullMs);
         }
 
-        if (item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0 && item.FinishProcessingTimestamp > 0)
+        if (!item.IsRecoveredFromDb && item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0 && item.FinishProcessingTimestamp > 0)
         {
             if (item.EnqueueTimestamp > item.StartProcessingTimestamp || item.StartProcessingTimestamp > item.FinishProcessingTimestamp)
             {
@@ -302,9 +322,18 @@ public sealed class MetricsCollector
             return (null, null, null);
         }
 
-        double? qWait = (item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0)
-            ? Math.Round(Stopwatch.GetElapsedTime(item.EnqueueTimestamp, item.StartProcessingTimestamp).TotalMilliseconds, 3)
-            : null;
+        double? qWait = null;
+        if (item.IsRecoveredFromDb)
+        {
+            if (item.StartProcessingTimestamp > 0)
+            {
+                qWait = Math.Max(0, Math.Round((DateTimeOffset.UtcNow - item.CreatedAtUtc).TotalMilliseconds, 3));
+            }
+        }
+        else if (item.EnqueueTimestamp > 0 && item.StartProcessingTimestamp > 0)
+        {
+            qWait = Math.Round(Stopwatch.GetElapsedTime(item.EnqueueTimestamp, item.StartProcessingTimestamp).TotalMilliseconds, 3);
+        }
 
         double? proc = (item.StartProcessingTimestamp > 0 && item.FinishProcessingTimestamp > 0)
             ? Math.Round(Stopwatch.GetElapsedTime(item.StartProcessingTimestamp, item.FinishProcessingTimestamp).TotalMilliseconds, 3)

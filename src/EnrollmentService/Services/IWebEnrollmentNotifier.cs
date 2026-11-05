@@ -1,6 +1,17 @@
 namespace EnrollmentService.Services;
 
 /// <summary>
+/// Результат спроби підтвердження Web-запису на основі відомості деканату.
+/// </summary>
+public enum RosterConfirmationResult
+{
+    Success,            // Успішний перехід held -> confirmed
+    AlreadyConfirmed,   // Вже confirmed (ідемпотентний успіх)
+    PermanentFailure,   // Постійне порушення (запис не знайдено, або статус скасований чи прострочений)
+    TransientFailure    // Тимчасова неможливість (конкурентна гонка або блокування)
+}
+
+/// <summary>
 /// Інтерфейс повідомлення Web-контуру про внесення запису до відомості деканату DPC.
 /// Відокремлює доменну зону відповідальності DPC (ведення відомості decanate_roster)
 /// від доменної зони Web (переведення статусу held -> confirmed у власній транзакції).

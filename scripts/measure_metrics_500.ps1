@@ -20,8 +20,18 @@ if (-not (Get-Command "docker" -ErrorAction SilentlyContinue)) {
     }
 }
 
+$origSeats = 30
+$origAvailable = 30
+
 try {
-    Write-Host "=== Крок 1: Додавання 500 тестових студентів та налаштування групи DISC-DPC-01 (150 місць) ===" -ForegroundColor Cyan
+    Write-Host "=== Крок 1: Збереження вихідного стану групи DISC-DPC-01 та додавання 500 тестових студентів ===" -ForegroundColor Cyan
+    $rawGroupInfo = (& $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT seats, available FROM discipline_group WHERE id = 'DISC-DPC-01';").Trim()
+    if (![string]::IsNullOrWhiteSpace($rawGroupInfo) -and $rawGroupInfo -match '^(\d+)\|(\d+)$') {
+        $origSeats = [int]$matches[1]
+        $origAvailable = [int]$matches[2]
+        Write-Host "Вихідний стан групи DISC-DPC-01 збережено: seats=$origSeats, available=$origAvailable" -ForegroundColor Green
+    }
+
     & $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -c "
     INSERT INTO student (id, email, full_name, max_disciplines, active_count, active_ects)
     SELECT
@@ -58,9 +68,12 @@ try {
     }
 }
 finally {
-    Write-Host "=== Крок 4: Відновлення конфігурації БД та ALLOW_TEST_OVERRIDES=false ===" -ForegroundColor Cyan
+    Write-Host "=== Крок 4: Відновлення вихідної конфігурації БД (seats=$origSeats, available=$origAvailable) та очищення тестових даних ===" -ForegroundColor Cyan
     & $DockerExe compose exec -T postgres psql -U dpc_user -d dpc_c10 -c "
-    UPDATE discipline_group SET seats = 30, available = 30 WHERE id = 'DISC-DPC-01';
+    UPDATE discipline_group SET seats = $origSeats, available = $origAvailable WHERE id = 'DISC-DPC-01';
+    DELETE FROM decanate_roster WHERE student_id LIKE 'student-perf-%';
+    DELETE FROM enrollment_requests WHERE student_id LIKE 'student-perf-%';
+    DELETE FROM student WHERE id LIKE 'student-perf-%';
     " | Out-Null
     $env:ALLOW_TEST_OVERRIDES = "false"
     & $DockerExe compose up -d app-a app-b | Out-Null

@@ -308,14 +308,6 @@ public sealed class EnrollmentRequestRepository
         while (await reader.ReadAsync(cancellationToken))
         {
             var createdAt = reader.GetFieldValue<DateTimeOffset>(3);
-            var elapsedSinceArrival = DateTimeOffset.UtcNow - createdAt;
-            long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            long enqueueTicks = nowTicks;
-            if (elapsedSinceArrival > TimeSpan.Zero)
-            {
-                long ticksAgo = (long)(elapsedSinceArrival.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
-                enqueueTicks = Math.Max(1, nowTicks - ticksAgo);
-            }
 
             list.Add(new QueuedRequestItem
             {
@@ -327,7 +319,8 @@ public sealed class EnrollmentRequestRepository
                 RequestPayloadHash = reader.IsDBNull(5) ? null : reader.GetString(5),
                 EnrollmentId = reader.IsDBNull(6) ? null : reader.GetGuid(6),
                 RequestedEnrollmentId = reader.IsDBNull(7) ? null : reader.GetGuid(7),
-                EnqueueTimestamp = enqueueTicks
+                EnqueueTimestamp = 0,
+                IsRecoveredFromDb = true
             });
         }
         return list;

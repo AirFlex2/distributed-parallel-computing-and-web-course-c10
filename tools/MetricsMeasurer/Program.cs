@@ -86,7 +86,8 @@ class Program
                 if (acceptedId != null)
                 {
                     // Опитування до термінального статусу (фіксує FirstReadTimestamp у DPC)
-                    for (int poll = 0; poll < 300; poll++)
+                    bool reachedTerminal = false;
+                    for (int poll = 0; poll < 400; poll++)
                     {
                         await Task.Delay(100);
                         using var getResp = await client.GetAsync($"/v1/enrollment-requests/{acceptedId}");
@@ -97,9 +98,15 @@ class Program
                             string? st = doc.RootElement.GetProperty("status").GetString();
                             if (st is "done" or "rejected" or "failed")
                             {
+                                reachedTerminal = true;
                                 break;
                             }
                         }
+                    }
+
+                    if (!reachedTerminal)
+                    {
+                        throw new InvalidOperationException($"Заявка {acceptedId} для студента {studentId} не досягла термінального стану за час очікування!");
                     }
                 }
             }
@@ -163,6 +170,38 @@ class Program
         Console.WriteLine($"processing_time_ms: sample_count={proc.GetProperty("sample_count").GetInt32()}, p50={proc.GetProperty("p50_ms").GetDouble()}, p95={proc.GetProperty("p95_ms").GetDouble()}, p99={proc.GetProperty("p99_ms").GetDouble()}");
         Console.WriteLine($"delivery_wait_ms: sample_count={deliv.GetProperty("sample_count").GetInt32()}, p50={deliv.GetProperty("p50_ms").GetDouble()}, p95={deliv.GetProperty("p95_ms").GetDouble()}, p99={deliv.GetProperty("p99_ms").GetDouble()}");
         Console.WriteLine($"full_domain_execution_ms: sample_count={full.GetProperty("sample_count").GetInt32()}, p50={full.GetProperty("p50_ms").GetDouble()}, p95={full.GetProperty("p95_ms").GetDouble()}, p99={full.GetProperty("p99_ms").GetDouble()}");
+
+        // Сувора валідація результатів перед збереженням у файл (Пункт 4)
+        if (totalAccepted != totalRequests)
+        {
+            throw new InvalidOperationException($"Валідація не пройдена: total_accepted = {totalAccepted}, очікувалося {totalRequests}");
+        }
+
+        int totalFinished = totalDone + totalRejected + totalFailed;
+        if (totalFinished != totalRequests)
+        {
+            throw new InvalidOperationException($"Валідація не пройдена: total_finished = {totalFinished}, очікувалося {totalRequests}");
+        }
+
+        int qCount = qWait.GetProperty("sample_count").GetInt32();
+        int pCount = proc.GetProperty("sample_count").GetInt32();
+        int dCount = deliv.GetProperty("sample_count").GetInt32();
+        int fCount = full.GetProperty("sample_count").GetInt32();
+
+        if (qCount != totalRequests || pCount != totalRequests || dCount != totalRequests || fCount != totalRequests)
+        {
+            throw new InvalidOperationException($"Валідація не пройдена: sample_count не дорівнює {totalRequests} для всіх інтервалів (q={qCount}, p={pCount}, d={dCount}, f={fCount})");
+        }
+
+        if (acceptedIds.Count != totalRequests)
+        {
+            throw new InvalidOperationException($"Валідація не пройдена: кількість успішно прийнятих заявок ({acceptedIds.Count}) не дорівнює {totalRequests}");
+        }
+
+        if (totalFailed > 0)
+        {
+            throw new InvalidOperationException($"Валідація не пройдена: зафіксовано {totalFailed} збоїв воркерів (total_failed > 0)");
+        }
 
         var resultObject = new
         {
