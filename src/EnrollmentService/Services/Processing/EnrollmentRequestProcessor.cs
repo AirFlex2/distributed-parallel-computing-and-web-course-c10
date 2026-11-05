@@ -148,6 +148,23 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             // Єдиний конвеєр обробки для SAFE та UNSAFE режимів (О1.4 РПО):
             // Єдина відмінність між ними — наявність транзакційного блокування FOR UPDATE у SAFE.
             (finalStatus, rejectionReason, committed) = await ProcessEnrollmentCoreAsync(item, isUnsafe, cancellationToken);
+
+            if (committed && _options.AllowTestOverrides && TestHookAfterCommitAsync != null)
+            {
+                try
+                {
+                    await TestHookAfterCommitAsync(item);
+                }
+                catch (Exception hookEx)
+                {
+                    StructuredJsonLogger.LogEvent(_options.InstanceId, "test_hook_after_commit_exception", new Dictionary<string, object?>
+                    {
+                        ["worker_id"] = workerId,
+                        ["request_id"] = item.Id,
+                        ["error"] = hookEx.ToString()
+                    });
+                }
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -322,11 +339,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 await tx.CommitAsync(cancellationToken);
                 committed = true;
 
-                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
-                {
-                    await TestHookAfterCommitAsync(item);
-                }
-
                 return ("done", null, true);
             }
 
@@ -429,11 +441,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     await tx.CommitAsync(cancellationToken);
                     committed = true;
 
-                    if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
-                    {
-                        await TestHookAfterCommitAsync(item);
-                    }
-
                     return ("done", null, true);
                 }
 
@@ -506,11 +513,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                 await tx.CommitAsync(cancellationToken);
                 committed = true;
 
-                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
-                {
-                    await TestHookAfterCommitAsync(item);
-                }
-
                 return ("done", null, true);
             }
             else
@@ -571,11 +573,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
                 await tx.CommitAsync(cancellationToken);
                 committed = true;
-
-                if (_options.AllowTestOverrides && TestHookAfterCommitAsync != null)
-                {
-                    await TestHookAfterCommitAsync(item);
-                }
 
                 return ("done", null, true);
             }

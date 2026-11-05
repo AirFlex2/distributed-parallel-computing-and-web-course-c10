@@ -401,6 +401,53 @@ public static class EnrollmentEndpoints
                     "invalid_enrollment_id");
             }
 
+            string? idempotencyKey = null;
+            if (ctx.Request.Headers.TryGetValue("Idempotency-Key", out var ikHeader) && !string.IsNullOrWhiteSpace(ikHeader))
+            {
+                idempotencyKey = ikHeader.ToString().Trim();
+                if (idempotencyKey.Length > 128)
+                {
+                    return ProblemDetailsMapper.CreateProblemResult(
+                        ctx, opts,
+                        StatusCodes.Status400BadRequest,
+                        "Некоректний заголовок Idempotency-Key",
+                        "Довжина заголовка Idempotency-Key перевищує допустимий ліміт 128 символів.",
+                        "invalid_idempotency_key");
+                }
+
+                // Перевірка ідемпотентності ДО резервування слота в черзі (пункт 1).
+                // Працює як до взяття заявки в обробку, так і після завершення (done).
+                await using var connCheck = await connectionFactory.OpenConnectionAsync(ctx.RequestAborted);
+                var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, connCheck, ctx.RequestAborted);
+                if (existing != null)
+                {
+                    Guid? existingEnrollmentId = existing.EnrollmentId ?? existing.RequestedEnrollmentId;
+                    string expectedHash = $"{callerStudentId}:{existing.GroupId}:{enrollmentGuid}";
+
+                    if (!string.Equals(existing.StudentId, callerStudentId, StringComparison.Ordinal) ||
+                        existingEnrollmentId != enrollmentGuid ||
+                        (existing.RequestPayloadHash != null &&
+                         !string.Equals(existing.RequestPayloadHash, expectedHash, StringComparison.Ordinal)))
+                    {
+                        return ProblemDetailsMapper.CreateProblemResult(
+                            ctx, opts,
+                            StatusCodes.Status409Conflict,
+                            "Конфлікт даних ідемпотентного запиту",
+                            $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами.",
+                            "idempotency_conflict");
+                    }
+
+                    string loc = $"/v1/enrollment-requests/{existing.Id}";
+                    ctx.Response.Headers.Location = loc;
+                    return Results.Accepted(loc, new EnrollmentAcceptedResponseDto(
+                        existing.Id,
+                        existing.StudentId,
+                        existing.GroupId,
+                        existing.Status,
+                        existing.CreatedAt));
+                }
+            }
+
             var enrollment = await enrollmentRepo.GetEnrollmentByIdAsync(enrollmentGuid, callerStudentId, ctx.RequestAborted);
             if (enrollment == null)
             {
@@ -436,11 +483,10 @@ public static class EnrollmentEndpoints
 
             bool slotConsumedByQueue = false;
             var requestId = Guid.NewGuid();
-            string? idempotencyKey = ctx.Request.Headers["Idempotency-Key"].FirstOrDefault();
-            if (string.IsNullOrWhiteSpace(idempotencyKey))
-            {
-                idempotencyKey = requestId.ToString("D");
-            }
+            string effectiveIdempotencyKey = !string.IsNullOrWhiteSpace(idempotencyKey)
+                ? idempotencyKey
+                : requestId.ToString("D");
+            string payloadFingerprint = $"{callerStudentId}:{enrollment.GroupId}:{enrollmentGuid}";
 
             var item = new QueuedRequestItem
             {
@@ -448,8 +494,8 @@ public static class EnrollmentEndpoints
                 StudentId = callerStudentId,
                 GroupId = enrollment.GroupId,
                 CreatedAtUtc = DateTimeOffset.UtcNow,
-                IdempotencyKey = idempotencyKey,
-                RequestPayloadHash = $"{callerStudentId}:{enrollment.GroupId}",
+                IdempotencyKey = effectiveIdempotencyKey,
+                RequestPayloadHash = payloadFingerprint,
                 EnrollmentId = enrollmentGuid,
                 RequestedEnrollmentId = enrollmentGuid,
                 EnqueueTimestamp = Stopwatch.GetTimestamp()
@@ -462,6 +508,34 @@ public static class EnrollmentEndpoints
                     bool inserted = await requestRepo.TryInsertQueuedRequestAsync(item, conn, ctx.RequestAborted);
                     if (!inserted)
                     {
+                        // Гонка двох однакових запитів з одним Idempotency-Key
+                        var existingAfterRace = await requestRepo.GetByIdempotencyKeyAsync(effectiveIdempotencyKey, conn, ctx.RequestAborted);
+                        if (existingAfterRace != null)
+                        {
+                            Guid? exEnrollmentId = existingAfterRace.EnrollmentId ?? existingAfterRace.RequestedEnrollmentId;
+                            if (string.Equals(existingAfterRace.StudentId, callerStudentId, StringComparison.Ordinal) &&
+                                exEnrollmentId == enrollmentGuid &&
+                                (existingAfterRace.RequestPayloadHash == null ||
+                                 string.Equals(existingAfterRace.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal)))
+                            {
+                                string existingLoc = $"/v1/enrollment-requests/{existingAfterRace.Id}";
+                                ctx.Response.Headers.Location = existingLoc;
+                                return Results.Accepted(existingLoc, new EnrollmentAcceptedResponseDto(
+                                    existingAfterRace.Id,
+                                    existingAfterRace.StudentId,
+                                    existingAfterRace.GroupId,
+                                    existingAfterRace.Status,
+                                    existingAfterRace.CreatedAt));
+                            }
+
+                            return ProblemDetailsMapper.CreateProblemResult(
+                                ctx, opts,
+                                StatusCodes.Status409Conflict,
+                                "Конфлікт даних ідемпотентного запиту",
+                                $"Ідемпотентний ключ '{effectiveIdempotencyKey}' вже було використано з іншими параметрами.",
+                                "idempotency_conflict");
+                        }
+
                         return ProblemDetailsMapper.CreateProblemResult(
                             ctx, opts,
                             StatusCodes.Status409Conflict,

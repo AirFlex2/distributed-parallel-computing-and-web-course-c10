@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using EnrollmentService;
+using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
 using EnrollmentService.Services.Processing;
@@ -3280,6 +3281,491 @@ public sealed class E2EHttpEndpointTests : IClassFixture<WebApplicationFactory<P
         finally
         {
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Registrations_Idempotency_RepeatBeforeProcessing_ReturnsSameAccepted()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-reg-idem-early";
+        string groupId = "GRP-REG-IDEM-EARLY";
+        string discId = "DISC-REG-IDEM-EARLY";
+        string ik = $"ik-early-{Guid.NewGuid():N}";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Перший виклик з Idempotency-Key
+            using var req1 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            req1.Headers.Add("Idempotency-Key", ik);
+            var resp1 = await client.SendAsync(req1);
+            Assert.Equal(HttpStatusCode.Accepted, resp1.StatusCode);
+            var json1 = await resp1.Content.ReadAsStringAsync();
+            using var doc1 = JsonDocument.Parse(json1);
+            Guid reqId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
+            string loc1 = resp1.Headers.Location?.ToString() ?? "";
+
+            // Повторний виклик з тим самим Idempotency-Key
+            using var req2 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            req2.Headers.Add("Idempotency-Key", ik);
+            var resp2 = await client.SendAsync(req2);
+            Assert.Equal(HttpStatusCode.Accepted, resp2.StatusCode);
+            var json2 = await resp2.Content.ReadAsStringAsync();
+            using var doc2 = JsonDocument.Parse(json2);
+            Guid reqId2 = Guid.Parse(doc2.RootElement.GetProperty("id").GetString()!);
+            string loc2 = resp2.Headers.Location?.ToString() ?? "";
+
+            Assert.Equal(reqId1, reqId2);
+            Assert.Equal(loc1, loc2);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Registrations_Idempotency_RepeatAfterDone_ReturnsSameAccepted()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-reg-idem-done";
+        string groupId = "GRP-REG-IDEM-DONE";
+        string discId = "DISC-REG-IDEM-DONE";
+        string ik = $"ik-done-{Guid.NewGuid():N}";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            using var regReq = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            regReq.Headers.Add("Idempotency-Key", ik);
+            var regResp = await client.SendAsync(regReq);
+            Assert.Equal(HttpStatusCode.Accepted, regResp.StatusCode);
+            var regJson = await regResp.Content.ReadAsStringAsync();
+            using var regDoc = JsonDocument.Parse(regJson);
+            Guid reqId = Guid.Parse(regDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Очікуємо переходу у done
+            var dpcClient = _factory.CreateClient();
+            dpcClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            bool isDone = false;
+            for (int i = 0; i < 40 && !isDone; i++)
+            {
+                await Task.Delay(100);
+                var getResp = await dpcClient.GetAsync($"/v1/enrollment-requests/{reqId}");
+                if (getResp.StatusCode == HttpStatusCode.OK)
+                {
+                    var getJson = await getResp.Content.ReadAsStringAsync();
+                    using var getDoc = JsonDocument.Parse(getJson);
+                    if (getDoc.RootElement.GetProperty("status").GetString() == "done")
+                    {
+                        isDone = true;
+                    }
+                }
+            }
+            Assert.True(isDone, "Заявка мала дійти до статусу done");
+
+            // Повторний запит з тим самим Idempotency-Key ПІСЛЯ done
+            using var repeatReq = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            repeatReq.Headers.Add("Idempotency-Key", ik);
+            var repeatResp = await client.SendAsync(repeatReq);
+
+            Assert.Equal(HttpStatusCode.Accepted, repeatResp.StatusCode);
+            var repeatJson = await repeatResp.Content.ReadAsStringAsync();
+            using var repeatDoc = JsonDocument.Parse(repeatJson);
+            Guid repeatReqId = Guid.Parse(repeatDoc.RootElement.GetProperty("id").GetString()!);
+            Assert.Equal(reqId, repeatReqId);
+            Assert.Equal($"/v1/enrollment-requests/{reqId}", repeatResp.Headers.Location?.ToString());
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Registrations_Idempotency_SameKeyDifferentParameters_Returns409Conflict()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId1 = "stud-reg-diff-1";
+        string studentId2 = "stud-reg-diff-2";
+        string groupId1 = "GRP-REG-DIFF-1";
+        string groupId2 = "GRP-REG-DIFF-2";
+        string discId1 = "DISC-REG-DIFF-1";
+        string discId2 = "DISC-REG-DIFF-2";
+        string ik = $"ik-diff-{Guid.NewGuid():N}";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId1, groupId1, discId1);
+        await TestEnvironment.CleanupTestDataAsync(studentId2, groupId2, discId2);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId1, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestStudentAsync(studentId2, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId1, discId1, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+            await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var client1 = _factory.CreateClient();
+            client1.DefaultRequestHeaders.Add("X-User-Id", studentId1);
+            client1.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-1-{Guid.NewGuid():N}");
+
+            var pResp1 = await client1.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, pResp1.StatusCode);
+            var pJson1 = await pResp1.Content.ReadAsStringAsync();
+            using var pDoc1 = JsonDocument.Parse(pJson1);
+            Guid enrollmentId1 = Guid.Parse(pDoc1.RootElement.GetProperty("id").GetString()!);
+
+            // Перший виклик з ik для studentId1 та enrollmentId1
+            using var reg1 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId1}/registrations");
+            reg1.Headers.Add("Idempotency-Key", ik);
+            var rResp1 = await client1.SendAsync(reg1);
+            Assert.Equal(HttpStatusCode.Accepted, rResp1.StatusCode);
+
+            // Спроба використати той самий ik іншим студентом
+            var client2 = _factory.CreateClient();
+            client2.DefaultRequestHeaders.Add("X-User-Id", studentId2);
+            client2.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-2-{Guid.NewGuid():N}");
+
+            var pResp2 = await client2.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId2}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, pResp2.StatusCode);
+            var pJson2 = await pResp2.Content.ReadAsStringAsync();
+            using var pDoc2 = JsonDocument.Parse(pJson2);
+            Guid enrollmentId2 = Guid.Parse(pDoc2.RootElement.GetProperty("id").GetString()!);
+
+            using var regDiffStud = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId2}/registrations");
+            regDiffStud.Headers.Add("Idempotency-Key", ik);
+            var rRespDiffStud = await client2.SendAsync(regDiffStud);
+            Assert.Equal(HttpStatusCode.Conflict, rRespDiffStud.StatusCode);
+            var errJson = await rRespDiffStud.Content.ReadAsStringAsync();
+            using var errDoc = JsonDocument.Parse(errJson);
+            Assert.Equal("idempotency_conflict", errDoc.RootElement.GetProperty("error_code").GetString());
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId1, groupId1, discId1);
+            await TestEnvironment.CleanupTestDataAsync(studentId2, groupId2, discId2);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Registrations_Idempotency_ConcurrentTwoRequests_OneEnqueuedOneReturnsExistingAccepted()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-reg-concurrent";
+        string groupId = "GRP-REG-CONCUR";
+        string discId = "DISC-REG-CONCUR";
+        string ik = $"ik-concur-{Guid.NewGuid():N}";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Два одночасні запити з однаковим Idempotency-Key
+            using var clientA = _factory.CreateClient();
+            clientA.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            using var reqA = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            reqA.Headers.Add("Idempotency-Key", ik);
+
+            using var clientB = _factory.CreateClient();
+            clientB.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            using var reqB = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            reqB.Headers.Add("Idempotency-Key", ik);
+
+            var taskA = clientA.SendAsync(reqA);
+            var taskB = clientB.SendAsync(reqB);
+
+            var responses = await Task.WhenAll(taskA, taskB);
+            Assert.Equal(HttpStatusCode.Accepted, responses[0].StatusCode);
+            Assert.Equal(HttpStatusCode.Accepted, responses[1].StatusCode);
+
+            var jsonA = await responses[0].Content.ReadAsStringAsync();
+            var jsonB = await responses[1].Content.ReadAsStringAsync();
+            using var docA = JsonDocument.Parse(jsonA);
+            using var docB = JsonDocument.Parse(jsonB);
+
+            Guid reqIdA = Guid.Parse(docA.RootElement.GetProperty("id").GetString()!);
+            Guid reqIdB = Guid.Parse(docB.RootElement.GetProperty("id").GetString()!);
+
+            Assert.Equal(reqIdA, reqIdB);
+            Assert.Equal(responses[0].Headers.Location, responses[1].Headers.Location);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Enrollment_AlreadyDirectlyConfirmed_SubmittingToRegistrations_Returns409Conflict()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-reg-already-conf";
+        string groupId = "GRP-REG-ALREADY-CONF";
+        string discId = "DISC-REG-ALREADY-CONF";
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // Пряме підтвердження студентом через POST /confirm (Web О1.1: held -> confirmed)
+            var confResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/confirm", null);
+            Assert.Equal(HttpStatusCode.OK, confResp.StatusCode);
+
+            // Спроба відправити вже підтверджений запис до черги РПО decanate_roster
+            var regResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/registrations", null);
+            Assert.Equal(HttpStatusCode.Conflict, regResp.StatusCode);
+            var regErrJson = await regResp.Content.ReadAsStringAsync();
+            using var regErrDoc = JsonDocument.Parse(regErrJson);
+            Assert.Equal("enrollment_not_held", regErrDoc.RootElement.GetProperty("error_code").GetString());
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task Worker_HookThrowsAfterCommit_RequestRemainsDone_AndMetricsIntact()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-hook-throw";
+        string groupId = "GRP-HOOK-THROW";
+        string discId = "DISC-HOOK-THROW";
+        Guid reqId = Guid.NewGuid();
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqId);
+
+        var connFactory = _factory.Services.GetRequiredService<IDbConnectionFactory>();
+        var groupRepo = _factory.Services.GetRequiredService<GroupRepository>();
+        var requestRepo = _factory.Services.GetRequiredService<EnrollmentRequestRepository>();
+        var enrollmentRepo = _factory.Services.GetRequiredService<EnrollmentRepository>();
+        var decanateRepo = _factory.Services.GetRequiredService<DecanateRepository>();
+        var metrics = _factory.Services.GetRequiredService<MetricsCollector>();
+        var options = _factory.Services.GetRequiredService<ServiceOptions>();
+
+        var processor = new EnrollmentRequestProcessor(
+            requestRepo,
+            groupRepo,
+            enrollmentRepo,
+            decanateRepo,
+            connFactory,
+            metrics,
+            options);
+
+        // Налаштовуємо тестовий hook, що викидає виключення після фіксації транзакції
+        processor.TestHookAfterCommitAsync = item =>
+        {
+            throw new InvalidOperationException("Simulated exception after transaction COMMIT");
+        };
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var item = new QueuedRequestItem
+            {
+                Id = reqId,
+                StudentId = studentId,
+                GroupId = groupId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                EnqueueTimestamp = Stopwatch.GetTimestamp()
+            };
+
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                bool inserted = await requestRepo.TryInsertQueuedRequestAsync(item, conn);
+                Assert.True(inserted);
+            }
+
+            var dummyQueue = new MonitorRequestQueue(100);
+            dummyQueue.TryReserveSlot();
+            dummyQueue.TryEnqueue(item);
+
+            // Виконуємо обробку воркером
+            await processor.ProcessItemAsync(1, item, false, dummyQueue, CancellationToken.None);
+
+            // Перевіряємо статус у базі даних: повинен залишатися 'done', а не 'failed'!
+            var statusDto = await requestRepo.GetStatusByIdAsync(reqId);
+            Assert.NotNull(statusDto);
+            Assert.Equal("done", statusDto.Status);
+            Assert.Null(statusDto.RejectionReason);
+            Assert.True(statusDto.RecordedInRoster);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task ConfirmEnrollmentFromRoster_VerificationOrder_Tests()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-conf-roster";
+        string groupId = "GRP-CONF-ROSTER";
+        string discId = "DISC-CONF-ROSTER";
+        Guid enrollmentId = Guid.NewGuid();
+        Guid reqId = Guid.NewGuid();
+        Guid foreignReqId = Guid.NewGuid();
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqId);
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, foreignReqId);
+
+        var connFactory = _factory.Services.GetRequiredService<IDbConnectionFactory>();
+        var decanateRepo = _factory.Services.GetRequiredService<DecanateRepository>();
+        var enrollmentService = _factory.Services.GetRequiredService<EnrollmentService.Services.EnrollmentService>();
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            // 1. Створюємо запис enrollment у стані held
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand(@"
+                    INSERT INTO enrollment (id, student_id, group_id, discipline_id, status, version, created_at, expires_at)
+                    VALUES (@eid, @sid, @gid, @did, 'held', 1, NOW(), NOW() + INTERVAL '15 minutes');", conn);
+                cmd.Parameters.AddWithValue("eid", enrollmentId);
+                cmd.Parameters.AddWithValue("sid", studentId);
+                cmd.Parameters.AddWithValue("gid", groupId);
+                cmd.Parameters.AddWithValue("did", discId);
+                await cmd.ExecuteNonQueryAsync();
+
+                // Створюємо заявку РПО
+                await using var cmdReq = new NpgsqlCommand(@"
+                    INSERT INTO enrollment_requests (id, student_id, group_id, status, created_at, enrollment_id)
+                    VALUES (@rid, @sid, @gid, 'done', NOW(), @eid);", conn);
+                cmdReq.Parameters.AddWithValue("rid", reqId);
+                cmdReq.Parameters.AddWithValue("sid", studentId);
+                cmdReq.Parameters.AddWithValue("gid", groupId);
+                cmdReq.Parameters.AddWithValue("eid", enrollmentId);
+                await cmdReq.ExecuteNonQueryAsync();
+            }
+
+            // Перевірка 1: Відсутність у decanate_roster -> ConfirmEnrollmentFromRosterAsync повертає FALSE
+            bool missingRosterResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
+            Assert.False(missingRosterResult, "Якщо запис відсутній у decanate_roster, підтвердження має повертати false");
+
+            // Тепер вносимо запис до decanate_roster з reqId
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await decanateRepo.InsertRosterEntryAsync(reqId, studentId, groupId, discId, 5.0m, enrollmentId, "joint_web_enrollment", DateTimeOffset.UtcNow, conn);
+            }
+
+            // Перевірка 2: Чужий requestId -> ConfirmEnrollmentFromRosterAsync повертає FALSE
+            bool foreignReqResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, foreignReqId);
+            Assert.False(foreignReqResult, "Чужий requestId повинен відхилятися з false");
+
+            // Перевірка 3: Коректне первинне підтвердження з held -> confirmed
+            bool firstConfirm = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
+            Assert.True(firstConfirm, "Коректний запис із відомості повинен бути успішно підтверджений");
+
+            // Перевіряємо версію в базі даних
+            int versionAfterFirstConfirm;
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("SELECT version FROM enrollment WHERE id = @eid;", conn);
+                cmd.Parameters.AddWithValue("eid", enrollmentId);
+                versionAfterFirstConfirm = (int)(await cmd.ExecuteScalarAsync())!;
+            }
+            Assert.Equal(2, versionAfterFirstConfirm);
+
+            // Перевірка 4: Ідемпотентний повтор підтвердження з тим же reqId для вже confirmed
+            // Повертає true, але версія НЕ змінюється
+            bool repeatConfirm = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
+            Assert.True(repeatConfirm, "Ідемпотентний повтор підтвердження повинен повертати true");
+
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("SELECT version FROM enrollment WHERE id = @eid;", conn);
+                cmd.Parameters.AddWithValue("eid", enrollmentId);
+                int versionAfterRepeat = (int)(await cmd.ExecuteScalarAsync())!;
+                Assert.Equal(versionAfterFirstConfirm, versionAfterRepeat);
+            }
+
+            // Перевірка 5: Чужий requestId для вже підтвердженого confirmed запису -> повертає FALSE!
+            bool foreignOnConfirmed = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, foreignReqId);
+            Assert.False(foreignOnConfirmed, "Чужий requestId навіть для confirmed запису повинен повертати false");
+
+            // Перевірка 6: Невалідний стан (expired або cancelled) -> повертає FALSE
+            await using (var conn = await connFactory.OpenConnectionAsync())
+            {
+                await using var cmd = new NpgsqlCommand("UPDATE enrollment SET status = 'cancelled' WHERE id = @eid;", conn);
+                cmd.Parameters.AddWithValue("eid", enrollmentId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            bool cancelledResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
+            Assert.False(cancelledResult, "Скасований запис (cancelled) повинен відхилятися з false");
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, reqId);
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, foreignReqId);
         }
     }
 

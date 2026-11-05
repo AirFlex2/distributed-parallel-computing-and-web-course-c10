@@ -81,13 +81,27 @@ stateDiagram-v2
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | *(новий)* | `POST /v1/enrollments` | `held` | $v = 1$ | `available = available - 1` | `active_count + 1`, `active_ects + ects` |
 | `held` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | $v = v + 1$ | Не змінюється (вже зарезервовано) | Не змінюється |
+| `held` | `POST /v1/enrollments/{id}/registrations` | `queued` -> `confirmed` | $v = v + 1$ | Не змінюється (вже зарезервовано) | Не змінюється (через воркер РПО до відомості деканату) |
 | `held` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | $v = v + 1$ | `available = available + 1` | `active_count - 1`, `active_ects - ects` |
 | `held` ($t > \text{expires\_at}$) | Фоновий таймер або дія після спливу часу | `expired` | $v = v + 1$ | `available = available + 1` (повернення) | `active_count - 1`, `active_ects - ects` |
 | `confirmed` | `POST /v1/enrollments/{id}/cancel` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється | 409 Conflict (`enrollment_already_confirmed`). Звичайне скасування підтвердженого запису заборонено |
 | `confirmed` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | Не змінюється | Не змінюється (ідемпотентно) | Не змінюється |
+| `confirmed` | `POST /v1/enrollments/{id}/registrations` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється | 409 Conflict (`enrollment_not_held`). Повторне внесення до відомості неможливе |
 | `cancelled` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | Не змінюється | Не змінюється (ідемпотентно) | Не змінюється |
 
-#### 2.6.2 РПО-контур: Життєвий цикл заявки (`enrollment_requests`, О1.1 РПО)
+#### 2.6.2 Розмежування статусів confirmed та реєстрації у відомості (Web vs РПО, С10)
+
+У проєкті чітко розмежовано два шляхи переведення запису у фінальний стан:
+1. **Прямий виклик `POST /v1/enrollments/{id}/confirm`**: базова операція автономного Web-контуру за методичкою Web (підтвердження вибору дисципліни студентом). Запис переходить із `held` у `confirmed` безпосередньо.
+2. **Наскрізна реєстрація `POST /v1/enrollments/{id}/registrations`**: міжкурсова інтеграція Web + РПО за темою C10. Приймає запис студента у стані `held`, ставить його у чергу воркерів РПО, які виконують повільну верифікацію, вносять запис до офіційної відомості деканату (`decanate_roster`) та атомарно фіксують статус `confirmed`.
+3. **Захист від повторної реєстрації**: якщо запис уже підтверджено (`confirmed`), виклик `POST /v1/enrollments/{id}/registrations` відхиляється з кодом 409 Conflict (`enrollment_not_held`), унеможливлюючи дублювання студентів у відомості деканату (`uq_decanate_roster_enrollment_id`).
+4. **Ідемпотентність `POST /v1/enrollments/{id}/registrations`**:
+   - Підтримка заголовка `Idempotency-Key` із перевіркою наявності заявки ДО резервування слота черги.
+   - Повторний запит з однаковим ключем, студентом та `enrollment_id` повертає збережений результат `202 Accepted` і заголовок `Location` як до обробки (`queued`), так і після неї (`done`), без повторного споживання черги.
+   - Зміна параметрів під тим самим ключем повертає 409 Conflict (`idempotency_conflict`).
+   - Конкурентні запити з однаковим ключем вирішуються через унікальний індекс PostgreSQL, повертаючи клієнту збережену заявку зі звільненням слота черги.
+
+#### 2.6.3 РПО-контур: Життєвий цикл заявки (`enrollment_requests`, О1.1 РПО)
 
 ```mermaid
 stateDiagram-v2

@@ -9,7 +9,9 @@ public sealed record ExistingRequestRecord(
     string Status,
     DateTimeOffset CreatedAt,
     string? RequestPayloadHash,
-    string? IdempotencyKey
+    string? IdempotencyKey,
+    Guid? EnrollmentId = null,
+    Guid? RequestedEnrollmentId = null
 );
 
 public sealed class EnrollmentRequestRepository
@@ -50,7 +52,7 @@ public sealed class EnrollmentRequestRepository
         CancellationToken cancellationToken = default)
     {
         await using var cmd = new NpgsqlCommand(@"
-            SELECT id, student_id, group_id, status, created_at, request_payload_hash, idempotency_key
+            SELECT id, student_id, group_id, status, created_at, request_payload_hash, idempotency_key, enrollment_id, requested_enrollment_id
             FROM enrollment_requests
             WHERE id = @id;", conn);
         cmd.Parameters.AddWithValue("id", id);
@@ -68,7 +70,9 @@ public sealed class EnrollmentRequestRepository
             reader.GetString(3),
             reader.GetFieldValue<DateTimeOffset>(4),
             reader.IsDBNull(5) ? null : reader.GetString(5),
-            reader.IsDBNull(6) ? null : reader.GetString(6));
+            reader.IsDBNull(6) ? null : reader.GetString(6),
+            reader.IsDBNull(7) ? null : reader.GetGuid(7),
+            reader.IsDBNull(8) ? null : reader.GetGuid(8));
     }
 
     public async Task<ExistingRequestRecord?> GetByIdempotencyKeyAsync(
@@ -77,7 +81,7 @@ public sealed class EnrollmentRequestRepository
         CancellationToken cancellationToken = default)
     {
         await using var cmd = new NpgsqlCommand(@"
-            SELECT id, student_id, group_id, status, created_at, request_payload_hash, idempotency_key
+            SELECT id, student_id, group_id, status, created_at, request_payload_hash, idempotency_key, enrollment_id, requested_enrollment_id
             FROM enrollment_requests
             WHERE idempotency_key = @idempotencyKey;", conn);
         cmd.Parameters.AddWithValue("idempotencyKey", idempotencyKey);
@@ -95,7 +99,9 @@ public sealed class EnrollmentRequestRepository
             reader.GetString(3),
             reader.GetFieldValue<DateTimeOffset>(4),
             reader.IsDBNull(5) ? null : reader.GetString(5),
-            reader.IsDBNull(6) ? null : reader.GetString(6));
+            reader.IsDBNull(6) ? null : reader.GetString(6),
+            reader.IsDBNull(7) ? null : reader.GetGuid(7),
+            reader.IsDBNull(8) ? null : reader.GetGuid(8));
     }
 
     public async Task<EnrollmentStatusResponseDto?> MarkFirstReadAndGetStatusAsync(

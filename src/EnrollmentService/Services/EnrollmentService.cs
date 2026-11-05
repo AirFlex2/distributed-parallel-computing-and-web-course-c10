@@ -520,6 +520,20 @@ public sealed class EnrollmentService
         NpgsqlTransaction tx,
         CancellationToken cancellationToken = default)
     {
+        // 1. Першим кроком перевіряємо наявність запису у decanate_roster за точною зв'язкою (request_id, enrollment_id).
+        // Якщо запис відсутній або прив'язаний до іншого request_id / enrollment_id — відхиляємо.
+        await using var verifyCmd = new NpgsqlCommand(
+            "SELECT COUNT(*) FROM decanate_roster WHERE request_id = @reqId AND enrollment_id = @eid;", conn, tx);
+        verifyCmd.Parameters.AddWithValue("reqId", requestId);
+        verifyCmd.Parameters.AddWithValue("eid", enrollmentId);
+        long rosterCount = (long)(await verifyCmd.ExecuteScalarAsync(cancellationToken) ?? 0L);
+
+        if (rosterCount == 0)
+        {
+            return false;
+        }
+
+        // 2. Блокуємо та зчитуємо поточний стан Web-запису
         await using var chkCmd = new NpgsqlCommand(
             "SELECT status, expires_at FROM enrollment WHERE id = @eid FOR UPDATE OF enrollment;", conn, tx);
         chkCmd.Parameters.AddWithValue("eid", enrollmentId);
@@ -533,27 +547,20 @@ public sealed class EnrollmentService
         DateTimeOffset expiresAt = reader.GetFieldValue<DateTimeOffset>(1);
         await reader.CloseAsync();
 
+        // 3. Тільки якщо запис дійсно присутній у відомості decanate_roster для цього request_id,
+        // дозволяємо ідемпотентний повтор для вже підтвердженого статусу (confirmed).
         if (currentStatus == "confirmed")
         {
             return true;
         }
 
+        // 4. Істеклі ('expired'), скасовані ('cancelled') та прострочені записи відхиляються з false.
         if (currentStatus != "held" || expiresAt <= DateTimeOffset.UtcNow)
         {
             return false;
         }
 
-        await using var verifyCmd = new NpgsqlCommand(
-            "SELECT COUNT(*) FROM decanate_roster WHERE request_id = @reqId AND enrollment_id = @eid;", conn, tx);
-        verifyCmd.Parameters.AddWithValue("reqId", requestId);
-        verifyCmd.Parameters.AddWithValue("eid", enrollmentId);
-        long rosterCount = (long)(await verifyCmd.ExecuteScalarAsync(cancellationToken) ?? 0L);
-
-        if (rosterCount == 0)
-        {
-            return false;
-        }
-
+        // 5. Оновлюємо статус із 'held' на 'confirmed' з атомарним інкрементом version
         await using var updateCmd = new NpgsqlCommand(@"
             UPDATE enrollment
             SET status = 'confirmed',
