@@ -1272,4 +1272,183 @@ public sealed partial class E2EHttpEndpointTests
             await TestEnvironment.CleanupTestDataAsync(student2, groupId2, discId2);
         }
     }
+
+    [SkippableFact]
+    public async Task DpcEndpoint_IdempotencyKey_SameStudentAndGroup_DifferentEnrollmentId_Returns409Conflict_AndLegacyHashCompatible()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = $"stud-idem-enr-diff-{Guid.NewGuid():N}"[..28];
+        string groupId = $"GRP-IDEM-ENR-DIFF-{Guid.NewGuid():N}"[..28];
+        string discId = $"DISC-IDEM-ENR-DIFF-{Guid.NewGuid():N}"[..28];
+        string idemKey = $"ik-enr-diff-{Guid.NewGuid():N}";
+        Guid enrollmentIdA = Guid.NewGuid();
+        Guid enrollmentIdB = Guid.NewGuid();
+        Guid? createdRequestId = null;
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 1, activeEcts: 3.0m);
+            await EnsureTestGroupAsync(
+                groupId,
+                discId,
+                seats: 10,
+                available: 9,
+                opensAt: DateTimeOffset.UtcNow.AddDays(-1),
+                closesAt: DateTimeOffset.UtcNow.AddDays(1),
+                ects: 3.0m,
+                dpcSandboxEnabled: true);
+
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var insEnr = new NpgsqlCommand(@"
+                    INSERT INTO enrollment (id, student_id, group_id, discipline_id, status, version, created_at, expires_at)
+                    VALUES (@id, @sid, @gid, @did, 'held', 1, NOW(), NOW() + INTERVAL '15 minutes');", conn);
+                insEnr.Parameters.AddWithValue("id", enrollmentIdA);
+                insEnr.Parameters.AddWithValue("sid", studentId);
+                insEnr.Parameters.AddWithValue("gid", groupId);
+                insEnr.Parameters.AddWithValue("did", discId);
+                await insEnr.ExecuteNonQueryAsync();
+            }
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            // 1. Перший запит із ключем idemKey, studentId, groupId та enrollment_id = A -> 202 Accepted
+            using (var req1 = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests"))
+            {
+                req1.Headers.Add("Idempotency-Key", idemKey);
+                req1.Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        student_id = studentId,
+                        group_id = groupId,
+                        enrollment_id = enrollmentIdA
+                    }),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using var resp1 = await client.SendAsync(req1);
+                Assert.Equal(HttpStatusCode.Accepted, resp1.StatusCode);
+                using var doc1 = JsonDocument.Parse(await resp1.Content.ReadAsStringAsync());
+                createdRequestId = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
+            }
+
+            // 2. Повтор із тими самими studentId, groupId та тим самим enrollment_id = A -> 202 Accepted (той самий ID заявки)
+            using (var reqSame = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests"))
+            {
+                reqSame.Headers.Add("Idempotency-Key", idemKey);
+                reqSame.Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        student_id = studentId,
+                        group_id = groupId,
+                        enrollment_id = enrollmentIdA
+                    }),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using var respSame = await client.SendAsync(reqSame);
+                Assert.Equal(HttpStatusCode.Accepted, respSame.StatusCode);
+                using var docSame = JsonDocument.Parse(await respSame.Content.ReadAsStringAsync());
+                Assert.Equal(createdRequestId.Value, Guid.Parse(docSame.RootElement.GetProperty("id").GetString()!));
+            }
+
+            // 3. Повтор із тим самим ключем, тим самим студентом і групою, але ІНШИМ enrollment_id = B -> 409 Conflict (idempotency_conflict)
+            using (var reqDiffEnr = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests"))
+            {
+                reqDiffEnr.Headers.Add("Idempotency-Key", idemKey);
+                reqDiffEnr.Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        student_id = studentId,
+                        group_id = groupId,
+                        enrollment_id = enrollmentIdB
+                    }),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using var respDiffEnr = await client.SendAsync(reqDiffEnr);
+                Assert.Equal(HttpStatusCode.Conflict, respDiffEnr.StatusCode);
+                using var docDiff = JsonDocument.Parse(await respDiffEnr.Content.ReadAsStringAsync());
+                Assert.Equal("idempotency_conflict", docDiff.RootElement.GetProperty("error_code").GetString());
+            }
+
+            // 4. Повтор із тим самим ключем, студентом і групою, але БЕЗ enrollment_id (null) -> 409 Conflict (idempotency_conflict)
+            using (var reqNullEnr = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests"))
+            {
+                reqNullEnr.Headers.Add("Idempotency-Key", idemKey);
+                reqNullEnr.Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        student_id = studentId,
+                        group_id = groupId
+                    }),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using var respNullEnr = await client.SendAsync(reqNullEnr);
+                Assert.Equal(HttpStatusCode.Conflict, respNullEnr.StatusCode);
+                using var docNull = JsonDocument.Parse(await respNullEnr.Content.ReadAsStringAsync());
+                Assert.Equal("idempotency_conflict", docNull.RootElement.GetProperty("error_code").GetString());
+            }
+
+            // 5. Перевірка зворотної сумісності зі збереженими записами старого формату відбитка "{studentId}:{groupId}"
+            await using (var conn = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var updHash = new NpgsqlCommand(
+                    "UPDATE enrollment_requests SET request_payload_hash = @legacyHash WHERE id = @rid;", conn);
+                updHash.Parameters.AddWithValue("legacyHash", $"{studentId}:{groupId}");
+                updHash.Parameters.AddWithValue("rid", createdRequestId.Value);
+                await updHash.ExecuteNonQueryAsync();
+            }
+
+            // Збіг за збереженим enrollment_id = A повертає 202 Accepted навіть при старому форматі request_payload_hash
+            using (var reqLegacyMatch = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests"))
+            {
+                reqLegacyMatch.Headers.Add("Idempotency-Key", idemKey);
+                reqLegacyMatch.Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        student_id = studentId,
+                        group_id = groupId,
+                        enrollment_id = enrollmentIdA
+                    }),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using var respLegacyMatch = await client.SendAsync(reqLegacyMatch);
+                Assert.Equal(HttpStatusCode.Accepted, respLegacyMatch.StatusCode);
+            }
+
+            // Відмінний enrollment_id = B при старому форматі request_payload_hash все одно повертає 409 Conflict
+            using (var reqLegacyMismatch = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollment-requests"))
+            {
+                reqLegacyMismatch.Headers.Add("Idempotency-Key", idemKey);
+                reqLegacyMismatch.Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        student_id = studentId,
+                        group_id = groupId,
+                        enrollment_id = enrollmentIdB
+                    }),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using var respLegacyMismatch = await client.SendAsync(reqLegacyMismatch);
+                Assert.Equal(HttpStatusCode.Conflict, respLegacyMismatch.StatusCode);
+            }
+
+            if (createdRequestId.HasValue)
+            {
+                await WaitForTerminalStatusAsync(client, createdRequestId.Value);
+            }
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, createdRequestId);
+        }
+    }
 }

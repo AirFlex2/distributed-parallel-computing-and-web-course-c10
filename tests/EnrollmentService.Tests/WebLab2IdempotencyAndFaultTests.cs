@@ -101,6 +101,115 @@ public sealed partial class E2EHttpEndpointTests
     }
 
     [SkippableFact]
+    public async Task Web_O21_ConcurrentEnrollments_25Seats_500Students_C10CardScale_PreservesAllInvariants()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string runTag = Guid.NewGuid().ToString("N")[..8];
+        string groupId = $"GRP-O21-500-{runTag}";
+        string discId = $"DISC-O21-500-{runTag}";
+        string studentPrefix = $"stud-o21-500-{runTag}-";
+        const int seats = 25;
+        const int totalStudents = 500;
+
+        var studentIds = Enumerable.Range(1, totalStudents)
+            .Select(i => $"{studentPrefix}{i:000}")
+            .ToArray();
+
+        using var factoryA = _factory.WithWebHostBuilder(b => b.UseSetting("INSTANCE_ID", "app-a"));
+        using var factoryB = _factory.WithWebHostBuilder(b => b.UseSetting("INSTANCE_ID", "app-b"));
+        using var clientA = factoryA.CreateClient();
+        using var clientB = factoryB.CreateClient();
+
+        try
+        {
+            await EnsureTestGroupAsync(
+                groupId,
+                discId,
+                seats,
+                seats,
+                DateTimeOffset.UtcNow.AddHours(-2),
+                DateTimeOffset.UtcNow.AddHours(2),
+                ects: 3.0m,
+                dpcSandboxEnabled: false);
+
+            await using (var connSeed = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var seedCmd = new NpgsqlCommand(@"
+                    INSERT INTO student (id, email, full_name, max_disciplines, active_count, active_ects)
+                    SELECT
+                        @prefix || LPAD(gs::text, 3, '0'),
+                        @prefix || LPAD(gs::text, 3, '0') || '@univ.edu.ua',
+                        'Студент Сценарію 500 #' || gs::text,
+                        5,
+                        0,
+                        0.0
+                    FROM generate_series(1, @total) AS gs
+                    ON CONFLICT (id) DO UPDATE SET active_count = 0, active_ects = 0.0;", connSeed);
+                seedCmd.Parameters.AddWithValue("prefix", studentPrefix);
+                seedCmd.Parameters.AddWithValue("total", totalStudents);
+                await seedCmd.ExecuteNonQueryAsync();
+            }
+
+            using var startGate = new ManualResetEventSlim(false);
+            var tasks = studentIds.Select((sid, idx) => Task.Run(async () =>
+            {
+                startGate.Wait();
+                var targetClient = (idx % 2 == 0) ? clientA : clientB;
+                using var req = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
+                req.Headers.Add("X-User-Id", sid);
+                req.Headers.Add("Idempotency-Key", $"idem-o21-500-{sid}");
+                req.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
+                return await targetClient.SendAsync(req);
+            })).ToArray();
+
+            startGate.Set();
+            var responses = await Task.WhenAll(tasks);
+
+            int createdCount = responses.Count(r => r.StatusCode == HttpStatusCode.Created);
+            int conflictCount = responses.Count(r => r.StatusCode == HttpStatusCode.Conflict);
+
+            Assert.Equal(seats, createdCount);
+            Assert.Equal(totalStudents - seats, conflictCount);
+
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+
+            await using (var cmdGroup = new NpgsqlCommand("SELECT seats, available FROM discipline_group WHERE id = @gid;", conn))
+            {
+                cmdGroup.Parameters.AddWithValue("gid", groupId);
+                await using var reader = await cmdGroup.ExecuteReaderAsync();
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal(seats, reader.GetInt32(0));
+                Assert.Equal(0, reader.GetInt32(1));
+            }
+
+            await using (var cmdEnr = new NpgsqlCommand("SELECT COUNT(*)::INT FROM enrollment WHERE group_id = @gid AND status IN ('held', 'confirmed');", conn))
+            {
+                cmdEnr.Parameters.AddWithValue("gid", groupId);
+                int actualEnrolled = (int)(await cmdEnr.ExecuteScalarAsync())!;
+                Assert.Equal(seats, actualEnrolled);
+            }
+
+            foreach (var resp in responses)
+            {
+                resp.Dispose();
+            }
+        }
+        finally
+        {
+            await using var connClean = await TestEnvironment.OpenConnectionAsync();
+            await using var cleanCmd = new NpgsqlCommand(@"
+                DELETE FROM enrollment WHERE group_id = @gid OR student_id LIKE @likePrefix;
+                DELETE FROM student WHERE id LIKE @likePrefix;", connClean);
+            cleanCmd.Parameters.AddWithValue("gid", groupId);
+            cleanCmd.Parameters.AddWithValue("likePrefix", studentPrefix + "%");
+            await cleanCmd.ExecuteNonQueryAsync();
+
+            await TestEnvironment.CleanupTestDataAsync(null, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
     public async Task Web_O22_IdempotencyKey_ReturnsSavedOriginalResponse_EvenAfterConfirmationOrOnAnotherInstance()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");

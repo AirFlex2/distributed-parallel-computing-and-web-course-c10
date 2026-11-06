@@ -146,11 +146,6 @@ public static class ComputeWorkerProcess
         double modelB,
         double modelTau)
     {
-        if (endIdx <= startIdx || a == b)
-        {
-            return;
-        }
-
         using var fs = new FileStream(
             sharedFilePath,
             FileMode.Open,
@@ -173,15 +168,23 @@ public static class ComputeWorkerProcess
             int* spinLockPtr = (int*)(basePtr + 8);
             int* readyCountPtr = (int*)(basePtr + 12);
 
-            // Бар'єр синхронізації старту дочірніх процесів, щоб усі працівники одночасно зверталися до спільної пам'яті
+            // Бар'єр синхронізації старту дочірніх процесів, щоб усі працівники одночасно зверталися до спільної пам'яті.
+            // Усі процеси відмічаються у бар'єрі до перевірки порожнього діапазону, а цільова кількість очікуваних
+            // активних процесів також враховує випадок n < workers.
+            int activeWorkers = (a == b || n <= 0) ? 1 : (int)Math.Min(n, (long)workers);
             Interlocked.Increment(ref *readyCountPtr);
-            if (workers > 1)
+            if (activeWorkers > 1)
             {
                 var swBarrier = Stopwatch.StartNew();
-                while (Volatile.Read(ref *readyCountPtr) < workers && swBarrier.ElapsedMilliseconds < 2500)
+                while (Volatile.Read(ref *readyCountPtr) < activeWorkers && swBarrier.ElapsedMilliseconds < 2500)
                 {
                     Thread.SpinWait(16);
                 }
+            }
+
+            if (endIdx <= startIdx || a == b)
+            {
+                return;
             }
 
             long sliceCount = endIdx - startIdx;

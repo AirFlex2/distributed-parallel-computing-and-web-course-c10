@@ -215,6 +215,44 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
         Assert.Equal(expectedSingleTrapezoid, n1Doc.RootElement.GetProperty("value").GetDouble(), precision: 10);
     }
 
+    [SkippableTheory]
+    [InlineData("lock")]
+    [InlineData("none")]
+    public async Task Dpc_O24_PostCompute_SmallN1With4Workers_SharedMemoryModes_CompleteWithoutBarrierTimeout(string mode)
+    {
+        Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        using var client = CreateAuthorizedClient();
+
+        var payload = new
+        {
+            a = 0.0,
+            b = 1.0,
+            n = 1,
+            workers = 4,
+            method = "trapezoid",
+            order = "natural",
+            mode
+        };
+
+        using var res = await client.PostAsync(
+            "/v1/compute",
+            new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+        var root = doc.RootElement;
+
+        double expectedSingleTrapezoid = 0.5 * (
+            C10IntensityMath.EvaluateLambda(0.0, 50.0, 5.0, 10.0) +
+            C10IntensityMath.EvaluateLambda(1.0, 50.0, 5.0, 10.0));
+
+        Assert.Equal(expectedSingleTrapezoid, root.GetProperty("value").GetDouble(), precision: 10);
+        // Переконуємося, що бар'єр не чекає 2500 мс тайм-ауту через порожні діапазони у 3 з 4 процесів
+        double wallS = root.GetProperty("wall_s").GetDouble();
+        Assert.True(wallS < 2.0, $"Очікувався швидкий вихід із бар'єра (wall_s < 2.0 с), але отримано wall_s={wallS:F3} с у режимі mode={mode}");
+    }
+
     [SkippableFact]
     public async Task Dpc_O24_PostCompute_ModesComparison_NoneLosesUpdates_LockAndLocalAreExact()
     {

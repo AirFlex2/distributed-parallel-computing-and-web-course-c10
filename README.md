@@ -1,13 +1,13 @@
 # Спільний навчальний проєкт за темою С10: «Запис на вибіркові дисципліни»
-## Лабораторна робота №1: «Розробка базового сервісу та паралельна обробка запитів»
+## Лабораторні роботи №1–2: Web + РПО («Розробка базового сервісу, ідемпотентність, паралельна обробка запитів та чисельні обчислення»)
 
 ---
 
 ## 1. Курс і тема
 
 - **Назви навчальних курсів**:
-  1. **«Обмін даними у Web-застосунках»** (обов'язкові пункти ядра **О1.1–О1.4, О1.7**, інфраструктурні пункти **О1.5, О1.6** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4, Д1.5**).
-  2. **«Розподілені та паралельні обчислення» (РПО)** (обов'язкові пункти ядра **О1.1–О1.4**, додатковий основний пункт **О1.5** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4**).
+  1. **«Обмін даними у Web-застосунках»** (ЛР1: обов'язкові пункти ядра **О1.1–О1.4, О1.7**, інфраструктурні пункти **О1.5, О1.6** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4, Д1.5**; ЛР2: основні пункти **О2.1–О2.4**).
+  2. **«Розподілені та паралельні обчислення» (РПО)** (ЛР1: обов'язкові пункти ядра **О1.1–О1.4**, додатковий основний пункт **О1.5** та додаткові бонуси **Д1.1, Д1.2, Д1.3, Д1.4**; ЛР2: основні пункти **О2.1–О2.4**).
 - **Ідентифікатор і назва теми**: **С10. Запис на вибіркові дисципліни** (каталог вибіркових курсів, формування навчальних груп, контроль лімітів кредитів ЄКТС та кількості дисциплін, ведення відомостей деканату).
 - **Склад команди**:
   - **Зінківський Тимур Євгенійович**, студент групи **ІТІНФ-23-2**.
@@ -17,7 +17,7 @@
   - База даних: `PostgreSQL 16 Alpine` (реляційна схема з обмеженнями цілісності, контрольованою денормалізацією та версіонованими міграціями SQL з контролем контрольних сум SHA-256).
   - Балансування та мережа: `Nginx 1.27 Alpine` (алгоритм балансування `least_conn`, проксі для Web API, виділений маршрут `/health-app-a`, маршрутизація `/registrations` та черги РПО на `dpc_backend`).
   - Клієнт: `JavaScript ES6+ / HTML5 / CSS3` (без сторонніх бібліотек чи фреймворків, порт 3000).
-  - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (190 тестових випадків: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
+  - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (194 тестові випадки: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, чисельного інтегрування, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
 
 ---
 
@@ -41,12 +41,12 @@
   - `taken` — кількість зайнятих місць;
   - `roster_count` — фактична кількість студентів, внесених до відомості деканату (`decanate_roster`).
 
-### 2.3 Зміст і призначення чисельного розрахунку (перспектива ЛР2)
+### 2.3 Зміст і призначення чисельного розрахунку (ЛР2 РПО)
 Обчислювальна модель прогнозування навантаження базується на функції інтенсивності вхідного потоку заявок від студентів з моменту відкриття кампанії вибору:
 $$\lambda(t) = B + A e^{-t/\tau}, \quad t \in [0; T]$$
 Первісна функції:
 $$\Phi(t) = B t - A \tau e^{-t/\tau}$$
-Інтеграл $I = \int_0^T \lambda(t)\,dt = \Phi(T) - \Phi(0)$ визначає сумарну кількість очікуваних запитів за перші $T$ хвилин і використовується для аналітичної оцінки навантаження та вибору статичних параметрів черги й пулу воркерів (конфігурація `QUEUE_CAPACITY` та `WORKERS`). В ЛР2 цей інтеграл обчислюється паралельними процесами складеною формулою трапецій (`method = "trapezoid"`, природний порядок підсумовування `order = "natural"`) з експериментальною перевіркою точності $O(h^2)$ проти аналітичного еталону.
+Інтеграл $I = \int_0^T \lambda(t)\,dt = \Phi(T) - \Phi(0)$ визначає сумарну кількість очікуваних запитів за перші $T$ хвилин і використовується для аналітичної оцінки навантаження та вибору статичних параметрів черги й пулу воркерів (конфігурація `QUEUE_CAPACITY` та `WORKERS`). У ЛР2 цей інтеграл обчислюється через `POST /v1/compute` паралельними процесами складеною формулою трапецій (`method = "trapezoid"`, природний порядок підсумовування `order = "natural"`) з експериментальною перевіркою точності $O(h^2)$ проти аналітичного еталону.
 
 ### 2.4 Пакетний звіт (перспектива ЛР4)
 Пакетний звіт формується кластером Apache Spark на основі зрізу даних у форматі Parquet. Звіт розраховує підсумкову заповненість академічних груп за дисциплінами, кафедрами та факультетами. Для дослідження перекосу навантаження (Data Skew) закладено «гарячий ключ» — популярна вибіркова дисципліна, на яку припадає до 40% усіх поданих заяв.
@@ -117,11 +117,11 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: POST /v1/enrollment-requests<br>(HTTP 202 Accepted, збережено в БД та поставлено в чергу)
+    [*] --> queued: POST /v1/enrollment-requests або /registrations<br>(HTTP 202 Accepted, збережено в БД та поставлено в чергу)
     
     queued --> processing: Воркер вилучив заявку з черги<br>(фіксація started_at)
     
-    processing --> done: Успішна валідація лімітів та наявність місць<br>(запис у decanate_roster, available - 1)
+    processing --> done: Успішна валідація лімітів та місць<br>(запис у decanate_roster; available - 1 лише в автономному режимі РПО,<br>а у спільному з Web місце вже зарезервоване у held)
     processing --> rejected: Відхилення за правилом: група заповнена,<br>вичерпано ліміт K=5 або 30.0 ЄКТС
     processing --> failed: Системна помилка обробки або невідновлювана помилка виконання
     
@@ -293,7 +293,7 @@ flowchart TD
 
         AppA -->|"Пул підключень Npgsql (Max 20)"| Postgres[("PostgreSQL 16 Alpine (порт 5432)<br>База даних: dpc_c10")]
         AppB -->|"Пул підключень Npgsql (Max 20)"| Postgres
-        Processor -->|"Запис у decanate_roster<br>декремент discipline_group.available"| Postgres
+        Processor -->|"Запис у decanate_roster<br>(та декремент available лише в автономному режимі РПО)"| Postgres
     end
 ```
 
@@ -304,11 +304,11 @@ flowchart TD
    - Ідентифікатор студента визначається виключно із заголовка `X-User-Id` (передача `student_id` у тілі суворо заборонена — повертається `422 Unprocessable Entity`).
    - Керує станами таблиці `enrollment` (`held -> confirmed | cancelled | expired`), зміною доступних місць `discipline_group.available` та статистикою студента (поля `active_count` та `active_ects` у таблиці `student`).
    - Web-контур **не змінює безпосередньо відомість деканату `decanate_roster` та не виконує внутрішню доменну обробку заявок РПО**, але для наскрізного сценарію реєстрації у відомості (`POST /v1/enrollments/{id}/registrations`) передає запит до черги контуру РПО (`enrollment_requests`) для подальшої асинхронної обробки пулом воркерів.
-2. **Асинхронний контур РПО (`/v1/enrollment-requests`, `/metrics`, `/v1/decanate-roster`)**:
+2. **Асинхронний контур РПО (`/v1/enrollment-requests`, `/v1/compute`, `/metrics`, `/v1/decanate-roster`)**:
    - Поєднує персистентне збереження заявок у PostgreSQL (`enrollment_requests`) з високоефективною обмеженою чергою в пам'яті вузла `app-a` та механізмом Restart Recovery при перезапуску процесу. Прийом заявки повертає негайну відповідь `202 Accepted`.
    - Забезпечує негайний зворотний тиск (Backpressure): якщо в черзі немає вільних слотів (`QUEUE_CAPACITY = 100`), метод `TryReserveSlot()` миттєво повертає `429 Too Many Requests` із заголовком `Retry-After: 1` **без навантаження бази даних**.
-   - Пул із 3 паралельних воркерів вилучає заявки, виконує обов'язковий повільний виклик (200–700 мс) строго поза критичною секцією БД, фіксує зарахування у `decanate_roster` та декрементує `discipline_group.available`.
-   - Відповідає за формування офіційної відомості деканату `decanate_roster`. Щодо меж готовності теми С10: у межах ЛР1 реалізовано первинне формування відомостей основного вибору, захист інваріанта місткості, облік статусів та підтримку атрибута `assignment_type` ('primary' / 'second_choice'). Автоматичний перерозподіл студентів за другим вибором (`second_choice`) після закриття набору деканатом згідно з навчальною програмою та методичними рекомендаціями РПО віднесено до майбутньої ЛР6 (координація розподілених виконавців та захист спільного ресурсу за допомогою нумерації поколінь — generation fencing) і не є блокером для атестації ЛР1.
+   - Пул із 3 паралельних воркерів вилучає заявки, виконує обов'язковий повільний виклик (200–700 мс) строго поза критичною секцією БД та фіксує зарахування у відомості `decanate_roster`. При цьому робота з лічильником вільних місць залежить від сценарію: у спільному сценарії Web + РПО (`POST /v1/enrollments/{id}/registrations`) місце в групі вже зарезервоване контуром Web при створенні `held`, тому воркер РПО лише перевіряє чинну бронь і вносить студента до `decanate_roster` **без повторного зменшення `available`** (після чого сповіщає Web для переходу `held -> confirmed`); натомість в автономному стендовому режимі РПО (`POST /v1/enrollment-requests` без Web-броні) воркер самостійно декрементує `discipline_group.available`.
+   - Відповідає за формування офіційної відомості деканату `decanate_roster`. Щодо меж готовності теми С10: у межах ЛР1–ЛР2 реалізовано первинне формування відомостей основного вибору, захист інваріанта місткості, облік статусів та підтримку атрибута `assignment_type` ('primary' / 'second_choice'). Автоматичний перерозподіл студентів за другим вибором (`second_choice`) після закриття набору деканатом згідно з навчальною програмою та методичними рекомендаціями РПО віднесено до майбутньої ЛР6 (координація розподілених виконавців та захист спільного ресурсу за допомогою нумерації поколінь — generation fencing) і не є блокером для атестації ЛР1–ЛР2.
    - Контур РПО **не здійснює прямих записів у таблицю `enrollment`**.
 3. **Єдине предметне правило для обох контурів (§1.10)**:
    - Перевірка «чи записаний студент уже на цю дисципліну» виконується уніфікованим SQL-запитом, який перевіряє **обидві таблиці одночасно** (`enrollment` у статусах held/confirmed та `decanate_roster`). Студент, зарахований через чергу РПО, не може повторно записатися на ту саму дисципліну через Web, і навпаки.
@@ -325,17 +325,17 @@ flowchart TD
 project/
 ├── .spectral.yaml                                 # Правила лінтування OpenAPI 3.1
 ├── compose.yaml                                   # Опис багатоконтейнерної системи (app-a, app-b, nginx, postgres)
-├── Dockerfile                                     # Multi-stage збірка .NET 8.0 SDK -> ASP.NET Core Runtime
+├── Dockerfile                                     # Multi-stage збірка .NET 8.0 SDK (з dotnet-trace) -> ASP.NET Core Runtime
 ├── nginx.conf                                     # Конфігурація Nginx: least_conn, проксі РПО та виділений /health-app-a
 ├── openapi.yaml                                   # Повний контракт API (OpenAPI 3.1), сертифікований Spectral CLI
-├── README.md                                      # Звітна документація проєкту за канонічною структурою §1.9
-├── client/                                        # Клієнтський модуль Web-контуру (пункт Д1.2 Web)
-│   ├── api.js                                     # Безпечна клієнтська логіка на JavaScript ES6+ (textContent, addEventListener)
+├── README.md                                      # Звітна документація проєкту за канонічною структурою §1.9 (ЛР1 + ЛР2)
+├── client/                                        # Клієнтський модуль Web-контуру (Д1.2 Web та О2.4 Web)
+│   ├── api.js                                     # Клієнтська логіка на JS ES6+ (ідемпотентні повтори, AbortController, Retry-After)
 │   ├── index.html                                 # Інтерфейс вибору курсів, підтвердження та перегляду черги (вбудовані CSS-стилі)
 │   ├── serve.mjs                                  # Автономний Node.js HTTP-сервер для клієнта на порті 3000
 │   ├── start_client.ps1                           # Скрипт локального хостингу вебклієнта (PowerShell)
 │   └── start_client.sh                            # Скрипт локального хостингу вебклієнта (Bash)
-├── migrations/                                    # Версіоновані міграції PostgreSQL
+├── migrations/                                    # Версіоновані міграції PostgreSQL (контроль SHA-256)
 │   ├── 001_init_c10_schema.sql                    # Таблиці предметної області, обмеження FK/CHECK, VIEW group_seats
 │   ├── 002_seed_c10_data.sql                      # Довідкові дисципліни, групи та тестові пули студентів
 │   ├── 003_update_group_seats_and_idempotency.sql # Оновлення VIEW group_seats (GREATEST) та локальний індекс (student_id, idempotency_key)
@@ -345,39 +345,45 @@ project/
 │   ├── 007_add_dpc_sandbox_enabled.sql            # Розділення автономних DPC-груп і Web-груп
 │   ├── 008_idempotency_and_joint_enrollment.sql   # Ідемпотентність Web-записів та зв'язок enrollment_id у заявках РПО
 │   ├── 009_add_requested_enrollment_id.sql        # Надійне збереження вихідного Web-ідентифікатора (requested_enrollment_id)
-│   └── 010_decanate_roster_unique_constraints.sql # Унікальні обмеження decanate_roster (student_id + discipline_id та enrollment_id)
-├── scripts/                                       # Сценарії автоматизованої перевірки
-│   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів (PowerShell 7+)
+│   ├── 010_decanate_roster_unique_constraints.sql # Унікальні обмеження decanate_roster (student_id + discipline_id та enrollment_id)
+│   └── 011_web_idempotency_lr2.sql                # Повна модель ідемпотентності Web О2.2 (processing/completed, збережена відповідь, TTL) + полігон О2.1
+├── scripts/                                       # Сценарії автоматизованої перевірки та вимірювань
+│   ├── empirical_metrics_500.json                 # Збережені результати емпіричного навантажувального заміру (500 клієнтів)
+│   ├── init_test_db.sql                           # Ініціалізація виділеної тестової бази даних dpc_c10_test
+│   ├── measure_compute.ps1                        # Скрипт серій вимірювань чисельного інтегрування та профілювання РПО ЛР2 (О2.2–О2.4)
+│   ├── measure_metrics_500.ps1                    # Скрипт навантажувального тестування 500 паралельними клієнтами
+│   ├── verify_all.ps1                             # Комплексний сценарій атестації всіх пунктів ЛР1 + ЛР2 (PowerShell 7+)
 │   └── verify_all.sh                              # Bash-обгортка для середовищ Linux/macOS
 ├── src/                                           # Вихідний код бекенд-сервісу .NET 8
 │   └── EnrollmentService/
-│       ├── EnrollmentService.csproj               # Файл проєкту .NET 8 (Nullable enable, ImplicitUsings)
-│       ├── Program.cs                             # Точка входу, реєстрація DI, конвеєр HTTP, перехоплення SIGTERM
+│       ├── EnrollmentService.csproj               # Файл проєкту .NET 8 (Nullable enable, AllowUnsafeBlocks)
+│       ├── Program.cs                             # Точка входу, DI, конвеєр HTTP, SIGTERM та запуск дочірніх процесів --compute-worker
 │       ├── Contracts/                             # DTO у форматі snake_case
-│       │   ├── DpcDtos.cs                         # DTO черги, заявок, відомості деканату та стану місць
+│       │   ├── DpcDtos.cs                         # DTO черги, заявок, відомості деканату, стану місць та обчислень /v1/compute
 │       │   └── WebDtos.cs                         # DTO вибору дисциплін, записів та пагінації (без зайвих полів)
 │       ├── Domain/                                # Чиста бізнес-логіка предметної області
 │       │   ├── Entities.cs                        # Доменні сутності (StudentEntity, DisciplineGroupEntity)
-│       │   ├── EnrollmentDomainRules.cs           # Чисті функції вікна [opens_at, closes_at), ліміти ЄКТС, Base64-курсори
+│       │   ├── EnrollmentDomainRules.cs           # Чисті функції вікна [opens_at, closes_at), ліміти ЄКТС, Base64-курсори, SHA-256 відбиток О2.2
 │       │   ├── EnrollmentPolicy.cs                # Єдина чиста доменна функція валідації правил для Web і РПО
 │       │   └── ServiceResult.cs                   # Типізований монолітний результат доменних операцій
 │       ├── Endpoints/                             # Маршрути Minimal API
 │       │   ├── AdminEndpoints.cs                  # Стендовий маршрут /v1/admin/reset (захищений ALLOW_TEST_OVERRIDES)
+│       │   ├── ComputeEndpoints.cs                # Маршрут POST /v1/compute для паралельного чисельного інтегрування C10 (РПО ЛР2)
 │       │   ├── DiagnosticsEndpoints.cs            # Маршрути GET /, GET /health, GET /metrics
 │       │   ├── EnrollmentEndpoints.cs             # Web-маршрути: POST, GET, confirm, cancel, registrations
 │       │   ├── EnrollmentRequestEndpoints.cs      # РПО-маршрути: POST (TryReserveSlot -> 429), GET за ID
 │       │   └── GroupEndpoints.cs                  # Каталог груп, ресурс group-seats, відомість, закриття групи
 │       ├── Extensions/
-│       │   └── ServiceCollectionExtensions.cs     # Реєстрація інфраструктури, сховищ та пулу воркерів
+│       │   └── ServiceCollectionExtensions.cs     # Реєстрація інфраструктури, сховищ, воркерів та ParallelComputeService
 │       ├── Http/                                  # HTTP-інфраструктура
-│       │   ├── BearerAuthMiddleware.cs            # Авторизація Bearer-токена для маршрутів РПО (HTTP 401)
+│       │   ├── BearerAuthMiddleware.cs            # Обов'язкова Bearer-авторизація для маршрутів РПО та /v1/compute (HTTP 401)
 │       │   ├── GracefulShutdownMiddleware.cs      # Відсікання нових мутуючих запитів кодом 503 при зупинці SIGTERM
 │       │   ├── HttpPayloadHelper.cs               # Парсер тіла: 400 (помилка синтаксису) та 422 (помилка полів)
 │       │   ├── ProblemDetailsMapper.cs            # Стандартні відповіді RFC 9457 (application/problem+json)
 │       │   ├── RequestIdentity.cs                 # Контекст запиту (Correlation ID, User ID, Trace ID)
 │       │   └── RequestIdentityMiddleware.cs       # Виділення X-User-Id, X-Request-ID, W3C traceparent, журнал JSON
 │       ├── Infrastructure/
-│       │   └── ServiceOptions.cs                  # Параметри конфігурації зі змінних середовища
+│       │   └── ServiceOptions.cs                  # Параметри конфігурації зі змінних середовища (вкл. FAULTS та параметри моделі C10)
 │       ├── Metrics/
 │       │   └── MetricsCollector.cs                # Монотонні таймстампи, розрахунок закону Літтла
 │       ├── Queues/                                # Реалізації обмеженої черги в пам'яті (РПО О1.2, Д1.3)
@@ -386,19 +392,29 @@ project/
 │       │   └── MonitorRequestQueue.cs             # Реалізація на базі lock та Monitor.Wait / Monitor.PulseAll
 │       ├── Repositories/                          # Рівень доступу до даних (чистий SQL без ORM)
 │       │   ├── DecanateRepository.cs              # Доступ до таблиці decanate_roster
-│       │   ├── EnrollmentRepository.cs            # Таблиці enrollment, student, ліниве прострочення
+│       │   ├── EnrollmentRepository.cs            # Таблиці enrollment, student, ідемпотентність О2.2, пакетне очищення ключів
 │       │   ├── EnrollmentRequestRepository.cs     # Таблиця enrollment_requests
 │       │   ├── GroupRepository.cs                 # Таблиці discipline, discipline_group, VIEW group_seats
 │       │   └── IDbConnectionFactory.cs            # Інтерфейс та фабрика з'єднань Npgsql з пулом (Max 20)
-│       └── Services/                              # Сервісний рівень та фонова обробка
-│           ├── DatabaseInitializer.cs             # Перевірка незмінності sha256 та накатування SQL-міграцій
-│           ├── EnrollmentService.cs               # Оркестрація транзакцій Web-контуру (канонічний порядок блокувань)
+│       └── Services/                              # Сервісний рівень, фонова обробка та чисельне інтегрування
+│           ├── DatabaseInitializer.cs             # Перевірка незмінності sha256 та накатування SQL-міграцій (001–011)
+│           ├── EnrollmentService.cs               # Оркестрація транзакцій Web-контуру (канонічні блокування, О2.1–О2.3)
 │           ├── EnrollmentWorkerPool.cs            # Безпечний життєвий цикл пулу воркерів (ізоляція винятків)
-│           ├── HeldEnrollmentExpirationBackgroundService.cs # Фоновий таймер звільнення held-записів (2 с)
+│           ├── FaultInjector.cs                   # Ін'єктор контрольованої відмови /faults/after_commit_before_response (Web О2.3)
+│           ├── HeldEnrollmentExpirationBackgroundService.cs # Фоновий таймер звільнення held-записів, reconciliation та очищення TTL ключів
+│           ├── IWebEnrollmentNotifier.cs          # Інтерфейс сповіщення Web-контуру про фіксацію у decanate_roster
+│           ├── StructuredJsonLogger.cs            # Форматування структурованих JSON-подій у stdout
+│           ├── WebEnrollmentNotifier.cs           # Реалізація сповіщення Web із експоненційними повторами (Retry)
+│           ├── Compute/                           # Багатопроцесне чисельне інтегрування C10 (РПО ЛР2 О2.1–О2.4)
+│           │   ├── C10IntensityMath.cs            # Ядро складеної та наївної формули трапецій і аналітичної первісної C10
+│           │   ├── ComputeWorkerProcess.cs        # Дочірній процес ОС (--compute-worker, режими local/lock/none через MemoryMappedFile)
+│           │   └── ParallelComputeService.cs      # Координатор запуску дочірніх процесів, збору результатів і метрик точності
 │           └── Processing/
-│               └── EnrollmentRequestProcessor.cs  # Єдиний процесор обробки заявок (безпечний FOR UPDATE та UNSAFE)
+│               ├── EnrollmentRequestProcessor.cs  # Процесор обробки заявок РПО (безпечний FOR UPDATE та UNSAFE)
+│               └── IEnrollmentRequestProcessor.cs # Контракт процесора заявок РПО
 └── tests/
     └── EnrollmentService.Tests/
+        ├── EnrollmentService.Tests.csproj         # Проєкт модульних, інтеграційних та E2E-тестів xUnit (.NET 8)
         ├── DomainAndQueueTests.Domain.cs          # 6 модульних тестів предметної області (вікна, ЄКТС, ліміти K, часові пояси)
         ├── DomainAndQueueTests.Queue.cs           # 3 тести черг (MonitorRequestQueue, слоти, багатопотоковість)
         ├── DomainAndQueueTests.Metrics.cs         # 13 тестів метрик (курсори, traceparent, Problem Details, закон Літтла, 8 InlineData)
@@ -408,17 +424,19 @@ project/
         ├── RestartAndRecoveryTests.Startup.cs     # 3 тести відновлення queued-заявок із PostgreSQL при старті та дозавантаження
         ├── RestartAndRecoveryTests.Shutdown.cs    # 2 тести Graceful Shutdown (Drain при заповненій БД та зупинка app-b без воркерів)
         ├── RestartAndRecoveryTests.CrashRecovery.cs # 11 тестів аварійного відновлення (5 станів ідемпотентності, збої до/після коміту, гонитва)
+        ├── DpcLab2ComputeTests.cs                 # 25 тестів РПО ЛР2 (POST /v1/compute, точність O(h^2), 1/2/4 процеси, local/lock/none, Bearer 401)
+        ├── WebLab2IdempotencyAndFaultTests.cs     # 8 тестів Web ЛР2 (О2.1 конкурентність 40 та 500 студентів на 25 місць, О2.2–О2.3 ідемпотентність і fault)
         ├── E2EHttpEndpointTests.Fixture.cs        # Спільна тестова фікстура WebApplicationFactory, хелпери перевірок та очищення
         ├── E2EHttpEndpointTests.Enrollment.cs     # 24 наскрізні E2E HTTP-тести Web-контуру (CRUD, вікна, ліміти, скасування, автентифікація)
         ├── E2EHttpEndpointTests.DpcQueue.cs       # 4 E2E HTTP-тести черги РПО (прийом 202, опитування, пісочниця, реєстрація Web)
-        ├── E2EHttpEndpointTests.Idempotency.cs    # 22 E2E HTTP-тести ідемпотентності (5 станів РПО, дублікати, конфлікти тіла, конкурентність)
-        ├── E2EHttpEndpointTests.JointRegistration.cs # 8 наскрізних E2E-тестів спільного сценарію Web + DPC (held -> confirmed, каскадні зв'язки)
-        ├── E2EHttpEndpointTests.Migrations.cs      # 5 E2E-тестів перевірки схеми та міграцій БД (007, 008, 009, 010)
+        ├── E2EHttpEndpointTests.Idempotency.cs    # 23 E2E HTTP-тести ідемпотентності (5 станів РПО, дублікати, конфлікти student/group/enrollment_id)
+        ├── E2EHttpEndpointTests.JointRegistration.cs # 11 наскрізних E2E-тестів спільного сценарію Web + DPC (held -> confirmed, узгодженість cancel/confirm)
+        ├── E2EHttpEndpointTests.Migrations.cs     # 5 E2E-тестів перевірки схеми та міграцій БД (007, 008, 009, 010)
         ├── E2EHttpEndpointTests.RepositoryAndWorker.cs # 7 тестів репозиторіїв та воркера (резервне заповнення requested_enrollment_id, хуки, унікальність)
-        ├── TestEnvironmentSafetyTests.cs          # 23 тести перевірки ізоляції тестового середовища, створення dpc_c10_test, перевірки SQLSTATE 42501/28P01 та блокування dpc_c10
-        ├── TestEnvironment.cs                    # Виділена конфігурація тестового середовища (dpc_c10_test) та очищення даних
-        ├── TestCollectionOrder.cs                # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])
-        └── appsettings.Test.json                 # Локальна конфігурація тестового запуску
+        ├── TestEnvironmentSafetyTests.cs          # 23 тести перевірки ізоляції тестового середовища, створення dpc_c10_test, перевірки SQLSTATE 42501/28P01
+        ├── TestEnvironment.cs                     # Виділена конфігурація тестового середовища (dpc_c10_test) та очищення даних
+        ├── TestCollectionOrder.cs                 # Послідовне виконання тестів бази даних ([assembly: CollectionBehavior])
+        └── appsettings.Test.json                  # Локальна конфігурація тестового запуску
 ```
 
 ---
@@ -429,7 +447,7 @@ project/
 - **Операційна система**: Windows 10/11 (з WSL2), Ubuntu 22.04+, macOS 13+.
 - **Процесор і ресурси**: $\ge 4$ CPU ядра, не менше 4 ГБ вільної оперативної пам'яті (RAM).
 - **Платформи розробки та виконання**:
-  - **.NET 8.0 SDK** (для збирання проєкту та запуску повного набору xUnit-тестів; поточний набір — 190 тестових випадків).
+  - **.NET 8.0 SDK** (для збирання проєкту та запуску повного набору xUnit-тестів; поточний набір — 194 тестові випадки).
   - **PowerShell 7+ (`pwsh`)** (для кросплатформенного запуску сценарію атестації `verify_all.ps1`).
   - **Node.js 18+ / npm** (для валідації специфікації лінтером `@stoplight/spectral-cli` та локального клієнта).
 - **Контейнеризація**:
@@ -492,7 +510,7 @@ docker compose up -d --build
 ```powershell
 pwsh scripts/verify_all.ps1
 ```
-*(Скрипт перевіряє лінтування контракту, проходження всіх 190 тестових випадків модульних, інтеграційних та E2E-тестів, перевірку параметрів безпеки, Backpressure 429 при стійкому навантаженні 50 клієнтами, захист від гонитви SAFE vs UNSAFE на одній групі, закон Літтла, Graceful Shutdown з кодом 503, курсорне пагінування, життєвий цикл Web та балансування).*
+*(Скрипт перевіряє лінтування контракту, проходження всіх 194 тестових випадків модульних, інтеграційних та E2E-тестів, перевірку параметрів безпеки, Backpressure 429 при стійкому навантаженні 50 клієнтами, захист від гонитви SAFE vs UNSAFE на одній групі, закон Літтла, Graceful Shutdown з кодом 503, курсорне пагінування, життєвий цикл Web та балансування).*
 
 #### 3. Запуск клієнтського вебзастосунку (пункт Д1.2 Web):
 ```powershell
@@ -768,7 +786,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
   6. **Інфраструктура, тестування та автоматизація**:
      - Конфігурація багатоконтейнерного середовища Docker Compose (вузли `app-a`, `app-b`, `nginx`, `postgres`).
      - Налаштування балансувальника Nginx за алгоритмом `least_conn`.
-     - Написання 190 тестових випадків модульного, інтеграційного та наскрізного E2E-тестування на базі xUnit, що перевіряють бізнес-правила, HTTP API, ідемпотентність, конкурентний доступ до спільних ресурсів, паралельну обробку запитів, паралельне чисельне інтегрування, міграції бази даних та безпеку тестового середовища.
+     - Написання 194 тестових випадків модульного, інтеграційного та наскрізного E2E-тестування на базі xUnit, що перевіряють бізнес-правила, HTTP API, ідемпотентність, конкурентний доступ до спільних ресурсів, паралельну обробку запитів, паралельне чисельне інтегрування, міграції бази даних та безпеку тестового середовища.
      - Розробка комплексного автоматизованого сценарію атестації `verify_all.ps1` та скрипта вимірювань `measure_compute.ps1`.
 
 ---
@@ -781,8 +799,8 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 
 | Пункт | Назва вимоги | Реалізація у коді та БД | Перевірка (тести / скрипти) |
 | :--- | :--- | :--- | :--- |
-| **О2.1** | Інваріант при одночасних запитах | `EnrollmentService.CreateEnrollmentAsync`, `GroupRepository.DecrementAvailableAsync` (`UPDATE discipline_group SET available = available - 1 WHERE id = @groupId AND available > 0`), транзакційні блокування `SELECT ... FOR UPDATE` (`student -> discipline_group`), DB `CHECK`-обмеження та частковий унікальний індекс `idx_enrollment_active_student_discipline` | `Web_O21_ConcurrentEnrollments_25Seats_40Students_AcrossTwoInstances_PreservesAllInvariants`, `scripts/verify_all.ps1` (крок 11.1 — 45 одночасних запитів прямо на `:8001` та `:8002`) |
-| **О2.2** | Механізм ідемпотентності | Міграції `008` та `011_web_idempotency_lr2.sql`, `EnrollmentDomainRules.ComputeWebEnrollmentFingerprint` (канонічний SHA-256 відбиток нормалізованого запиту), збереження `idempotency_operation`, `idempotency_state` (`processing` / `completed`), початкової HTTP-відповіді (`idempotency_response_status`, `idempotency_response_body`, `idempotency_response_location`) та `idempotency_expires_at` в одній транзакції з предметною операцією, пакетне очищення `CleanupExpiredIdempotencyKeysBatchAsync` (`FOR UPDATE SKIP LOCKED`) | `Web_O22_IdempotencyKey_ReturnsSavedOriginalResponse_EvenAfterConfirmationOrOnAnotherInstance`, `Web_O22_IdempotencyKey_InProgressState_Returns409Conflict_Then201WhenCompleted`, `Web_O22_IdempotencyKey_BatchCleanup_ClearsExpiredKeysWithoutDeletingEnrollments`, `E2EHttpEndpointTests.Idempotency.cs` |
+| **О2.1** | Інваріант при одночасних запитах | `EnrollmentService.CreateEnrollmentAsync`, `GroupRepository.DecrementAvailableAsync` (`UPDATE discipline_group SET available = available - 1 WHERE id = @groupId AND available > 0`), транзакційні блокування `SELECT ... FOR UPDATE` (`student -> discipline_group`), DB `CHECK`-обмеження та частковий унікальний індекс `idx_enrollment_active_student_discipline` | `Web_O21_ConcurrentEnrollments_25Seats_500Students_C10CardScale_PreservesAllInvariants` (масштаб картки C10: 500 студентів на 25 місць), `Web_O21_ConcurrentEnrollments_25Seats_40Students_AcrossTwoInstances_PreservesAllInvariants`, `scripts/verify_all.ps1` (крок 11.1 — 45 одночасних запитів прямо на `:8001` та `:8002`) |
+| **О2.2** | Механізм ідемпотентності | Міграції `008` та `011_web_idempotency_lr2.sql`, `EnrollmentDomainRules.ComputeWebEnrollmentFingerprint` (канонічний SHA-256 відбиток нормалізованого запиту), збереження `idempotency_operation`, `idempotency_state` (`processing` / `completed`), початкової HTTP-відповіді (`idempotency_response_status`, `idempotency_response_body`, `idempotency_response_location`) та `idempotency_expires_at` в одній транзакції з предметною операцією, пакетне очищення `CleanupExpiredIdempotencyKeysBatchAsync` (`FOR UPDATE SKIP LOCKED`), а також врахування `enrollment_id` у канонічному відбитку заявок `/v1/enrollment-requests` | `Web_O22_IdempotencyKey_ReturnsSavedOriginalResponse_EvenAfterConfirmationOrOnAnotherInstance`, `Web_O22_IdempotencyKey_InProgressState_Returns409Conflict_Then201WhenCompleted`, `Web_O22_IdempotencyKey_BatchCleanup_ClearsExpiredKeysWithoutDeletingEnrollments`, `DpcEndpoint_IdempotencyKey_SameStudentAndGroup_DifferentEnrollmentId_Returns409Conflict_AndLegacyHashCompatible`, `E2EHttpEndpointTests.Idempotency.cs` |
 | **О2.3** | Повтор після втраченої відповіді | `FaultInjector.MaybeTriggerAfterCommitBeforeResponse` (`FAULTS=on`, атомарне захоплення й видалення `/faults/after_commit_before_response`, логування JSON-події `fault.hit`, негайне аварійне завершення процесу після `COMMIT` до відправлення HTTP-відповіді) | `Web_O23_FaultAfterCommitBeforeResponse_TriggersOnce_CommitsData_AndRetryOnSecondInstanceReturns201`, `scripts/verify_all.ps1` (крок 11.3 на контейнерах `app-a` та `app-b`) |
 | **О2.4** | Повторні спроби в клієнті | `client/api.js` (`createWebEnrollment`, `computeWebRetryDelayMs`, `parseRetryAfterMs`, `isRetryableWebEnrollmentResponse`): один `Idempotency-Key` на логічну операцію, обмеження часу кожної спроби та загального бюджету `totalBudgetMs = 8000` мс через `AbortController` (`signal`), експоненційний відступ із випадковим джитером, повага до `Retry-After` ($\text{delay} \ge \text{Retry-After}$), повтори на мережевих помилках / тайм-аутах / `429` / `503` / `409 idempotency_key_in_progress`, заборона повторів на `400`/`401`/`403`/`404`/`422` і предметних `409`, виведення **«Результат невідомий»** при вичерпанні ліміту спроб або бюджету часу | `client/api.js`, `scripts/verify_all.ps1` (крок 11.3) |
 
@@ -790,10 +808,10 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 
 | Пункт | Назва вимоги | Реалізація у коді | Перевірка (тести / скрипти) |
 | :--- | :--- | :--- | :--- |
-| **О2.1** | Паралельне чисельне інтегрування | `POST /v1/compute` (`ComputeEndpoints.cs`, `ParallelComputeService.cs`, `ComputeWorkerProcess.cs`, `C10IntensityMath.cs`, `BearerAuthMiddleware.cs`): обов'язкова `Bearer`-авторизація, валідація області визначення картки C10 ($0 \le a \le b \le T$), складена формула трапецій для $\lambda(t) = B + A e^{-t/\tau}$ з розбиттям на `workers` $\in \{1, 2, 4\}$ окремих дочірніх процесів ОС за цілими індексами без пропусків і перекриттів | `Dpc_O21_PostCompute_LocalMode_MatchesAnalyticalReferenceAcrossWorkerCounts`, `Dpc_O21_PostCompute_MissingOrInvalidBearerToken_Returns401Unauthorized`, `Dpc_O21_PostCompute_InvalidParameters_Returns400ProblemDetails`, `scripts/verify_all.ps1` (кроки 12.0, 12.1) |
+| **О2.1** | Паралельне чисельне інтегрування | `POST /v1/compute` (`ComputeEndpoints.cs`, `ParallelComputeService.cs`, `ComputeWorkerProcess.cs`, `C10IntensityMath.cs`, `BearerAuthMiddleware.cs`): обов'язкова `Bearer`-авторизація, валідація області визначення картки C10 ($0 \le a \le b \le T$), складена формула трапецій для $\lambda(t) = B + A e^{-t/\tau}$ з розбиттям на `workers` $\in \{1, 2, 4\}$ окремих дочірні процеси ОС за цілими індексами без пропусків і перекриттів | `Dpc_O21_PostCompute_LocalMode_MatchesAnalyticalReferenceAcrossWorkerCounts`, `Dpc_O21_PostCompute_MissingOrInvalidBearerToken_Returns401Unauthorized`, `Dpc_O21_PostCompute_InvalidParameters_Returns400ProblemDetails`, `scripts/verify_all.ps1` (кроки 12.0, 12.1) |
 | **О2.2** | Дослідження точності | Аналітичний еталон $I(a, b) = F(b) - F(a) = B(b - a) + A\tau(e^{-a/\tau} - e^{-b/\tau})$, обчислення `abs_error` та `rel_error`, експериментальна серія для $n$ та $2n$ (підтвердження порядку $O(h^2)$, зменшення похибки в $\approx 4.0000$ раза при подвоєнні $n$) | `C10IntensityMath_AccuracyOrder_ErrorDecreasesFourfoldWhenDoublingN`, `Dpc_O22_PostCompute_EdgeCases_ZeroWidthAndSingleSubinterval`, `scripts/measure_compute.ps1` |
 | **О2.3** | Прискорення та причини обмеження | Вимірювання $T_p$, прискорення $S(p) = T_1 / T_p$ та ефективності $E(p) = S(p)/p$ на $p \in \{1, 2, 4\}$ процесах при `bench_n = 250000000` ($T_{\text{med}}(1) = 1.5289\text{ с} \ge 1.0\text{ с}$), відтворюване профілювання фаз у Release-контейнері (`--compute-worker --profile-o23`) та перевірка гіпотези оптимізації гарячого циклу в однакових умовах | `C10IntensityMath_OptimizationHypothesis_CompositeMatchesNaivePerSubinterval`, `scripts/measure_compute.ps1` (розділи 2 та 3) |
-| **О2.4** | Спільна сума та локальні результати | Три режими параметра `mode` у `POST /v1/compute`: `none` (спільна сума у міжпроцесній пам'яті `MemoryMappedFile` без синхронізації — відтворювана втрата оновлень при `workers > 1`), `lock` (спільна сума під міжпроцесним атомарним спін-блокуванням `Interlocked.CompareExchange`), `local` (локальні суми в кожному процесі з фінальним детермінованим додаванням) | `Dpc_O24_PostCompute_ModesComparison_NoneLosesUpdates_LockAndLocalAreExact`, `scripts/measure_compute.ps1` (розділ 4), `scripts/verify_all.ps1` (крок 12.2) |
+| **О2.4** | Спільна сума та локальні результати | Три режими параметра `mode` у `POST /v1/compute`: `none` (спільна сума у міжпроцесній пам'яті `MemoryMappedFile` без синхронізації — відтворювана втрата оновлень при `workers > 1`), `lock` (спільна сума під міжпроцесним атомарним спін-блокуванням `Interlocked.CompareExchange`), `local` (локальні суми в кожному процесі з фінальним детермінованим додаванням); коректне проходження бар'єра при $n < \text{workers}$ | `Dpc_O24_PostCompute_ModesComparison_NoneLosesUpdates_LockAndLocalAreExact`, `Dpc_O24_PostCompute_SmallN1With4Workers_SharedMemoryModes_CompleteWithoutBarrierTimeout`, `scripts/measure_compute.ps1` (розділ 4), `scripts/verify_all.ps1` (крок 12.2) |
 
 ---
 
@@ -813,13 +831,16 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
    ```
 5. Оновлюється статистика студента (`active_count + 1`, `active_ects + ects`) і вставляється запис у `enrollment` разом із збереженою ідемпотентною відповіддю.
 
-**Результати багатопримірникового експерименту конкурентності (`verify_all.ps1`, крок 11.1):**
-- Тестова група: `22222222-2222-2222-2222-222222222209` (`WEB-CONC-25`, місткість `seats = 25`, `available = 25`, `3.0` ЄКТС).
-- Навантаження: **45 одночасних запитів** від різних студентів (`student-web-conc-01` .. `student-web-conc-45`), відправлених напряму на обидва примірники застосунку: непарні — на `http://localhost:8001` (`app-a`), парні — на `http://localhost:8002` (`app-b`).
-- Фактичний результат:
-  - Успішних відповідей `201 Created`: **рівно 25** (відповідає місткості групи).
-  - Відхилених відповідей `409 Conflict` (`error_code = "group_full"`): **рівно 20**.
-  - Кінцевий стан у PostgreSQL: `available = 0`, `taken = 25`, `free_seats = 0`, `invariant_holds = true`, кількість активних записів у `enrollment` дорівнює `25`, у кожного з 25 зарахованих студентів `active_count = 1`, `active_ects = 3.0`.
+**Масштаб конкурентного експерименту та результати перевірки інваріанта:**
+- **Повномасштабний сценарій за карткою теми C10 (`500` студентів на групу з `25` місць):**
+  - В інтеграційному тесті `Web_O21_ConcurrentEnrollments_25Seats_500Students_C10CardScale_PreservesAllInvariants` (`WebLab2IdempotencyAndFaultTests.cs`) безпосередньо відтворено числовий приклад із картки теми C10: **500 одночасних запитів** від 500 різних студентів у момент відкриття реєстрації на групу місткістю **25 місць**, рівномірно розподілених між двома примірниками сервісу (`app-a` та `app-b`).
+  - Результат: рівно **25** запитів отримують `201 Created`, решта **475** запитів детерміновано відхиляються з кодом `409 Conflict` (`error_code = "group_full"`), у БД `available = 0`, `taken = 25`, а кількість створених активних записів `held` становить рівно `25`.
+- **Швидкий контейнерний тест інваріанта у `verify_all.ps1` (крок 11.1 — `45` одночасних запитів):**
+  - У регулярному скрипті автоматичної атестації `scripts/verify_all.ps1` використовується компактний відтворюваний тест із **45 одночасними запитами** (`student-web-conc-01` .. `student-web-conc-45`) на тестову групу `22222222-2222-2222-2222-222222222209` (`WEB-CONC-25`, місткість `seats = 25`, `available = 25`, `3.0` ЄКТС), які надсилаються паралельно напряму на обидва контейнери: непарні — на `http://localhost:8001` (`app-a`), парні — на `http://localhost:8002` (`app-b`). Вибір 45 запитів ($45 > 25$) дозволяє гарантовано створити конкурентне перевищення місткості на $80\%$ і перевірити всі інваріанти кластера за лічені секунди без накладних витрат на запуск 500 окремих процесів/завдань PowerShell під час швидкої перевірки.
+  - Фактичний результат у `verify_all.ps1`:
+    - Успішних відповідей `201 Created`: **рівно 25** (відповідає місткості групи).
+    - Відхилених відповідей `409 Conflict` (`error_code = "group_full"`): **рівно 20**.
+    - Кінцевий стан у PostgreSQL: `available = 0`, `taken = 25`, `free_seats = 0`, `invariant_holds = true`, кількість активних записів у `enrollment` дорівнює `25`, у кожного з 25 зарахованих студентів `active_count = 1`, `active_ects = 3.0`.
 
 #### 10.2.2. Повний механізм ідемпотентності (Web О2.2)
 
@@ -1033,7 +1054,7 @@ $$\text{start}_w = \left\lfloor \frac{w \cdot n}{p} \right\rfloor, \quad \text{e
 # 1. Статична перевірка контракту OpenAPI 3.1 (Spectral CLI)
 npx @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 
-# 2. Запуск усіх 190 модульних, інтеграційних та E2E-тестів xUnit
+# 2. Запуск усіх 194 модульних, інтеграційних та E2E-тестів xUnit
 docker compose up -d postgres
 dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj
 

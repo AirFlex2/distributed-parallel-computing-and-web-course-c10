@@ -64,7 +64,8 @@ public static class EnrollmentRequestEndpoints
 
             string studentId = dto!.StudentId!.Trim();
             string groupId = dto!.GroupId!.Trim();
-            string payloadFingerprint = $"{studentId}:{groupId}";
+            Guid? enrollmentId = dto.EnrollmentId;
+            string payloadFingerprint = ComputeRequestPayloadFingerprint(studentId, groupId, enrollmentId);
 
             // Швидка перевірка переповнення черги (О1.2)
             if (!queue.TryReserveSlot())
@@ -88,15 +89,13 @@ public static class EnrollmentRequestEndpoints
                     var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, connCheck, httpContext.RequestAborted);
                     if (existing != null)
                     {
-                        if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                            !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
-                            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+                        if (!IsMatchingIdempotentRequest(existing, studentId, groupId, enrollmentId, payloadFingerprint))
                         {
                             return ProblemDetailsMapper.CreateProblemResult(
                                 httpContext, opts,
                                 StatusCodes.Status409Conflict,
                                 "Конфлікт даних ідемпотентного запиту",
-                                $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id або group_id.",
+                                $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id, group_id або enrollment_id.",
                                 "idempotency_conflict");
                         }
 
@@ -133,15 +132,13 @@ public static class EnrollmentRequestEndpoints
                     var existing = await requestRepo.GetByIdempotencyKeyAsync(idempotencyKey, connCheck, httpContext.RequestAborted);
                     if (existing != null)
                     {
-                        if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                            !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
-                            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+                        if (!IsMatchingIdempotentRequest(existing, studentId, groupId, enrollmentId, payloadFingerprint))
                         {
                             return ProblemDetailsMapper.CreateProblemResult(
                                 httpContext, opts,
                                 StatusCodes.Status409Conflict,
                                 "Конфлікт даних ідемпотентного запиту",
-                                $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id або group_id.",
+                                $"Ідемпотентний ключ '{idempotencyKey}' вже було використано з іншими параметрами student_id, group_id або enrollment_id.",
                                 "idempotency_conflict");
                         }
 
@@ -223,9 +220,7 @@ public static class EnrollmentRequestEndpoints
 
                     if (existing != null)
                     {
-                        if (!string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal) ||
-                            !string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
-                            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+                        if (!IsMatchingIdempotentRequest(existing, studentId, groupId, enrollmentId, payloadFingerprint))
                         {
                             return ProblemDetailsMapper.CreateProblemResult(
                                 httpContext, opts,
@@ -346,5 +341,45 @@ public static class EnrollmentRequestEndpoints
         });
 
         return app;
+    }
+
+    private static string ComputeRequestPayloadFingerprint(string studentId, string groupId, Guid? enrollmentId)
+        => enrollmentId.HasValue
+            ? $"{studentId}:{groupId}:{enrollmentId.Value:D}"
+            : $"{studentId}:{groupId}";
+
+    private static bool IsMatchingIdempotentRequest(
+        ExistingRequestRecord existing,
+        string studentId,
+        string groupId,
+        Guid? enrollmentId,
+        string payloadFingerprint)
+    {
+        if (!string.Equals(existing.StudentId, studentId, StringComparison.Ordinal) ||
+            !string.Equals(existing.GroupId, groupId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        Guid? existingEnrollmentId = existing.RequestedEnrollmentId ?? existing.EnrollmentId;
+        if (existingEnrollmentId != enrollmentId)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(existing.RequestPayloadHash))
+        {
+            return true;
+        }
+
+        if (string.Equals(existing.RequestPayloadHash, payloadFingerprint, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Зворотна сумісність із раніше збереженими записами, де хеш формувався у форматі "{studentId}:{groupId}"
+        // без суфікса enrollment_id, за умови що фактичний збережений enrollment_id (або його відсутність) повністю збігається.
+        string legacyFingerprint = $"{studentId}:{groupId}";
+        return string.Equals(existing.RequestPayloadHash, legacyFingerprint, StringComparison.Ordinal);
     }
 }
