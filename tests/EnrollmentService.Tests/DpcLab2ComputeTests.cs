@@ -354,10 +354,19 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
         }
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Dpc_O24_ComputeWorker_BarrierTimeout_FailsWithErrorCodeAndDoesNotProceed()
     {
-        Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+        // Перевіряємо обов'язкову валідацію додатності barrierTimeoutMs (> 0)
+        Assert.Throws<ArgumentOutOfRangeException>(() => ParallelComputeService.CreateWorkerStartInfo(
+            a: 0.0, b: 10.0, n: 100, startIdx: 0, endIdx: 25, workers: 4,
+            modelA: 50.0, modelB: 5.0, modelTau: 10.0, mode: "lock", kernel: "composite",
+            sharedFilePath: "test.bin", barrierTimeoutMs: 0));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => ParallelComputeService.CreateWorkerStartInfo(
+            a: 0.0, b: 10.0, n: 100, startIdx: 0, endIdx: 25, workers: 4,
+            modelA: 50.0, modelB: 5.0, modelTau: 10.0, mode: "lock", kernel: "composite",
+            sharedFilePath: "test.bin", barrierTimeoutMs: -100));
 
         string shmPath = Path.Combine(Path.GetTempPath(), $"c10_test_barrier_timeout_{Guid.NewGuid():N}.bin");
         Process? proc = null;

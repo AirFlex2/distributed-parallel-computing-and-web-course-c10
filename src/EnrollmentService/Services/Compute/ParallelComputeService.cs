@@ -392,6 +392,14 @@ public sealed class ParallelComputeService
         string? sharedFilePath,
         int barrierTimeoutMs = 5000)
     {
+        if (barrierTimeoutMs <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(barrierTimeoutMs),
+                barrierTimeoutMs,
+                "Час очікування бар'єра (barrierTimeoutMs) має бути строго додатним числом (> 0).");
+        }
+
         string assemblyLocation = typeof(Program).Assembly.Location;
         string? currentProcessPath = Environment.ProcessPath;
 
@@ -447,11 +455,8 @@ public sealed class ParallelComputeService
             psi.ArgumentList.Add(sharedFilePath);
         }
 
-        if (barrierTimeoutMs > 0)
-        {
-            psi.ArgumentList.Add("--barrier-timeout-ms");
-            psi.ArgumentList.Add(barrierTimeoutMs.ToString(CultureInfo.InvariantCulture));
-        }
+        psi.ArgumentList.Add("--barrier-timeout-ms");
+        psi.ArgumentList.Add(barrierTimeoutMs.ToString(CultureInfo.InvariantCulture));
 
         return psi;
     }

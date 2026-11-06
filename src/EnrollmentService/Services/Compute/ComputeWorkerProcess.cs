@@ -87,7 +87,13 @@ public static class ComputeWorkerProcess
                         sharedFilePath = val;
                         break;
                     case "--barrier-timeout-ms":
-                        barrierTimeoutMs = int.Parse(val, CultureInfo.InvariantCulture);
+                        if (!int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsedTimeout) || parsedTimeout <= 0)
+                        {
+                            throw new ArgumentOutOfRangeException(
+                                nameof(barrierTimeoutMs),
+                                $"Параметр --barrier-timeout-ms має бути строго додатним цілим числом (> 0), отримано '{val}'.");
+                        }
+                        barrierTimeoutMs = parsedTimeout;
                         break;
                 }
             }
@@ -154,6 +160,14 @@ public static class ComputeWorkerProcess
         double modelTau,
         int barrierTimeoutMs)
     {
+        if (barrierTimeoutMs <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(barrierTimeoutMs),
+                barrierTimeoutMs,
+                "Час очікування бар'єра (barrierTimeoutMs) має бути строго додатним числом (> 0).");
+        }
+
         using var fs = new FileStream(
             sharedFilePath,
             FileMode.Open,
