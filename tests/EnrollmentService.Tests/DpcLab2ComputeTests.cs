@@ -251,6 +251,57 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
         // Переконуємося, що бар'єр не чекає 2500 мс тайм-ауту через порожні діапазони у 3 з 4 процесів
         double wallS = root.GetProperty("wall_s").GetDouble();
         Assert.True(wallS < 2.0, $"Очікувався швидкий вихід із бар'єра (wall_s < 2.0 с), але отримано wall_s={wallS:F3} с у режимі mode={mode}");
+
+        // Додаткова перевірка повноцінної синхронізації всіх workers=4 процесів на бар'єрі при n=2:
+        // два процеси з порожнім діапазоном [2, 2) стартують першими, а два обчислювальні процеси [0, 1) та [1, 2) — через 150 мс.
+        // Бар'єр має дочекатися всіх 4 процесів (readyCount == 4), а не розблокуватися достроково після перших двох порожніх.
+        string shmPath = Path.Combine(Path.GetTempPath(), $"c10_test_barrier_{Guid.NewGuid():N}.bin");
+        try
+        {
+            await File.WriteAllBytesAsync(shmPath, new byte[ComputeWorkerProcess.SharedMemoryByteSize]);
+
+            string[] BuildWorkerArgs(long start, long end) =>
+            [
+                ComputeWorkerProcess.WorkerArgFlag,
+                "--a", "0",
+                "--b", "2",
+                "--n", "2",
+                "--start", start.ToString(),
+                "--end", end.ToString(),
+                "--workers", "4",
+                "--mode", mode,
+                "--shared-file", shmPath
+            ];
+
+            var swEmpty = System.Diagnostics.Stopwatch.StartNew();
+            var emptyWorker2 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(2, 2)));
+            var emptyWorker3 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(2, 2)));
+
+            await Task.Delay(150);
+            // На цей момент у бар'єрі лише 2 порожні потоки з 4 — вони ще не повинні завершитися
+            Assert.False(emptyWorker2.IsCompleted, "Процес із порожнім діапазоном не повинен проходити бар'єр, поки readyCount < workers (4)");
+            Assert.False(emptyWorker3.IsCompleted, "Процес із порожнім діапазоном не повинен проходити бар'єр, поки readyCount < workers (4)");
+
+            var activeWorker0 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(0, 1)));
+            var activeWorker1 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(1, 2)));
+
+            int[] exitCodes = await Task.WhenAll(emptyWorker2, emptyWorker3, activeWorker0, activeWorker1);
+            swEmpty.Stop();
+
+            Assert.All(exitCodes, code => Assert.Equal(0, code));
+            Assert.True(swEmpty.ElapsedMilliseconds < 1500, $"Бар'єр мав завершитися відразу після приходу 4-го учасника, але зайняв {swEmpty.ElapsedMilliseconds} мс");
+
+            byte[] shmBytes = await File.ReadAllBytesAsync(shmPath);
+            int finalReadyCount = BitConverter.ToInt32(shmBytes, 12);
+            Assert.Equal(4, finalReadyCount);
+        }
+        finally
+        {
+            if (File.Exists(shmPath))
+            {
+                File.Delete(shmPath);
+            }
+        }
     }
 
     [SkippableFact]

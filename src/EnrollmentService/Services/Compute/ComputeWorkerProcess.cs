@@ -169,14 +169,13 @@ public static class ComputeWorkerProcess
             int* readyCountPtr = (int*)(basePtr + 12);
 
             // Бар'єр синхронізації старту дочірніх процесів, щоб усі працівники одночасно зверталися до спільної пам'яті.
-            // Усі процеси відмічаються у бар'єрі до перевірки порожнього діапазону, а цільова кількість очікуваних
-            // активних процесів також враховує випадок n < workers.
-            int activeWorkers = (a == b || n <= 0) ? 1 : (int)Math.Min(n, (long)workers);
+            // Усі запущені процеси відмічаються у бар'єрі до перевірки порожнього діапазону та очікують повного складу workers.
             Interlocked.Increment(ref *readyCountPtr);
-            if (activeWorkers > 1)
+            if (workers > 1)
             {
                 var swBarrier = Stopwatch.StartNew();
-                while (Volatile.Read(ref *readyCountPtr) < activeWorkers && swBarrier.ElapsedMilliseconds < 2500)
+                while (Volatile.Read(ref *readyCountPtr) < workers &&
+                       swBarrier.ElapsedMilliseconds < 2500)
                 {
                     Thread.SpinWait(16);
                 }
