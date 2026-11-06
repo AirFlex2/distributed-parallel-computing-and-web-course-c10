@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -253,50 +254,155 @@ public sealed class DpcLab2ComputeTests : IClassFixture<WebApplicationFactory<Pr
         Assert.True(wallS < 2.0, $"Очікувався швидкий вихід із бар'єра (wall_s < 2.0 с), але отримано wall_s={wallS:F3} с у режимі mode={mode}");
 
         // Додаткова перевірка повноцінної синхронізації всіх workers=4 процесів на бар'єрі при n=2:
-        // два процеси з порожнім діапазоном [2, 2) стартують першими, а два обчислювальні процеси [0, 1) та [1, 2) — через 150 мс.
-        // Бар'єр має дочекатися всіх 4 процесів (readyCount == 4), а не розблокуватися достроково після перших двох порожніх.
+        // запускаються реальні окремі дочірні процеси ОС через ProcessStartInfo.
+        // Два процеси з порожнім діапазоном [2, 2) стартують першими.
+        // За допомогою спільної пам'яті тест детерміновано очікує, поки обидва порожні процеси
+        // реально увійдуть у бар'єр і збільшать readyCount до 2 (без сліпої фіксованої затримки).
+        // Після цього перевіряється, що вони НЕ завершилися (HasExited == false),
+        // і лише після запуску двох обчислювальних процесів [0, 1) та [1, 2) всі 4 процеси завершуються з кодом 0.
         string shmPath = Path.Combine(Path.GetTempPath(), $"c10_test_barrier_{Guid.NewGuid():N}.bin");
+        Process? proc2 = null;
+        Process? proc3 = null;
+        Process? proc0 = null;
+        Process? proc1 = null;
+
         try
         {
-            await File.WriteAllBytesAsync(shmPath, new byte[ComputeWorkerProcess.SharedMemoryByteSize]);
+            await using (var initFs = new FileStream(
+                shmPath,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.ReadWrite | FileShare.Delete))
+            {
+                byte[] zeros = new byte[ComputeWorkerProcess.SharedMemoryByteSize];
+                await initFs.WriteAsync(zeros);
+                await initFs.FlushAsync();
+            }
 
-            string[] BuildWorkerArgs(long start, long end) =>
-            [
-                ComputeWorkerProcess.WorkerArgFlag,
-                "--a", "0",
-                "--b", "2",
-                "--n", "2",
-                "--start", start.ToString(),
-                "--end", end.ToString(),
-                "--workers", "4",
-                "--mode", mode,
-                "--shared-file", shmPath
-            ];
+            int ReadReadyCount()
+            {
+                using var fs = new FileStream(shmPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                Span<byte> buf = stackalloc byte[16];
+                fs.ReadExactly(buf);
+                return BitConverter.ToInt32(buf.Slice(12, 4));
+            }
 
-            var swEmpty = System.Diagnostics.Stopwatch.StartNew();
-            var emptyWorker2 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(2, 2)));
-            var emptyWorker3 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(2, 2)));
+            ProcessStartInfo BuildPsi(long start, long end) =>
+                ParallelComputeService.CreateWorkerStartInfo(
+                    a: 0.0,
+                    b: 2.0,
+                    n: 2,
+                    startIdx: start,
+                    endIdx: end,
+                    workers: 4,
+                    modelA: 50.0,
+                    modelB: 5.0,
+                    modelTau: 10.0,
+                    mode: mode,
+                    kernel: "composite",
+                    sharedFilePath: shmPath,
+                    barrierTimeoutMs: 5000);
 
-            await Task.Delay(150);
-            // На цей момент у бар'єрі лише 2 порожні потоки з 4 — вони ще не повинні завершитися
-            Assert.False(emptyWorker2.IsCompleted, "Процес із порожнім діапазоном не повинен проходити бар'єр, поки readyCount < workers (4)");
-            Assert.False(emptyWorker3.IsCompleted, "Процес із порожнім діапазоном не повинен проходити бар'єр, поки readyCount < workers (4)");
+            proc2 = Process.Start(BuildPsi(2, 2))!;
+            proc3 = Process.Start(BuildPsi(2, 2))!;
 
-            var activeWorker0 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(0, 1)));
-            var activeWorker1 = Task.Run(() => ComputeWorkerProcess.Run(BuildWorkerArgs(1, 2)));
+            // Детерміновано очікуємо, поки обидва порожні процеси реально увійдуть у бар'єр і збільшать readyCount до 2
+            var swWaitReady = System.Diagnostics.Stopwatch.StartNew();
+            while (swWaitReady.ElapsedMilliseconds < 5000)
+            {
+                if (ReadReadyCount() >= 2)
+                {
+                    break;
+                }
+                await Task.Delay(10);
+            }
 
-            int[] exitCodes = await Task.WhenAll(emptyWorker2, emptyWorker3, activeWorker0, activeWorker1);
-            swEmpty.Stop();
+            int readyCountBeforeActive = ReadReadyCount();
+            Assert.Equal(2, readyCountBeforeActive);
+            Assert.False(proc2.HasExited, "Дочірній процес ОС із порожнім діапазоном не повинен виходити з бар'єра, поки readyCount (2) < workers (4)");
+            Assert.False(proc3.HasExited, "Дочірній процес ОС із порожнім діапазоном не повинен виходити з бар'єра, поки readyCount (2) < workers (4)");
 
-            Assert.All(exitCodes, code => Assert.Equal(0, code));
-            Assert.True(swEmpty.ElapsedMilliseconds < 1500, $"Бар'єр мав завершитися відразу після приходу 4-го учасника, але зайняв {swEmpty.ElapsedMilliseconds} мс");
+            // Запускаємо два обчислювальні процеси
+            proc0 = Process.Start(BuildPsi(0, 1))!;
+            proc1 = Process.Start(BuildPsi(1, 2))!;
 
-            byte[] shmBytes = await File.ReadAllBytesAsync(shmPath);
-            int finalReadyCount = BitConverter.ToInt32(shmBytes, 12);
+            await Task.WhenAll(
+                proc2.WaitForExitAsync(),
+                proc3.WaitForExitAsync(),
+                proc0.WaitForExitAsync(),
+                proc1.WaitForExitAsync());
+
+            Assert.Equal(0, proc2.ExitCode);
+            Assert.Equal(0, proc3.ExitCode);
+            Assert.Equal(0, proc0.ExitCode);
+            Assert.Equal(0, proc1.ExitCode);
+
+            int finalReadyCount = ReadReadyCount();
             Assert.Equal(4, finalReadyCount);
         }
         finally
         {
+            if (proc2 != null) { try { if (!proc2.HasExited) proc2.Kill(true); } catch { } proc2.Dispose(); }
+            if (proc3 != null) { try { if (!proc3.HasExited) proc3.Kill(true); } catch { } proc3.Dispose(); }
+            if (proc0 != null) { try { if (!proc0.HasExited) proc0.Kill(true); } catch { } proc0.Dispose(); }
+            if (proc1 != null) { try { if (!proc1.HasExited) proc1.Kill(true); } catch { } proc1.Dispose(); }
+
+            if (File.Exists(shmPath))
+            {
+                File.Delete(shmPath);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task Dpc_O24_ComputeWorker_BarrierTimeout_FailsWithErrorCodeAndDoesNotProceed()
+    {
+        Skip.If(!await TestEnvironment.IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string shmPath = Path.Combine(Path.GetTempPath(), $"c10_test_barrier_timeout_{Guid.NewGuid():N}.bin");
+        Process? proc = null;
+        try
+        {
+            await using (var fs = new FileStream(shmPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete))
+            {
+                byte[] zeros = new byte[ComputeWorkerProcess.SharedMemoryByteSize];
+                await fs.WriteAsync(zeros);
+            }
+
+            // Запускаємо лише 1 процес із workers=4 і коротким бар'єрним тайм-аутом 300 мс (інші 3 процеси не запускаються)
+            var psi = ParallelComputeService.CreateWorkerStartInfo(
+                a: 0.0,
+                b: 10.0,
+                n: 100,
+                startIdx: 0,
+                endIdx: 25,
+                workers: 4,
+                modelA: 50.0,
+                modelB: 5.0,
+                modelTau: 10.0,
+                mode: "lock",
+                kernel: "composite",
+                sharedFilePath: shmPath,
+                barrierTimeoutMs: 300);
+
+            proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            // Перевіряємо, що при тайм-ауті процес НЕ продовжує вирахування, а негайно завершується з помилкою (exit code 1)
+            Assert.Equal(1, proc.ExitCode);
+            Assert.True(stderr.Contains("Синхронізаційний бар'єр") || stderr.Contains("бар'єр") || stderr.Contains("TimeoutException"),
+                $"Expected barrier timeout error in stderr, but got: {stderr}");
+            Assert.DoesNotContain("0\n", stdout);
+        }
+        finally
+        {
+            if (proc != null)
+            {
+                try { if (!proc.HasExited) proc.Kill(true); } catch { }
+                proc.Dispose();
+            }
             if (File.Exists(shmPath))
             {
                 File.Delete(shmPath);

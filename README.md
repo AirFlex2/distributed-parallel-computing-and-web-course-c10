@@ -17,7 +17,7 @@
   - База даних: `PostgreSQL 16 Alpine` (реляційна схема з обмеженнями цілісності, контрольованою денормалізацією та версіонованими міграціями SQL з контролем контрольних сум SHA-256).
   - Балансування та мережа: `Nginx 1.27 Alpine` (алгоритм балансування `least_conn`, проксі для Web API, виділений маршрут `/health-app-a`, маршрутизація `/registrations` та черги РПО на `dpc_backend`).
   - Клієнт: `JavaScript ES6+ / HTML5 / CSS3` (без сторонніх бібліотек чи фреймворків, порт 3000).
-  - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (194 тестові випадки: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, чисельного інтегрування, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
+  - Тестування та перевірка: `Spectral CLI 6.11` (OpenAPI 3.1), `xUnit` (195 тестових випадків: модульні, інтеграційні та наскрізні E2E-перевірки бізнес-правил, HTTP-статусів, ідемпотентності, конкурентного доступу, черг, чисельного інтегрування, міграцій БД та ізоляції тестового середовища), `PowerShell 7+ / Bash` (скрипти комплексної автоматизованої атестації).
 
 ---
 
@@ -447,7 +447,7 @@ project/
 - **Операційна система**: Windows 10/11 (з WSL2), Ubuntu 22.04+, macOS 13+.
 - **Процесор і ресурси**: $\ge 4$ CPU ядра, не менше 4 ГБ вільної оперативної пам'яті (RAM).
 - **Платформи розробки та виконання**:
-  - **.NET 8.0 SDK** (для збирання проєкту та запуску повного набору xUnit-тестів; поточний набір — 194 тестові випадки).
+  - **.NET 8.0 SDK** (для збирання проєкту та запуску повного набору xUnit-тестів; поточний набір — 195 тестових випадків).
   - **PowerShell 7+ (`pwsh`)** (для кросплатформенного запуску сценарію атестації `verify_all.ps1`).
   - **Node.js 18+ / npm** (для валідації специфікації лінтером `@stoplight/spectral-cli` та локального клієнта).
 - **Контейнеризація**:
@@ -510,7 +510,7 @@ docker compose up -d --build
 ```powershell
 pwsh scripts/verify_all.ps1
 ```
-*(Скрипт перевіряє лінтування контракту, проходження всіх 194 тестових випадків модульних, інтеграційних та E2E-тестів, перевірку параметрів безпеки, Backpressure 429 при стійкому навантаженні 50 клієнтами, захист від гонитви SAFE vs UNSAFE на одній групі, закон Літтла, Graceful Shutdown з кодом 503, курсорне пагінування, життєвий цикл Web та балансування).*
+*(Скрипт перевіряє лінтування контракту, проходження всіх 195 тестових випадків модульних, інтеграційних та E2E-тестів, перевірку параметрів безпеки, Backpressure 429 при стійкому навантаженні 50 клієнтами, захист від гонитви SAFE vs UNSAFE на одній групі, закон Літтла, Graceful Shutdown з кодом 503, курсорне пагінування, життєвий цикл Web та балансування).*
 
 #### 3. Запуск клієнтського вебзастосунку (пункт Д1.2 Web):
 ```powershell
@@ -786,7 +786,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
   6. **Інфраструктура, тестування та автоматизація**:
      - Конфігурація багатоконтейнерного середовища Docker Compose (вузли `app-a`, `app-b`, `nginx`, `postgres`).
      - Налаштування балансувальника Nginx за алгоритмом `least_conn`.
-     - Написання 194 тестових випадків модульного, інтеграційного та наскрізного E2E-тестування на базі xUnit, що перевіряють бізнес-правила, HTTP API, ідемпотентність, конкурентний доступ до спільних ресурсів, паралельну обробку запитів, паралельне чисельне інтегрування, міграції бази даних та безпеку тестового середовища.
+     - Написання 195 тестових випадків модульного, інтеграційного та наскрізного E2E-тестування на базі xUnit, що перевіряють бізнес-правила, HTTP API, ідемпотентність, конкурентний доступ до спільних ресурсів, паралельну обробку запитів, паралельне чисельне інтегрування, міграції бази даних та безпеку тестового середовища.
      - Розробка комплексного автоматизованого сценарію атестації `verify_all.ps1` та скрипта вимірювань `measure_compute.ps1`.
 
 ---
@@ -811,7 +811,7 @@ npx --yes @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 | **О2.1** | Паралельне чисельне інтегрування | `POST /v1/compute` (`ComputeEndpoints.cs`, `ParallelComputeService.cs`, `ComputeWorkerProcess.cs`, `C10IntensityMath.cs`, `BearerAuthMiddleware.cs`): обов'язкова `Bearer`-авторизація, валідація області визначення картки C10 ($0 \le a \le b \le T$), складена формула трапецій для $\lambda(t) = B + A e^{-t/\tau}$ з розбиттям на `workers` $\in \{1, 2, 4\}$ окремих дочірні процеси ОС за цілими індексами без пропусків і перекриттів | `Dpc_O21_PostCompute_LocalMode_MatchesAnalyticalReferenceAcrossWorkerCounts`, `Dpc_O21_PostCompute_MissingOrInvalidBearerToken_Returns401Unauthorized`, `Dpc_O21_PostCompute_InvalidParameters_Returns400ProblemDetails`, `scripts/verify_all.ps1` (кроки 12.0, 12.1) |
 | **О2.2** | Дослідження точності | Аналітичний еталон $I(a, b) = F(b) - F(a) = B(b - a) + A\tau(e^{-a/\tau} - e^{-b/\tau})$, обчислення `abs_error` та `rel_error`, експериментальна серія для $n$ та $2n$ (підтвердження порядку $O(h^2)$, зменшення похибки в $\approx 4.0000$ раза при подвоєнні $n$) | `C10IntensityMath_AccuracyOrder_ErrorDecreasesFourfoldWhenDoublingN`, `Dpc_O22_PostCompute_EdgeCases_ZeroWidthAndSingleSubinterval`, `scripts/measure_compute.ps1` |
 | **О2.3** | Прискорення та причини обмеження | Вимірювання $T_p$, прискорення $S(p) = T_1 / T_p$ та ефективності $E(p) = S(p)/p$ на $p \in \{1, 2, 4\}$ процесах при `bench_n = 250000000` ($T_{\text{med}}(1) = 1.5289\text{ с} \ge 1.0\text{ с}$), відтворюване профілювання фаз у Release-контейнері (`--compute-worker --profile-o23`) та перевірка гіпотези оптимізації гарячого циклу в однакових умовах | `C10IntensityMath_OptimizationHypothesis_CompositeMatchesNaivePerSubinterval`, `scripts/measure_compute.ps1` (розділи 2 та 3) |
-| **О2.4** | Спільна сума та локальні результати | Три режими параметра `mode` у `POST /v1/compute`: `none` (спільна сума у міжпроцесній пам'яті `MemoryMappedFile` без синхронізації — відтворювана втрата оновлень при `workers > 1`), `lock` (спільна сума під міжпроцесним атомарним спін-блокуванням `Interlocked.CompareExchange`), `local` (локальні суми в кожному процесі з фінальним детермінованим додаванням); коректне проходження бар'єра при $n < \text{workers}$ | `Dpc_O24_PostCompute_ModesComparison_NoneLosesUpdates_LockAndLocalAreExact`, `Dpc_O24_PostCompute_SmallN1With4Workers_SharedMemoryModes_CompleteWithoutBarrierTimeout`, `scripts/measure_compute.ps1` (розділ 4), `scripts/verify_all.ps1` (крок 12.2) |
+| **О2.4** | Спільна сума та локальні результати | Три режими параметра `mode` у `POST /v1/compute`: `none` (спільна сума у міжпроцесній пам'яті `MemoryMappedFile` без синхронізації — відтворювана втрата оновлень при `workers > 1`), `lock` (спільна сума під міжпроцесним атомарним спін-блокуванням `Interlocked.CompareExchange`), `local` (локальні суми в кожному процесі з фінальним детермінованим додаванням); коректне проходження бар'єра при $n < \text{workers}$ | `Dpc_O24_PostCompute_ModesComparison_NoneLosesUpdates_LockAndLocalAreExact`, `Dpc_O24_PostCompute_SmallN1With4Workers_SharedMemoryModes_CompleteWithoutBarrierTimeout`, `Dpc_O24_ComputeWorker_BarrierTimeout_FailsWithErrorCodeAndDoesNotProceed`, `scripts/measure_compute.ps1` (розділ 4), `scripts/verify_all.ps1` (крок 12.2) |
 
 ---
 
@@ -1054,7 +1054,7 @@ $$\text{start}_w = \left\lfloor \frac{w \cdot n}{p} \right\rfloor, \quad \text{e
 # 1. Статична перевірка контракту OpenAPI 3.1 (Spectral CLI)
 npx @stoplight/spectral-cli lint openapi.yaml --fail-severity=warn
 
-# 2. Запуск усіх 194 модульних, інтеграційних та E2E-тестів xUnit
+# 2. Запуск усіх 195 модульних, інтеграційних та E2E-тестів xUnit
 docker compose up -d postgres
 dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj
 

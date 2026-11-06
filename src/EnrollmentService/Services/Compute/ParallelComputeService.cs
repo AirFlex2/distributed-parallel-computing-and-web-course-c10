@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using EnrollmentService.Domain;
 
 namespace EnrollmentService.Services.Compute;
@@ -376,7 +377,7 @@ public sealed class ParallelComputeService
         }
     }
 
-    private static ProcessStartInfo CreateWorkerStartInfo(
+    public static ProcessStartInfo CreateWorkerStartInfo(
         double a,
         double b,
         long n,
@@ -388,7 +389,8 @@ public sealed class ParallelComputeService
         double modelTau,
         string mode,
         string kernel,
-        string? sharedFilePath)
+        string? sharedFilePath,
+        int barrierTimeoutMs = 5000)
     {
         string assemblyLocation = typeof(Program).Assembly.Location;
         string? currentProcessPath = Environment.ProcessPath;
@@ -409,6 +411,8 @@ public sealed class ParallelComputeService
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
             CreateNoWindow = true
         };
 
@@ -441,6 +445,12 @@ public sealed class ParallelComputeService
         {
             psi.ArgumentList.Add("--shared-file");
             psi.ArgumentList.Add(sharedFilePath);
+        }
+
+        if (barrierTimeoutMs > 0)
+        {
+            psi.ArgumentList.Add("--barrier-timeout-ms");
+            psi.ArgumentList.Add(barrierTimeoutMs.ToString(CultureInfo.InvariantCulture));
         }
 
         return psi;

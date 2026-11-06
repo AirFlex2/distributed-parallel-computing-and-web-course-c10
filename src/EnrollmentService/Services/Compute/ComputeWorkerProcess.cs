@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
+using System.Text;
 using System.Text.Json;
 
 namespace EnrollmentService.Services.Compute;
@@ -18,6 +19,7 @@ public static class ComputeWorkerProcess
     {
         try
         {
+            Console.OutputEncoding = Encoding.UTF8;
             if (args.Any(a => string.Equals(a, ProfileO23Flag, StringComparison.OrdinalIgnoreCase)))
             {
                 return RunProfileAndHypothesisVerification(args);
@@ -35,6 +37,7 @@ public static class ComputeWorkerProcess
             string mode = "local";
             string kernel = "composite";
             string? sharedFilePath = null;
+            int barrierTimeoutMs = 5000;
 
             for (int i = 1; i < args.Length; i++)
             {
@@ -83,6 +86,9 @@ public static class ComputeWorkerProcess
                     case "--shared-file":
                         sharedFilePath = val;
                         break;
+                    case "--barrier-timeout-ms":
+                        barrierTimeoutMs = int.Parse(val, CultureInfo.InvariantCulture);
+                        break;
                 }
             }
 
@@ -119,7 +125,8 @@ public static class ComputeWorkerProcess
                 endIdx,
                 modelA,
                 modelB,
-                modelTau);
+                modelTau,
+                barrierTimeoutMs);
 
             Console.Out.WriteLine("0");
             Console.Out.Flush();
@@ -144,7 +151,8 @@ public static class ComputeWorkerProcess
         long endIdx,
         double modelA,
         double modelB,
-        double modelTau)
+        double modelTau,
+        int barrierTimeoutMs)
     {
         using var fs = new FileStream(
             sharedFilePath,
@@ -175,9 +183,15 @@ public static class ComputeWorkerProcess
             {
                 var swBarrier = Stopwatch.StartNew();
                 while (Volatile.Read(ref *readyCountPtr) < workers &&
-                       swBarrier.ElapsedMilliseconds < 2500)
+                       swBarrier.ElapsedMilliseconds < barrierTimeoutMs)
                 {
                     Thread.SpinWait(16);
+                }
+
+                if (Volatile.Read(ref *readyCountPtr) < workers)
+                {
+                    throw new TimeoutException(
+                        $"Синхронізаційний бар'єр міжпроцесної пам'яті не досягнуто за {swBarrier.ElapsedMilliseconds} мс: зареєстровано лише {Volatile.Read(ref *readyCountPtr)} із {workers} процесів-працівників.");
                 }
             }
 
