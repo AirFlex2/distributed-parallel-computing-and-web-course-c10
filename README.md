@@ -81,12 +81,12 @@ stateDiagram-v2
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | *(новий)* | `POST /v1/enrollments` | `held` | $v = 1$ | `available = available - 1` | `active_count + 1`, `active_ects + ects` |
 | `held` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | $v = v + 1$ | Не змінюється (вже зарезервовано) | Не змінюється |
-| `held` | `POST /v1/enrollments/{id}/registrations` | `queued` -> `confirmed` | $v = v + 1$ | Не змінюється (вже зарезервовано) | Не змінюється (через воркер РПО до відомості деканату) |
+| `held` | `POST /v1/enrollments/{id}/registrations` | `confirmed` | $v = v + 1$ | Не змінюється (вже зарезервовано) | Не змінюється (заявка РПО проходить `queued` $\to$ `processing` $\to$ `done`) |
 | `held` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | $v = v + 1$ | `available = available + 1` | `active_count - 1`, `active_ects - ects` |
 | `held` ($t > \text{expires\_at}$) | Фоновий таймер або дія після спливу часу | `expired` | $v = v + 1$ | `available = available + 1` (повернення) | `active_count - 1`, `active_ects - ects` |
-| `confirmed` | `POST /v1/enrollments/{id}/cancel` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється | 409 Conflict (`enrollment_already_confirmed`). Звичайне скасування підтвердженого запису заборонено |
+| `confirmed` | `POST /v1/enrollments/{id}/cancel` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється (409 Conflict: `enrollment_already_confirmed`; звичайне скасування підтвердженого запису заборонено) |
 | `confirmed` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | Не змінюється | Не змінюється (ідемпотентно) | Не змінюється |
-| `confirmed` | `POST /v1/enrollments/{id}/registrations` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється | 409 Conflict (`enrollment_not_held`). Повторне внесення до відомості неможливе |
+| `confirmed` | `POST /v1/enrollments/{id}/registrations` | `confirmed` (відхилено) | Не змінюється | Не змінюється | Не змінюється (409 Conflict: `enrollment_not_held`; повторне внесення до відомості неможливе) |
 | `cancelled` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | Не змінюється | Не змінюється (ідемпотентно) | Не змінюється |
 
 #### 2.6.2 Розмежування статусів confirmed та реєстрації у відомості (Web vs РПО, С10)
@@ -424,8 +424,8 @@ project/
         ├── RestartAndRecoveryTests.Startup.cs     # 3 тести відновлення queued-заявок із PostgreSQL при старті та дозавантаження
         ├── RestartAndRecoveryTests.Shutdown.cs    # 2 тести Graceful Shutdown (Drain при заповненій БД та зупинка app-b без воркерів)
         ├── RestartAndRecoveryTests.CrashRecovery.cs # 11 тестів аварійного відновлення (5 станів ідемпотентності, збої до/після коміту, гонитва)
-        ├── DpcLab2ComputeTests.cs                 # 25 тестів РПО ЛР2 (POST /v1/compute, точність O(h^2), 1/2/4 процеси, local/lock/none, Bearer 401)
-        ├── WebLab2IdempotencyAndFaultTests.cs     # 8 тестів Web ЛР2 (О2.1 конкурентність 40 та 500 студентів на 25 місць, О2.2–О2.3 ідемпотентність і fault)
+        ├── DpcLab2ComputeTests.cs                 # 28 тестів РПО ЛР2 (POST /v1/compute, точність O(h^2), 1/2/4 процеси, local/lock/none, Bearer 401)
+        ├── WebLab2IdempotencyAndFaultTests.cs     # 6 тестів Web ЛР2 (О2.1 конкурентність 40 та 500 студентів на 25 місць, О2.2–О2.3 ідемпотентність і fault)
         ├── E2EHttpEndpointTests.Fixture.cs        # Спільна тестова фікстура WebApplicationFactory, хелпери перевірок та очищення
         ├── E2EHttpEndpointTests.Enrollment.cs     # 24 наскрізні E2E HTTP-тести Web-контуру (CRUD, вікна, ліміти, скасування, автентифікація)
         ├── E2EHttpEndpointTests.DpcQueue.cs       # 4 E2E HTTP-тести черги РПО (прийом 202, опитування, пісочниця, реєстрація Web)
