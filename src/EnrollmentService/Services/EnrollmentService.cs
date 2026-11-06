@@ -386,6 +386,28 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     "Неможливо підтвердити скасований запис.");
             }
 
+            // Перевіряємо наявність запису у decanate_roster за enrollment_id.
+            // Якщо запис уже зафіксовано у відомості контуром РПО (DPC),
+            // переводимо held у confirmed незалежно від expires_at,
+            // не змінюючи available_seats і статистику студента (вони вже були виділені при створенні held).
+            await using var rosterCheckCmd = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM decanate_roster WHERE enrollment_id = @eid;", conn, tx);
+            rosterCheckCmd.Parameters.AddWithValue("eid", enrollmentId);
+            long inRosterCount = (long)(await rosterCheckCmd.ExecuteScalarAsync(cancellationToken) ?? 0L);
+
+            if (inRosterCount > 0)
+            {
+                if (enrollment.Status == "held")
+                {
+                    await _enrollmentRepo.ConfirmEnrollmentHeldAsync(enrollmentId, conn, tx, cancellationToken);
+                }
+
+                await tx.CommitAsync(cancellationToken);
+
+                var updatedFromRoster = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(updatedFromRoster ?? enrollment with { Status = "confirmed", Version = enrollment.Version + 1 });
+            }
+
             if (enrollment.Status == "expired" || enrollment.ExpiresAt < DateTimeOffset.UtcNow)
             {
                 // Атомарне звільнення простроченого запису без взаємоблокувань
