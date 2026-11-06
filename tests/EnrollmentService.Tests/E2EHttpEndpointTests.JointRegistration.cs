@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using EnrollmentService.Services;
 using EnrollmentService.Services.Processing;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
@@ -615,6 +616,223 @@ public sealed partial class E2EHttpEndpointTests
         finally
         {
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task JointScenario_CancelAttemptAfterDpcCommit_RejectsCancelAndKeepsConfirmedConsistency()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-e2e-cancel-after-dpc";
+        string groupId = "GRP-CANCEL-AFTER-DPC";
+        string discId = "DISC-CANCEL-AFTER-DPC";
+        Guid testRequestId = Guid.NewGuid();
+
+        var processor = _factory.Services.GetRequiredService<EnrollmentRequestProcessor>();
+        var dpcCommitReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowWebNotifyToProceed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Перехоплюємо виконання воркера РПО СТРОГО після COMMIT DPC (запис у decanate_roster зафіксовано),
+        // але ДО виклику Web-нотифікатора NotifyRosterRecordedAsync.
+        using var hookRegistration = processor.RegisterPostCommitBeforeNotificationHook(testRequestId, async (item) =>
+        {
+            dpcCommitReached.TrySetResult(true);
+            await allowWebNotifyToProceed.Task;
+        });
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
+
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
+
+            // 1. Web створює held-запис (місце у групі 5 -> 4, student activeCount 0 -> 1)
+            var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            var postJson = await postResp.Content.ReadAsStringAsync();
+            using var postDoc = JsonDocument.Parse(postJson);
+            Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
+
+            // 2. Ставимо запис у чергу РПО для внесення до відомості decanate_roster
+            var clientDpc = _factory.CreateClient();
+            clientDpc.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+            var reqContent = new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    student_id = studentId,
+                    group_id = groupId,
+                    request_id = testRequestId,
+                    enrollment_id = enrollmentId.ToString("D")
+                }),
+                Encoding.UTF8,
+                "application/json");
+
+            var dpcResp = await clientDpc.PostAsync("/v1/enrollment-requests", reqContent);
+            Assert.Equal(HttpStatusCode.Accepted, dpcResp.StatusCode);
+
+            // 3. Очікуємо, поки воркер РПО виконає COMMIT у транзакції DPC (студент у відомості decanate_roster, request_id = done)
+            await dpcCommitReached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Переконуємося, що в БД у decanate_roster запис ВЖЕ зафіксовано
+            await using (var connCheck = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var cmdRoster = new NpgsqlCommand("SELECT COUNT(*) FROM decanate_roster WHERE enrollment_id = @eid;", connCheck);
+                cmdRoster.Parameters.AddWithValue("eid", enrollmentId);
+                long rCount = (long)(await cmdRoster.ExecuteScalarAsync())!;
+                Assert.Equal(1L, rCount);
+            }
+
+            // 4. ТЕПЕР (до сповіщення Web) надходить студентський запит на скасування POST /cancel:
+            // Web повинен виявити наявність запису у decanate_roster, ВІДХИЛИТИ скасування з кодом 409 Conflict,
+            // НЕ повертати місце у групу, НЕ зменшувати active_count студента та перевести статус у confirmed.
+            var cancelResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/cancel", null);
+            Assert.Equal(HttpStatusCode.Conflict, cancelResp.StatusCode);
+            var cancelErrJson = await cancelResp.Content.ReadAsStringAsync();
+            using var cancelErrDoc = JsonDocument.Parse(cancelErrJson);
+            Assert.Equal("enrollment_already_confirmed", cancelErrDoc.RootElement.GetProperty("error_code").GetString());
+
+            // 5. Перевіряємо інваріанти БД одразу після спроби скасування:
+            await using (var connState = await TestEnvironment.OpenConnectionAsync())
+            {
+                // Вільні місця: мають залишитися 4 (місце НЕ повернуто у пул)
+                await using var cmdGrp = new NpgsqlCommand("SELECT available FROM discipline_group WHERE id = @gid;", connState);
+                cmdGrp.Parameters.AddWithValue("gid", groupId);
+                int avail = (int)(await cmdGrp.ExecuteScalarAsync())!;
+                Assert.Equal(4, avail);
+
+                // Статистика студента: active_count має залишитися 1 (НЕ зменшено)
+                await using var cmdStud = new NpgsqlCommand("SELECT active_count, active_ects FROM student WHERE id = @sid;", connState);
+                cmdStud.Parameters.AddWithValue("sid", studentId);
+                await using var rdr = await cmdStud.ExecuteReaderAsync();
+                Assert.True(await rdr.ReadAsync());
+                Assert.Equal(1, rdr.GetInt32(0));
+                Assert.Equal(3.0m, rdr.GetDecimal(1));
+                await rdr.CloseAsync();
+
+                // Статус enrollment: переведено у confirmed (а не cancelled)
+                await using var cmdEnr = new NpgsqlCommand("SELECT status FROM enrollment WHERE id = @eid;", connState);
+                cmdEnr.Parameters.AddWithValue("eid", enrollmentId);
+                string enrStatus = (string)(await cmdEnr.ExecuteScalarAsync())!;
+                Assert.Equal("confirmed", enrStatus);
+            }
+
+            // 6. Дозволяємо воркеру РПО завершити сповіщення Web
+            allowWebNotifyToProceed.TrySetResult(true);
+
+            // Очікуємо термінального стану заявки DPC
+            await WaitForTerminalStatusAsync(clientDpc, testRequestId);
+
+            // Перевіряємо остаточний статус заявки
+            var pollResp = await clientDpc.GetAsync($"/v1/enrollment-requests/{testRequestId}");
+            var pollJson = await pollResp.Content.ReadAsStringAsync();
+            using var pollDoc = JsonDocument.Parse(pollJson);
+            Assert.Equal("done", pollDoc.RootElement.GetProperty("status").GetString());
+        }
+        finally
+        {
+            allowWebNotifyToProceed.TrySetResult(true);
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+        }
+    }
+
+    [SkippableFact]
+    public async Task JointScenario_DelayedWebNotificationAfterExpiresAt_SuccessfullyConfirmsRosterEnrollment()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        string studentId = "stud-delayed-notify-exp";
+        string groupId = "GRP-DELAYED-NOTIFY-EXP";
+        string discId = "DISC-DELAYED-NOTIFY-EXP";
+        Guid heldEnrollmentId = Guid.NewGuid();
+        Guid testRequestId = Guid.NewGuid();
+
+        await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
+
+        try
+        {
+            await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 1, activeEcts: 3.0m);
+            await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 4, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 3.0m, dpcSandboxEnabled: true);
+
+            await using var conn = await TestEnvironment.OpenConnectionAsync();
+
+            // 1. Створюємо запис enrollment у стані held, але зі строком expires_at У МИНУЛОМУ (наприклад, -10 хвилин тому)
+            DateTimeOffset expiredPast = DateTimeOffset.UtcNow.AddMinutes(-10);
+            await using (var insEnr = new NpgsqlCommand(@"
+                INSERT INTO enrollment (id, student_id, group_id, discipline_id, status, version, created_at, expires_at)
+                VALUES (@id, @sid, @gid, @did, 'held', 1, @created, @expires);", conn))
+            {
+                insEnr.Parameters.AddWithValue("id", heldEnrollmentId);
+                insEnr.Parameters.AddWithValue("sid", studentId);
+                insEnr.Parameters.AddWithValue("gid", groupId);
+                insEnr.Parameters.AddWithValue("did", discId);
+                insEnr.Parameters.AddWithValue("created", expiredPast.AddMinutes(-15));
+                insEnr.Parameters.AddWithValue("expires", expiredPast);
+                await insEnr.ExecuteNonQueryAsync();
+            }
+
+            // 2. Створюємо заявку enrollment_requests у стані 'done' (DPC транзакція успішно завершена)
+            await using (var insReq = new NpgsqlCommand(@"
+                INSERT INTO enrollment_requests (id, student_id, group_id, status, created_at, enrollment_id)
+                VALUES (@rid, @sid, @gid, 'done', NOW(), @eid);", conn))
+            {
+                insReq.Parameters.AddWithValue("rid", testRequestId);
+                insReq.Parameters.AddWithValue("sid", studentId);
+                insReq.Parameters.AddWithValue("gid", groupId);
+                insReq.Parameters.AddWithValue("eid", heldEnrollmentId);
+                await insReq.ExecuteNonQueryAsync();
+            }
+
+            // 3. Вносимо запис до decanate_roster (імітація: РПО успішно зафіксував студента у відомості,
+            // коли резервування було чинним, але мережеве сповіщення затрималося понад 15 хвилин)
+            await using (var insRoster = new NpgsqlCommand(@"
+                INSERT INTO decanate_roster (request_id, student_id, group_id, discipline_id, ects, enrollment_id, assignment_type, created_at)
+                VALUES (@rid, @sid, @gid, @did, 3.0, @eid, 'joint_web_enrollment', @fin);", conn))
+            {
+                insRoster.Parameters.AddWithValue("rid", testRequestId);
+                insRoster.Parameters.AddWithValue("sid", studentId);
+                insRoster.Parameters.AddWithValue("gid", groupId);
+                insRoster.Parameters.AddWithValue("did", discId);
+                insRoster.Parameters.AddWithValue("eid", heldEnrollmentId);
+                insRoster.Parameters.AddWithValue("fin", DateTimeOffset.UtcNow);
+                await insRoster.ExecuteNonQueryAsync();
+            }
+
+            // 4. Перевіряємо, що фоновий очищувач прострочених записів НЕ експірує цей запис (бо він у відомості)
+            var enrollmentService = _factory.Services.GetRequiredService<EnrollmentService.Services.EnrollmentService>();
+            var repo = _factory.Services.GetRequiredService<EnrollmentService.Repositories.EnrollmentRepository>();
+            int expiredCount = await repo.ExpireStaleHeldEnrollmentsAsync();
+            Assert.Equal(0, expiredCount);
+
+            // 5. Викликаємо затримане підтвердження через ConfirmEnrollmentDetailedAsync:
+            // Попри expires_at < NOW(), метод ПОВИНЕН підтвердити запис (Success), оскільки факт офіційного
+            // внесення до відомості деканату вже зафіксовано в decanate_roster.
+            var result = await enrollmentService.ConfirmEnrollmentDetailedAsync(heldEnrollmentId, testRequestId);
+            Assert.Equal(RosterConfirmationResult.Success, result);
+
+            // 6. Перевіряємо оновлення в базі: статус став confirmed, version інкрементовано
+            await using (var chkCmd = new NpgsqlCommand("SELECT status, version FROM enrollment WHERE id = @eid;", conn))
+            {
+                chkCmd.Parameters.AddWithValue("eid", heldEnrollmentId);
+                await using var rdr = await chkCmd.ExecuteReaderAsync();
+                Assert.True(await rdr.ReadAsync());
+                Assert.Equal("confirmed", rdr.GetString(0));
+                Assert.Equal(2, rdr.GetInt32(1));
+            }
+
+            // 7. Ідемпотентний повтор виклику повертає AlreadyConfirmed
+            var repeatResult = await enrollmentService.ConfirmEnrollmentDetailedAsync(heldEnrollmentId, testRequestId);
+            Assert.Equal(RosterConfirmationResult.AlreadyConfirmed, repeatResult);
+        }
+        finally
+        {
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, testRequestId);
         }
     }
 }

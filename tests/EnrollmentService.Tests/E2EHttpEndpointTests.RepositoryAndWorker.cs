@@ -539,7 +539,7 @@ public sealed partial class E2EHttpEndpointTests
             bool expiredResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
             Assert.False(expiredResult, "Прострочений запис (expired) повинен відхилятися з false");
 
-            // Перевірка 8: Запис held, але час резерву сплив (expires_at <= now) -> повертає FALSE
+            // Перевірка 8: Запис held, але час резерву сплив (expires_at <= now), проте запис уже внесено до відомості decanate_roster -> повертає TRUE
             await using (var conn = await connFactory.OpenConnectionAsync())
             {
                 await using var cmd = new NpgsqlCommand("UPDATE enrollment SET status = 'held', created_at = NOW() - INTERVAL '20 minutes', expires_at = NOW() - INTERVAL '5 minutes' WHERE id = @eid;", conn);
@@ -548,7 +548,7 @@ public sealed partial class E2EHttpEndpointTests
             }
 
             bool timedOutHeldResult = await enrollmentService.ConfirmEnrollmentFromRosterAsync(enrollmentId, reqId);
-            Assert.False(timedOutHeldResult, "Запис held із минулим expires_at повинен відхилятися з false");
+            Assert.True(timedOutHeldResult, "Запис held із минулим expires_at, внесений до відомості decanate_roster, повинен підтверджуватися з true");
         }
         finally
         {

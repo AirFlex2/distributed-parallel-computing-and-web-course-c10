@@ -40,6 +40,7 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     }
 
     private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
+    private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPostCommitBeforeNotifyHooks = new();
 
     /// <summary>
     /// Реєструє тестову точку перехоплення, ізольовану виключно для конкретного ідентифікатора заявки (requestId).
@@ -59,6 +60,26 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         return new ScopedHookRegistration(() =>
         {
             _scopedPreProcessingHooks.TryRemove(new KeyValuePair<Guid, Func<QueuedRequestItem, Task>>(requestId, hook));
+        });
+    }
+
+    /// <summary>
+    /// Реєструє тестову точку перехоплення після успішного COMMIT транзакції DPC (де запис уже внесено до decanate_roster),
+    /// але ДО надсилання сповіщення Web-контуру через IWebEnrollmentNotifier.
+    /// Дозволяє детерміновано протестувати стан гонки між фіксацією у відомості та скасуванням Web-запису.
+    /// </summary>
+    public IDisposable RegisterPostCommitBeforeNotificationHook(Guid requestId, Func<QueuedRequestItem, Task> hook)
+    {
+        ArgumentNullException.ThrowIfNull(hook);
+
+        if (!_scopedPostCommitBeforeNotifyHooks.TryAdd(requestId, hook))
+        {
+            throw new InvalidOperationException($"Хук після коміту для requestId '{requestId}' вже зареєстровано.");
+        }
+
+        return new ScopedHookRegistration(() =>
+        {
+            _scopedPostCommitBeforeNotifyHooks.TryRemove(new KeyValuePair<Guid, Func<QueuedRequestItem, Task>>(requestId, hook));
         });
     }
 
@@ -481,6 +502,22 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
 
                     // О1.5 DPC: час завершення обробки фіксується СТРОГО ПІСЛЯ завершення коміту транзакції
                     _metrics.MarkProcessingFinished(item);
+
+                    if (_scopedPostCommitBeforeNotifyHooks.TryGetValue(item.Id, out var postCommitHook))
+                    {
+                        try
+                        {
+                            await postCommitHook(item);
+                        }
+                        catch (Exception hookEx)
+                        {
+                            StructuredJsonLogger.LogEvent(_options.InstanceId, "scoped_post_commit_hook_exception", new Dictionary<string, object?>
+                            {
+                                ["request_id"] = item.Id,
+                                ["error"] = hookEx.ToString()
+                            });
+                        }
+                    }
 
                     // Web самостійно виконує перехід held -> confirmed у власній окремій транзакції.
                     // DPC повідомляє Web про результат через нотифікатор IWebEnrollmentNotifier.

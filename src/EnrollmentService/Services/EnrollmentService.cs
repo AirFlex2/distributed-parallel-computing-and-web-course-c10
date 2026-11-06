@@ -498,6 +498,38 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     "Підтверджений запис (confirmed) вже внесено до відомості деканату і він не підлягає скасуванню через студентський інтерфейс.");
             }
 
+            // Перевіряємо наявність запису у decanate_roster за enrollment_id.
+            // Якщо запис уже зафіксовано у відомості контуром РПО (DPC), скасовувати його
+            // та повертати місце у групу неприпустимо — переводимо у confirmed та повертаємо 409 Conflict.
+            await using var rosterCheckCmd = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM decanate_roster WHERE enrollment_id = @eid;", conn, tx);
+            rosterCheckCmd.Parameters.AddWithValue("eid", enrollmentId);
+            long inRosterCount = (long)(await rosterCheckCmd.ExecuteScalarAsync(cancellationToken) ?? 0L);
+
+            if (inRosterCount > 0)
+            {
+                if (enrollment.Status == "held")
+                {
+                    int confirmedVersion = enrollment.Version + 1;
+                    await using var confirmCmd = new NpgsqlCommand(@"
+                        UPDATE enrollment
+                        SET status = 'confirmed',
+                            version = @version
+                        WHERE id = @id AND status = 'held';", conn, tx);
+                    confirmCmd.Parameters.AddWithValue("id", enrollmentId);
+                    confirmCmd.Parameters.AddWithValue("version", confirmedVersion);
+                    await confirmCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await tx.CommitAsync(cancellationToken);
+
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_already_confirmed",
+                    "Неможливо скасувати підтверджений запис",
+                    "Підтверджений запис (confirmed) вже внесено до відомості деканату і він не підлягає скасуванню через студентський інтерфейс.");
+            }
+
             if (enrollment.Status == "cancelled")
             {
                 await tx.CommitAsync(cancellationToken);
@@ -654,8 +686,11 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
             return RosterConfirmationResult.AlreadyConfirmed;
         }
 
-        // 4. Постійні порушення: запис скасовано ('cancelled'), минув строк ('expired') або прострочений
-        if (currentStatus != "held" || expiresAt <= DateTimeOffset.UtcNow)
+        // 4. Постійні порушення: запис скасовано ('cancelled') або переведено в інший термінальний стан.
+        // Зауваження: оскільки запис успішно внесено до відомості decanate_roster у межах чинного вікна резервування,
+        // затримка сповіщення Web або відпрацювання reconciliation після закінчення expires_at НЕ є перешкодою
+        // для фіксації підтвердження (held -> confirmed), адже офіційне зарахування студента вже зафіксовано.
+        if (currentStatus != "held")
         {
             return RosterConfirmationResult.PermanentFailure;
         }
