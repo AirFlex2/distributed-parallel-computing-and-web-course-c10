@@ -19,7 +19,7 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
         Guid requestId,
         CancellationToken cancellationToken = default)
     {
-        // Механізм повторної доставки (Retry): до 3 спроб з експоненційною затримкою (50 мс, 100 мс, 200 мс)
+        // Механізм повторної доставки (Retry): до 3 спроб загалом (1 початкова + 2 повторні) із затримками 50 мс та 100 мс
         for (int attempt = 1; attempt <= 3; attempt++)
         {
             try
@@ -45,10 +45,10 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
 
                     case RosterConfirmationResult.TransientFailure:
                     default:
-                        // Тимчасова неможливість підтвердження — повторюємо з експоненційною затримкою
+                        // Тимчасова неможливість підтвердження — повторюємо з експоненційною затримкою (50 мс, 100 мс)
                         if (attempt < 3 && !cancellationToken.IsCancellationRequested)
                         {
-                            int delayMs = 50 * (1 << (attempt - 1)); // 50, 100, 200 мс
+                            int delayMs = 50 * (1 << (attempt - 1)); // 50 мс після attempt 1, 100 мс після attempt 2
                             await Task.Delay(delayMs, cancellationToken);
                         }
                         break;
@@ -70,7 +70,7 @@ public sealed class WebEnrollmentNotifier : IWebEnrollmentNotifier
                         ["request_id"] = requestId,
                         ["error"] = ex.Message
                     });
-                    int delayMs = 50 * (1 << (attempt - 1)); // 50, 100, 200 мс
+                    int delayMs = 50 * (1 << (attempt - 1)); // 50 мс після attempt 1, 100 мс після attempt 2
                     await Task.Delay(delayMs, cancellationToken);
                 }
                 else
