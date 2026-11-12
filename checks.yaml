@@ -1,0 +1,101 @@
+# Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1 + ЛР2)
+# Створено суворо на основі joint/checks-template.yaml та специфікацій checks.example.yaml обох курсів.
+
+# ==============================================================================
+# Розділ курсу «Обмін даними у Web-застосунках» (Web Interactions)
+# ==============================================================================
+web:
+  openapi: openapi.yaml
+  base: http://localhost:8080
+  items:
+    - О1.5   # Список із курсором (GET /v1/enrollments?limit=...&cursor=...)
+    - О1.6   # Система, /health, журнал JSON
+    - Д1.4   # traceparent -> trace_id у структурованому журналі JSON
+    - О2.3   # Повтор після втраченої відповіді (/faults/after_commit_before_response)
+    - О2.4   # Повторні спроби в клієнті (exponential backoff + jitter + Retry-After)
+  instances:
+    app-a: "http://localhost:8001"
+    app-b: "http://localhost:8002"
+  services:
+    nginx: nginx
+    app-a: app-a
+    app-b: app-b
+    postgres: postgres
+  log_fields:
+    time: time
+    instance: instance
+    route: route
+    status: status
+    duration: duration_ms
+
+# ==============================================================================
+# Розділ курсу «Розподілені та паралельні обчислення» (Distributed Parallel Computing)
+# ==============================================================================
+dpc:
+  openapi: openapi.yaml
+  base: http://localhost:8000
+  items:
+    - О1.5   # Час виконання, перцентилі p50/p95/p99 та метрики черги Літтла
+    - Д1.4   # Graceful Shutdown (SIGTERM) із вивантаженням повної черги
+    - О2.2   # Дослідження точності чисельного інтегрування (n та 2n)
+  services:
+    api: app-a
+    postgres: postgres
+  load_s: 10
+  resource:
+    path: /v1/group-seats/DISC-DPC-01
+    ok_field: invariant_holds
+  metrics:
+    - queue_length
+    - in_flight
+    - rejected
+  compute:
+    tolerance: 1.0e-6
+    bench_n: 250000000
+    modes:
+      param: mode
+      values: [none, lock, local]
+
+# ==============================================================================
+# Спільний сценарій наскрізної перевірки взаємодії двох контурів (Scenario)
+# Наскрізна передача ідентифікатора та стану між Web та DPC (тема C10, joint/README.md)
+# ==============================================================================
+scenario:
+  - name: web-create
+    part: web
+    user: student-1
+    method: POST
+    path: /v1/enrollments
+    body:
+      group_id: DISC-DPC-01
+    idempotent: true
+    status: 201
+    save: enrollment
+  - name: web-register
+    part: web
+    user: student-1
+    method: POST
+    path: "/v1/enrollments/{enrollment}/registrations"
+    idempotent: true
+    status: 202
+    save: request
+  - name: dpc-result
+    part: dpc
+    method: GET
+    path: "/v1/enrollment-requests/{request}"
+    status: 200
+    expect:
+      id: "{request}"
+      status: done
+      recorded_in_roster: true
+    wait: 60
+  - name: web-result
+    part: web
+    user: student-1
+    method: GET
+    path: "/v1/enrollments/{enrollment}"
+    status: 200
+    expect:
+      id: "{enrollment}"
+      status: confirmed
+    wait: 60
