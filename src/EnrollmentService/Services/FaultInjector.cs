@@ -2,16 +2,22 @@ using System.Diagnostics;
 
 namespace EnrollmentService.Services;
 
-// Web О2.3: Контрольована відмова (failpoint) після фіксації транзакції в PostgreSQL (COMMIT),
-// але до відправлення HTTP-відповіді клієнту.
-// Активується лише за наявності FAULTS=on та файлу-прапорця /faults/after_commit_before_response.
+public sealed class SimulatedRayWorkerCrashException : Exception
+{
+    public SimulatedRayWorkerCrashException(string message) : base(message) { }
+}
+
+// Web О2.3 та РПО О3.4: Контрольовані відмови (/faults).
+// - after_commit_before_response: після COMMIT створення Web-запису, до HTTP-відповіді.
+// - after_effect_before_ack: після застосування ефекту приймачем у БД, до ack завершення задачі (для тестів).
 public static class FaultInjector
 {
     public const string AfterCommitBeforeResponseFaultName = "after_commit_before_response";
+    public const string AfterEffectBeforeAckFaultName = "after_effect_before_ack";
 
-    // Тестовий перехоплювач виключно для xUnit-тестів в одному процесі (щоб не вбивати процес тест-раннера).
-    // У реальному контейнері (коли перехоплювач == null) виконується негайне аварійне завершення процесу (SIGKILL).
+    // Тестові перехоплювачі виключно для xUnit-тестів в одному процесі (щоб не вбивати процес тест-раннера).
     public static Action<string, Guid, string, string?>? InProcessTestFaultIntercept { get; set; }
+    public static Action<string, Guid, string>? InProcessAfterEffectFaultIntercept { get; set; }
 
     public static void MaybeTriggerAfterCommitBeforeResponse(
         ServiceOptions options,
@@ -19,46 +25,11 @@ public static class FaultInjector
         string studentId,
         string? idempotencyKey)
     {
-        if (!options.FaultsEnabled)
+        if (!TryClaimFaultFlag(options, AfterCommitBeforeResponseFaultName))
         {
             return;
         }
 
-        string dir = string.IsNullOrWhiteSpace(options.FaultsDirectory) ? "/faults" : options.FaultsDirectory;
-        string flagPath = Path.Combine(dir, AfterCommitBeforeResponseFaultName);
-
-        if (!File.Exists(flagPath))
-        {
-            return;
-        }
-
-        // Атомарне захоплення прапорця через перейменування в тій самій директорії,
-        // щоб прапорець спрацював рівно один раз навіть при одночасних запитах або спільному томі.
-        string claimedPath = Path.Combine(dir, $".claimed_{AfterCommitBeforeResponseFaultName}_{Guid.NewGuid():N}");
-        try
-        {
-            File.Move(flagPath, claimedPath);
-        }
-        catch ( IOException )
-        {
-            // Інший потік або примірник уже захопив/видалив прапорець
-            return;
-        }
-        catch ( UnauthorizedAccessException )
-        {
-            return;
-        }
-
-        try
-        {
-            File.Delete(claimedPath);
-        }
-        catch
-        {
-            // Ігноруємо помилку видалення тимчасового файлу після атомарного перейменування
-        }
-
-        // Обов'язковий структурований запис у журнал перед аварійним завершенням (О2.3 / Д1.4)
         StructuredJsonLogger.LogEvent(options.InstanceId, "fault.hit", new Dictionary<string, object?>
         {
             ["fault"] = AfterCommitBeforeResponseFaultName,
@@ -74,9 +45,74 @@ public static class FaultInjector
             return;
         }
 
-        // Негайне неграціозне завершення процесу (включно з PID 1 у Linux-контейнері Docker)
-        // без закриття HTTP-відповіді Kestrel (обрив TCP-з'єднання після COMMIT).
         Environment.Exit(137);
         Environment.FailFast("Controlled fault: after_commit_before_response");
+    }
+
+    public static void MaybeTriggerAfterEffectBeforeAckInProcess(
+        ServiceOptions options,
+        Guid requestId,
+        string studentId)
+    {
+        if (!TryClaimFaultFlag(options, AfterEffectBeforeAckFaultName))
+        {
+            return;
+        }
+
+        StructuredJsonLogger.LogEvent(options.InstanceId, "fault.hit", new Dictionary<string, object?>
+        {
+            ["fault"] = AfterEffectBeforeAckFaultName,
+            ["request_id"] = requestId.ToString("D"),
+            ["student_id"] = studentId
+        });
+
+        var intercept = InProcessAfterEffectFaultIntercept;
+        if (intercept != null)
+        {
+            intercept(options.InstanceId, requestId, studentId);
+        }
+
+        throw new SimulatedRayWorkerCrashException(
+            $"Simulated Ray worker crash ({AfterEffectBeforeAckFaultName}) after receiver committed effect for request {requestId}.");
+    }
+
+    private static bool TryClaimFaultFlag(ServiceOptions options, string faultName)
+    {
+        if (!options.FaultsEnabled)
+        {
+            return false;
+        }
+
+        string dir = string.IsNullOrWhiteSpace(options.FaultsDirectory) ? "/faults" : options.FaultsDirectory;
+        string flagPath = Path.Combine(dir, faultName);
+
+        if (!File.Exists(flagPath))
+        {
+            return false;
+        }
+
+        string claimedPath = Path.Combine(dir, $".claimed_{faultName}_{Guid.NewGuid():N}");
+        try
+        {
+            File.Move(flagPath, claimedPath);
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+
+        try
+        {
+            File.Delete(claimedPath);
+        }
+        catch
+        {
+        }
+
+        return true;
     }
 }

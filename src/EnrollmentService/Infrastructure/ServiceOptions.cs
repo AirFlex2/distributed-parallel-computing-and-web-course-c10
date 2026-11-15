@@ -30,6 +30,24 @@ public sealed class ServiceOptions
     public double ComputeModelT { get; set; } = 60.0;
     public int ComputeWorkerTimeoutMs { get; set; } = 60000;
 
+    // Web ЛР3 (О3.1–О3.3): серверна автентифікація (непрозорі токени) та захист браузерних запитів (CORS)
+    public int AuthTokenTtlMinutes { get; set; } = 120;
+    public string DemoStudentPassword { get; set; } = "StudentPass2026!";
+    public string DemoStaffPassword { get; set; } = "StaffPass2026!";
+    public string[] AllowedOrigins { get; set; } = new[] { "http://localhost:3000", "http://127.0.0.1:3000" };
+
+    // РПО ЛР3 (О3.1–О3.4): Ray-кластер, обмеження кількості незавершених задач (IN_FLIGHT_LIMIT) та внутрішній приймач ефектів
+    private int? _inFlightLimit;
+    public int InFlightLimit
+    {
+        get => _inFlightLimit ?? Math.Max(1, Workers);
+        set => _inFlightLimit = value > 0 ? value : null;
+    }
+    public string RayDispatcherUrl { get; set; } = string.Empty;
+    public int RayTaskMaxRetries { get; set; } = 3;
+    public string InternalReceiverUrl { get; set; } = "http://app-a:8080/v1/internal/ray-effect-receiver";
+    public string InternalReceiverSecret { get; set; } = "c10-ray-internal-receiver-2026";
+
     public static ServiceOptions FromConfiguration(IConfiguration config)
     {
         var options = new ServiceOptions();
@@ -75,6 +93,45 @@ public sealed class ServiceOptions
             options.ComputeModelT = modelT;
         if (int.TryParse(config["COMPUTE_WORKER_TIMEOUT_MS"], out var workerTimeout) && workerTimeout >= 1000)
             options.ComputeWorkerTimeoutMs = workerTimeout;
+
+        if (int.TryParse(config["AUTH_TOKEN_TTL_MINUTES"], out var authTtl) && authTtl > 0)
+            options.AuthTokenTtlMinutes = authTtl;
+        if (!string.IsNullOrWhiteSpace(config["DEMO_STUDENT_PASSWORD"]))
+            options.DemoStudentPassword = config["DEMO_STUDENT_PASSWORD"]!.Trim();
+        if (!string.IsNullOrWhiteSpace(config["DEMO_STAFF_PASSWORD"]))
+            options.DemoStaffPassword = config["DEMO_STAFF_PASSWORD"]!.Trim();
+
+        string? corsRaw = config["CORS_ALLOWED_ORIGINS"];
+        if (!string.IsNullOrWhiteSpace(corsRaw))
+        {
+            var parsedOrigins = corsRaw
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(o => !string.Equals(o, "*", StringComparison.Ordinal))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (parsedOrigins.Length > 0)
+            {
+                options.AllowedOrigins = parsedOrigins;
+            }
+        }
+
+        if (int.TryParse(config["IN_FLIGHT_LIMIT"], out var inFlightLimit) && inFlightLimit > 0)
+        {
+            options.InFlightLimit = inFlightLimit;
+        }
+        else
+        {
+            options.InFlightLimit = Math.Max(1, options.Workers);
+        }
+
+        if (!string.IsNullOrWhiteSpace(config["RAY_DISPATCHER_URL"]))
+            options.RayDispatcherUrl = config["RAY_DISPATCHER_URL"]!.Trim().TrimEnd('/');
+        if (int.TryParse(config["RAY_TASK_MAX_RETRIES"], out var rayRetries) && rayRetries >= 0)
+            options.RayTaskMaxRetries = rayRetries;
+        if (!string.IsNullOrWhiteSpace(config["INTERNAL_RECEIVER_URL"]))
+            options.InternalReceiverUrl = config["INTERNAL_RECEIVER_URL"]!.Trim();
+        if (!string.IsNullOrWhiteSpace(config["INTERNAL_RECEIVER_SECRET"]))
+            options.InternalReceiverSecret = config["INTERNAL_RECEIVER_SECRET"]!.Trim();
 
         bool isProduction = string.Equals(config["ASPNETCORE_ENVIRONMENT"], "Production", StringComparison.OrdinalIgnoreCase)
             || string.Equals(config["DOTNET_ENVIRONMENT"], "Production", StringComparison.OrdinalIgnoreCase);

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>С10 — Запис на вибіркові дисципліни (ЛР1: Web + РПО)</title>
+    <title>С10 — Запис на вибіркові дисципліни (ЛР1–ЛР3: Web + РПО)</title>
     <style>
         :root {
             --bg: #f4f6f9;
@@ -149,35 +149,54 @@
 <div class="container">
     <header>
         <div>
-            <h1>С10. Запис на вибіркові дисципліни — Окремий клієнт поза Compose (ЛР1: Web + РПО)</h1>
+            <h1>С10. Запис на вибіркові дисципліни — Окремий клієнт поза Compose (ЛР1–ЛР3: Web + РПО)</h1>
             <div class="subtitle">
-                Зінківський Тимур Євгенійович (ІТІНФ-23-2) | Nginx (app-a + app-b) + PostgreSQL |
+                Зінківський Тимур Євгенійович (ІТІНФ-23-2) | Nginx (app-a + app-b) + PostgreSQL + Ray |
                 <span id="testOverridesBadge" class="badge badge-ok">Режим: перевірка...</span>
             </div>
         </div>
         <div class="auth-bar">
             <label for="apiUrl">Вхідна точка (Nginx):</label>
             <input type="text" id="apiUrl" value="http://localhost:8080" style="width: 175px;">
-            <label for="webUserSelect">Студент (X-User-Id):</label>
-            <select id="webUserSelect">
-                <option value="student-1">student-1 (Зінківський Т. Є.)</option>
-                <option value="student-2">student-2 (Коваленко О. І.)</option>
-                <option value="student-3">student-3 (Шевченко М. В.)</option>
-                <option value="student-ects-20">student-ects-20 (Тест ЄКТС: вже має 20.0 кред.)</option>
-                <option value="student-limit-max">student-limit-max (Тест ліміту K: вже має 5 із 5)</option>
-            </select>
-            <label for="authToken">Bearer:</label>
-            <input type="text" id="authToken" value="secret-c10-token-2026" style="width: 165px;">
+            <label for="authToken">DPC Service Bearer:</label>
+            <input type="text" id="authToken" value="secret-c10-token-2026" style="width: 175px;">
             <button id="btnRefreshAll">Оновити все</button>
         </div>
     </header>
 
     <!-- ================================================================== -->
-    <!-- ЧАСТИНА А: КУРС «ОБМІН ДАНИМИ У WEB-ЗАСТОСУНКАХ» (ЛР1: О1.1–О1.7, Д1.1–Д1.5) -->
+    <!-- ЧАСТИНА А: КУРС «ОБМІН ДАНИМИ У WEB-ЗАСТОСУНКАХ» (ЛР1–ЛР3)          -->
     <!-- ================================================================== -->
     <div class="section-banner web">
-        <span>ЧАСТИНА А. Курс «Обмін даними у Web-застосунках» (ЛР1: Контракт, модель, головна операція POST /v1/enrollments, курсор)</span>
-        <span id="webStudentStatusBadge" class="badge badge-ok">Активних дисциплін: 0/5 | Кредитів ЄКТС: 0.0/30.0</span>
+        <span>ЧАСТИНА А. Курс «Обмін даними у Web-застосунках» (ЛР1–ЛР3: Вхід, RBAC, CORS, Ідемпотентність, Курсор)</span>
+        <span id="webStudentStatusBadge" class="badge badge-ok">Сесія не активна</span>
+    </div>
+
+    <!-- Web Панель 0: Вхід, поточна сесія (/v1/me) та вихід (/v1/auth/logout) (О3.1, О3.2, О3.4) -->
+    <div class="card" style="margin-bottom: 20px;">
+        <h2>А0. Серверна автентифікація та керування сесією (POST /v1/auth/login, GET /v1/me, POST /v1/auth/logout — Web ЛР3 О3.1, О3.4)</h2>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+            <label for="webUserSelect">Демонстраційна роль:</label>
+            <select id="webUserSelect">
+                <option value="student-1">student-1 — Студент (role: user, Зінківський Т. Є.)</option>
+                <option value="student-2">student-2 — Інший студент (role: user, Коваленко О. І.)</option>
+                <option value="student-3">student-3 — Студент (role: user, Шевченко М. В.)</option>
+                <option value="student-ects-20">student-ects-20 — Студент 20.0 ЄКТС (role: user)</option>
+                <option value="student-limit-max">student-limit-max — Студент 5/5 дисциплін (role: user)</option>
+                <option value="staff-1">staff-1 — Персонал деканату (role: staff)</option>
+            </select>
+            <label for="webLoginInput">Логін:</label>
+            <input type="text" id="webLoginInput" value="student-1" style="width: 140px;">
+            <label for="webPasswordInput">Пароль:</label>
+            <input type="password" id="webPasswordInput" value="StudentPass2026!" style="width: 150px;">
+            <button class="teal" id="btnWebLogin">Увійти (POST /v1/auth/login)</button>
+            <button class="secondary" id="btnWebMe">Профіль (GET /v1/me)</button>
+            <button class="danger" id="btnWebLogout">Вийти (POST /v1/auth/logout)</button>
+            <span id="webCurrentSessionBadge" class="badge badge-warn">Не авторизовано</span>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <button class="teal" id="btnRunWebLab3Scenario">Автосценарій Web ЛР3 (О3.1–О3.4: 401 &rarr; Вхід &rarr; Запис &rarr; PATCH &rarr; 403 &rarr; 404 чужого &rarr; staff &rarr; Logout)</button>
+        </div>
     </div>
 
     <div class="grid">
@@ -237,6 +256,14 @@
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;">
                 <label for="webCursorLimit">Розмір сторінки (limit 1..50):</label>
                 <input type="number" id="webCursorLimit" value="2" min="1" max="50" style="width: 70px;">
+                <label for="webPatchTargetGroupSelect">Група для PATCH:</label>
+                <select id="webPatchTargetGroupSelect">
+                    <option value="DISC-AI-02">DISC-AI-02</option>
+                    <option value="DISC-SEC-03">DISC-SEC-03</option>
+                    <option value="DISC-DB-01">DISC-DB-01</option>
+                    <option value="DISC-WEB-01">DISC-WEB-01</option>
+                    <option value="DISC-DPC-01">DISC-DPC-01</option>
+                </select>
                 <button class="teal" id="btnReadAllWebEnrollmentPages">Прочитати ВСІ сторінки за курсором next_cursor</button>
                 <button class="secondary" id="btnTestCorruptedCursor">Перевірити пошкоджений курсор (400)</button>
             </div>

@@ -426,8 +426,7 @@ public sealed partial class E2EHttpEndpointTests
                 closesAt: DateTimeOffset.UtcNow.AddDays(1),
                 ects: 5.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-web-01");
 
             var content1 = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -506,8 +505,7 @@ public sealed partial class E2EHttpEndpointTests
                 closesAt: DateTimeOffset.UtcNow.AddDays(1),
                 ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-conflict-idem-key");
 
             // Перший запит
@@ -538,8 +536,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
 
         var content = new StringContent("{\"group_id\": \"DISC-WEB-01\"}", Encoding.UTF8, "application/json");
         var response = await client.PostAsync("/v1/enrollments", content);
@@ -559,8 +556,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
         client.DefaultRequestHeaders.Add("Idempotency-Key", "   ");
 
         var content = new StringContent("{\"group_id\": \"DISC-WEB-01\"}", Encoding.UTF8, "application/json");
@@ -577,8 +573,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
         client.DefaultRequestHeaders.Add("Idempotency-Key", new string('x', 129));
 
         var content = new StringContent("{\"group_id\": \"DISC-WEB-01\"}", Encoding.UTF8, "application/json");
@@ -613,12 +608,10 @@ public sealed partial class E2EHttpEndpointTests
                 closesAt: DateTimeOffset.UtcNow.AddDays(1),
                 ects: 4.0m);
 
-            var client1 = _factory.CreateClient();
-            client1.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client1 = await CreateAuthenticatedWebClientAsync(studentId);
             client1.DefaultRequestHeaders.Add("Idempotency-Key", idempotencyKey);
 
-            var client2 = _factory.CreateClient();
-            client2.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client2 = await CreateAuthenticatedWebClientAsync(studentId);
             client2.DefaultRequestHeaders.Add("Idempotency-Key", idempotencyKey);
 
             var task1 = client1.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -747,12 +740,10 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestGroupAsync(groupId1, discId1, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
             await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
 
-            var client1 = _factory.CreateClient();
-            client1.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client1 = await CreateAuthenticatedWebClientAsync(studentId);
             client1.DefaultRequestHeaders.Add("Idempotency-Key", idempotencyKey);
 
-            var client2 = _factory.CreateClient();
-            client2.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client2 = await CreateAuthenticatedWebClientAsync(studentId);
             client2.DefaultRequestHeaders.Add("Idempotency-Key", idempotencyKey);
 
             var task1 = client1.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
@@ -834,8 +825,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            await LoginWebAsync(client, studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -911,8 +901,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -991,8 +980,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestGroupAsync(groupId1, discId1, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
             await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client1 = _factory.CreateClient();
-            client1.DefaultRequestHeaders.Add("X-User-Id", studentId1);
+            var client1 = await CreateAuthenticatedWebClientAsync(studentId1);
             client1.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-1-{Guid.NewGuid():N}");
 
             var pResp1 = await client1.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
@@ -1008,8 +996,7 @@ public sealed partial class E2EHttpEndpointTests
             Assert.Equal(HttpStatusCode.Accepted, rResp1.StatusCode);
 
             // Спроба використати той самий ik іншим студентом
-            var client2 = _factory.CreateClient();
-            client2.DefaultRequestHeaders.Add("X-User-Id", studentId2);
+            var client2 = await CreateAuthenticatedWebClientAsync(studentId2);
             client2.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-2-{Guid.NewGuid():N}");
 
             var pResp2 = await client2.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId2}\"}}", Encoding.UTF8, "application/json"));
@@ -1050,8 +1037,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -1061,13 +1047,11 @@ public sealed partial class E2EHttpEndpointTests
             Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
 
             // Два одночасні запити з однаковим Idempotency-Key
-            using var clientA = _factory.CreateClient();
-            clientA.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            using var clientA = await CreateAuthenticatedWebClientAsync(studentId);
             using var reqA = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
             reqA.Headers.Add("Idempotency-Key", ik);
 
-            using var clientB = _factory.CreateClient();
-            clientB.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            using var clientB = await CreateAuthenticatedWebClientAsync(studentId);
             using var reqB = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
             reqB.Headers.Add("Idempotency-Key", ik);
 
@@ -1171,8 +1155,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
             // Створюємо enrollment для студента 1
-            var client1 = _factory.CreateClient();
-            client1.DefaultRequestHeaders.Add("X-User-Id", student1);
+            var client1 = await CreateAuthenticatedWebClientAsync(student1);
             client1.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
             var postResp1 = await client1.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
             Assert.Equal(HttpStatusCode.Created, postResp1.StatusCode);
@@ -1181,8 +1164,7 @@ public sealed partial class E2EHttpEndpointTests
             Guid enrollmentId1 = Guid.Parse(doc1.RootElement.GetProperty("id").GetString()!);
 
             // Створюємо enrollment для студента 2
-            var client2 = _factory.CreateClient();
-            client2.DefaultRequestHeaders.Add("X-User-Id", student2);
+            var client2 = await CreateAuthenticatedWebClientAsync(student2);
             client2.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
             var postResp2 = await client2.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId2}\"}}", Encoding.UTF8, "application/json"));
             Assert.Equal(HttpStatusCode.Created, postResp2.StatusCode);
@@ -1191,13 +1173,11 @@ public sealed partial class E2EHttpEndpointTests
             Guid enrollmentId2 = Guid.Parse(doc2.RootElement.GetProperty("id").GetString()!);
 
             // Одночасно відправляємо POST /v1/enrollments/{id}/registrations зі спільним Idempotency-Key для двох різних студентів
-            using var regClient1 = _factory.CreateClient();
-            regClient1.DefaultRequestHeaders.Add("X-User-Id", student1);
+            using var regClient1 = await CreateAuthenticatedWebClientAsync(student1);
             using var regReq1 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId1}/registrations");
             regReq1.Headers.Add("Idempotency-Key", sharedIk);
 
-            using var regClient2 = _factory.CreateClient();
-            regClient2.DefaultRequestHeaders.Add("X-User-Id", student2);
+            using var regClient2 = await CreateAuthenticatedWebClientAsync(student2);
             using var regReq2 = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId2}/registrations");
             regReq2.Headers.Add("Idempotency-Key", sharedIk);
 

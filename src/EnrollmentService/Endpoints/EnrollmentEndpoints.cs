@@ -13,34 +13,22 @@ public static class EnrollmentEndpoints
 {
     public static IEndpointRouteBuilder MapEnrollmentEndpoints(this IEndpointRouteBuilder app)
     {
-        // Довідковий маршрут: список студентів у БД із захистом персональних даних (Web О1.4, О3.2)
-        // Примітка: заголовок X-User-Id є навчальною симуляцією контексту користувача для ЛР1 (до впровадження JWT у ЛР3);
-        // повноцінна автентифікація та авторизація персоналу реалізована через заголовок Authorization: Bearer <token>.
-        // 401 Unauthorized — якщо немає Bearer токена або X-User-Id
-        // 403 Forbidden — якщо студент із X-User-Id намагається переглянути чужі дані через ?student_id=...
-        // 200 OK — персонал бачить усіх або фільтрованого студента; студент бачить виключно власний профіль
+        // Довідковий маршрут: список студентів у БД із захистом персональних даних (Web О1.4, О3.1, О3.2)
+        // 401 Unauthorized — без валідного Web-токена
+        // 403 Forbidden — якщо студент намагається переглянути чужі дані через ?student_id=...
+        // 200 OK — персонал (staff) бачить усіх або фільтрованого студента; студент бачить виключно власний профіль
         app.MapGet("/v1/students", async (EnrollmentRepository enrollmentRepo, HttpContext ctx, ServiceOptions opts) =>
         {
-            string authHeader = ctx.Request.Headers.Authorization.ToString().Trim();
-            bool isStaff = !string.IsNullOrWhiteSpace(authHeader) &&
-                string.Equals(authHeader, $"Bearer {opts.ApiAuthToken}", StringComparison.Ordinal);
-
-            bool hasStudentHeader = ctx.Request.Headers.TryGetValue("X-User-Id", out var userHeader) &&
-                !string.IsNullOrWhiteSpace(userHeader.ToString());
-            string callerStudentId = hasStudentHeader ? userHeader.ToString().Trim() : string.Empty;
-
-            if (!isStaff && !hasStudentHeader)
+            if (!RequestIdentity.TryRequireAuthenticatedUser(ctx, opts, out var webUser, out var authProblem))
             {
-                return ProblemDetailsMapper.CreateProblemResult(
-                    ctx, opts,
-                    StatusCodes.Status401Unauthorized,
-                    "Неавторизований доступ",
-                    "Для доступу до персональних даних студентів необхідна автентифікація (Bearer токен персоналу або заголовок X-User-Id студента).",
-                    "unauthorized");
+                return authProblem!;
             }
+
+            bool isStaff = string.Equals(webUser!.Role, "staff", StringComparison.Ordinal);
 
             if (!isStaff)
             {
+                string callerStudentId = webUser.StudentId ?? webUser.UserId;
                 if (ctx.Request.Query.TryGetValue("student_id", out var qStudent) && !string.IsNullOrWhiteSpace(qStudent))
                 {
                     if (!string.Equals(qStudent.ToString().Trim(), callerStudentId, StringComparison.Ordinal))
@@ -84,34 +72,25 @@ public static class EnrollmentEndpoints
         });
 
         // Отримання профілю конкретного студента за його ідентифікатором (Web О3.2)
+        // Для чужого або неіснуючого студента роль 'user' отримує однаковий 404 Not Found.
         app.MapGet("/v1/students/{id}", async (string id, EnrollmentRepository enrollmentRepo, HttpContext ctx, ServiceOptions opts) =>
         {
-            string authHeader = ctx.Request.Headers.Authorization.ToString().Trim();
-            bool isStaff = !string.IsNullOrWhiteSpace(authHeader) &&
-                string.Equals(authHeader, $"Bearer {opts.ApiAuthToken}", StringComparison.Ordinal);
-
-            bool hasStudentHeader = ctx.Request.Headers.TryGetValue("X-User-Id", out var userHeader) &&
-                !string.IsNullOrWhiteSpace(userHeader.ToString());
-            string callerStudentId = hasStudentHeader ? userHeader.ToString().Trim() : string.Empty;
-
-            if (!isStaff && !hasStudentHeader)
+            if (!RequestIdentity.TryRequireAuthenticatedUser(ctx, opts, out var webUser, out var authProblem))
             {
-                return ProblemDetailsMapper.CreateProblemResult(
-                    ctx, opts,
-                    StatusCodes.Status401Unauthorized,
-                    "Неавторизований доступ",
-                    "Для доступу до персональних даних студента необхідна автентифікація.",
-                    "unauthorized");
+                return authProblem!;
             }
+
+            bool isStaff = string.Equals(webUser!.Role, "staff", StringComparison.Ordinal);
+            string callerStudentId = webUser.StudentId ?? webUser.UserId;
 
             if (!isStaff && !string.Equals(id, callerStudentId, StringComparison.Ordinal))
             {
                 return ProblemDetailsMapper.CreateProblemResult(
                     ctx, opts,
-                    StatusCodes.Status403Forbidden,
-                    "Доступ заборонено",
-                    "Студент не має права переглядати персональні дані інших студентів.",
-                    "forbidden");
+                    StatusCodes.Status404NotFound,
+                    "Студента не знайдено",
+                    $"Студента з ідентифікатором '{id}' не знайдено.",
+                    "student_not_found");
             }
 
             var student = await enrollmentRepo.GetStudentByIdAsync(id, ctx.RequestAborted);
@@ -121,7 +100,7 @@ public static class EnrollmentEndpoints
                     ctx, opts,
                     StatusCodes.Status404NotFound,
                     "Студента не знайдено",
-                    $"Студент '{id}' не існує у системі.",
+                    $"Студента з ідентифікатором '{id}' не знайдено.",
                     "student_not_found");
             }
 
@@ -241,7 +220,7 @@ public static class EnrollmentEndpoints
                     ctx, opts,
                     StatusCodes.Status400BadRequest,
                     "Параметр student_id у рядку запиту заборонено",
-                    "Список записів повертається виключно для користувача із заголовка X-User-Id.",
+                    "Список записів повертається виключно для автентифікованого користувача з Bearer-токена.",
                     "query_student_override_forbidden");
             }
 
@@ -299,6 +278,51 @@ public static class EnrollmentEndpoints
                 return result.ToProblemResult(ctx, opts);
             }
 
+            ctx.Response.Headers.ETag = $"\"v{result.Value!.Version}\"";
+            return Results.Ok(result.Value);
+        });
+
+        // Зміна групи запису студентом (Web С10, О3.2: тільки власник, перевірка версії через If-Match, заборона зміни захищених полів 422)
+        app.MapPatch("/v1/enrollments/{id}", async (
+            string id,
+            HttpContext ctx,
+            EnrollmentService.Services.EnrollmentService enrollmentService,
+            ServiceOptions opts) =>
+        {
+            if (!RequestIdentity.TryRequireCallerStudentId(ctx, opts, out string callerStudentId, out var userHeaderProblem))
+            {
+                return userHeaderProblem!;
+            }
+
+            if (!Guid.TryParse(id, out var enrollmentGuid))
+            {
+                return ProblemDetailsMapper.CreateProblemResult(
+                    ctx, opts,
+                    StatusCodes.Status400BadRequest,
+                    "Некоректний ідентифікатор запису",
+                    "Параметр id має бути валідним UUID.",
+                    "invalid_enrollment_id");
+            }
+
+            var (dto, problemResult) = await HttpPayloadHelper.ReadAndValidateAsync<PatchWebEnrollmentDto>(ctx, opts);
+            if (problemResult != null)
+            {
+                return problemResult;
+            }
+
+            string? ifMatchHeader = ctx.Request.Headers.IfMatch.FirstOrDefault();
+            var result = await enrollmentService.PatchEnrollmentGroupAsync(
+                callerStudentId,
+                enrollmentGuid,
+                dto!,
+                ifMatchHeader,
+                ctx.RequestAborted);
+            if (!result.IsSuccess)
+            {
+                return result.ToProblemResult(ctx, opts);
+            }
+
+            ctx.Response.Headers.ETag = $"\"v{result.Value!.Version}\"";
             return Results.Ok(result.Value);
         });
 
@@ -455,7 +479,7 @@ public static class EnrollmentEndpoints
                     ctx, opts,
                     StatusCodes.Status404NotFound,
                     "Запис не знайдено",
-                    $"Запис із номером '{enrollmentGuid}' для студента '{callerStudentId}' не існує.",
+                    $"Запис із ідентифікатором '{enrollmentGuid}' не знайдено.",
                     "enrollment_not_found");
             }
 

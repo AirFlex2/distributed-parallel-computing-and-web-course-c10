@@ -243,6 +243,7 @@ public sealed class EnrollmentRepository
             FROM enrollment e
             JOIN decanate_roster dr ON dr.enrollment_id = e.id
             WHERE e.status = 'held'
+              AND dr.created_at < NOW() - INTERVAL '2 seconds'
             LIMIT 50;", conn);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -711,6 +712,29 @@ public sealed class EnrollmentRepository
 
         int rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
         return rows > 0;
+    }
+
+    public async Task UpdateEnrollmentGroupAsync(
+        Guid id,
+        string newGroupId,
+        string newDisciplineId,
+        int newVersion,
+        NpgsqlConnection conn,
+        NpgsqlTransaction tx,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE enrollment
+            SET group_id = @groupId,
+                discipline_id = @disciplineId,
+                version = @version
+            WHERE id = @id;", conn, tx);
+        cmd.Parameters.AddWithValue("groupId", newGroupId);
+        cmd.Parameters.AddWithValue("disciplineId", newDisciplineId);
+        cmd.Parameters.AddWithValue("version", newVersion);
+        cmd.Parameters.AddWithValue("id", id);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<(string StudentId, string GroupId, string DisciplineId, string Status, DateTimeOffset ExpiresAt)?> GetEnrollmentForJointVerificationAsync(

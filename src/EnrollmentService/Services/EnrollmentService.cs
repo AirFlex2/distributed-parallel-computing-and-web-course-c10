@@ -345,7 +345,7 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     StatusCodes.Status404NotFound,
                     "enrollment_not_found",
                     "Запис не знайдено",
-                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не знайдено.");
+                    $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
             }
 
             var group = await _groupRepo.GetGroupForUpdateAsync(basicInfo.Value.GroupId, conn, tx, cancellationToken);
@@ -367,7 +367,7 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     StatusCodes.Status404NotFound,
                     "enrollment_not_found",
                     "Запис не знайдено",
-                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не знайдено.");
+                    $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
             }
 
             if (enrollment.Status == "confirmed")
@@ -485,7 +485,7 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     StatusCodes.Status404NotFound,
                     "enrollment_not_found",
                     "Запис не знайдено",
-                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не існує.");
+                    $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
             }
 
             var group = await _groupRepo.GetGroupForUpdateAsync(basicInfo.Value.GroupId, conn, tx, cancellationToken);
@@ -507,7 +507,7 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     StatusCodes.Status404NotFound,
                     "enrollment_not_found",
                     "Запис не знайдено",
-                    $"Запис із номером '{enrollmentId}' для студента '{studentId}' не існує.");
+                    $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
             }
 
             if (enrollment.Status == "confirmed")
@@ -654,7 +654,8 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
         Guid enrollmentId,
         CancellationToken cancellationToken = default)
     {
-        // RFC 9110: GET є безпечним (safe) та ідемпотентним методом і виконує виключно читання
+        // RFC 9110: GET є безпечним (safe) та ідемпотентним методом і виконує виключно читання.
+        // Web ЛР3 (О3.2): для чужого і неіснуючого запису повертається ідентичний 404.
         var item = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
         if (item == null)
         {
@@ -662,10 +663,226 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                 StatusCodes.Status404NotFound,
                 "enrollment_not_found",
                 "Запис не знайдено",
-                $"Запис '{enrollmentId}' для студента '{studentId}' не існує.");
+                $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
         }
 
         return ServiceResult<WebEnrollmentResponseDto>.Ok(item);
+    }
+
+    public async Task<ServiceResult<WebEnrollmentResponseDto>> PatchEnrollmentGroupAsync(
+        string studentId,
+        Guid enrollmentId,
+        PatchWebEnrollmentDto dto,
+        string? ifMatchHeader = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(dto.GroupId) || dto.GroupId.Trim().Length > 64 || dto.GroupId.Contains(' '))
+        {
+            return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                StatusCodes.Status422UnprocessableEntity,
+                "invalid_group_id_format",
+                "Некоректні дані запиту (Unprocessable Entity)",
+                "Поле 'group_id' є обов'язковим, не може бути порожнім або містити пробіли.");
+        }
+
+        string newGroupId = dto.GroupId.Trim();
+        int? expectedVersion = null;
+        if (!string.IsNullOrWhiteSpace(ifMatchHeader))
+        {
+            string normalizedIfMatch = ifMatchHeader.Trim().Trim('"');
+            if (normalizedIfMatch.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
+            {
+                normalizedIfMatch = normalizedIfMatch[2..].Trim().Trim('"');
+            }
+            if (normalizedIfMatch.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+            {
+                normalizedIfMatch = normalizedIfMatch[1..];
+            }
+
+            if (!int.TryParse(normalizedIfMatch, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsedVer) || parsedVer < 1)
+            {
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status400BadRequest,
+                    "invalid_if_match_header",
+                    "Некоректний заголовок If-Match",
+                    "Заголовок If-Match має містити очікувану версію запису (наприклад, \"v1\").");
+            }
+            expectedVersion = parsedVer;
+        }
+
+        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            var student = await _enrollmentRepo.GetStudentForUpdateAsync(studentId, conn, tx, cancellationToken);
+            if (student == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "enrollment_not_found",
+                    "Запис не знайдено",
+                    $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
+            }
+
+            var enrollment = await _enrollmentRepo.GetEnrollmentForUpdateAsync(enrollmentId, studentId, conn, tx, cancellationToken);
+            if (enrollment == null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "enrollment_not_found",
+                    "Запис не знайдено",
+                    $"Запис із ідентифікатором '{enrollmentId}' не знайдено.");
+            }
+
+            if (expectedVersion.HasValue && enrollment.Version != expectedVersion.Value)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "version_conflict",
+                    "Конфлікт версії запису (If-Match)",
+                    $"Очікувалася версія v{expectedVersion.Value}, проте поточна версія запису — v{enrollment.Version}.");
+            }
+
+            if (!string.Equals(enrollment.Status, "held", StringComparison.Ordinal))
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "enrollment_not_held",
+                    "Зміна групи неможлива",
+                    $"Змінити групу дозволено лише для запису у стані 'held' (поточний стан: '{enrollment.Status}').");
+            }
+
+            if (string.Equals(enrollment.GroupId, newGroupId, StringComparison.Ordinal))
+            {
+                await tx.CommitAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Ok(enrollment);
+            }
+
+            // Блокуємо обидві групи в детермінованому алфавітному порядку для уникнення deadlock
+            string firstGroupId = string.CompareOrdinal(enrollment.GroupId, newGroupId) < 0 ? enrollment.GroupId : newGroupId;
+            string secondGroupId = string.CompareOrdinal(enrollment.GroupId, newGroupId) < 0 ? newGroupId : enrollment.GroupId;
+
+            var firstGrp = await _groupRepo.GetGroupWithDisciplineForUpdateAsync(firstGroupId, conn, tx, cancellationToken);
+            var secondGrp = firstGroupId == secondGroupId
+                ? firstGrp
+                : await _groupRepo.GetGroupWithDisciplineForUpdateAsync(secondGroupId, conn, tx, cancellationToken);
+
+            var oldGroupWithDisc = firstGroupId == enrollment.GroupId ? firstGrp : secondGrp;
+            var newGroupWithDisc = firstGroupId == newGroupId ? firstGrp : secondGrp;
+
+            if (!newGroupWithDisc.HasValue)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status404NotFound,
+                    "group_not_found",
+                    "Групу дисципліни не знайдено",
+                    $"Група з ідентифікатором '{newGroupId}' не існує.");
+            }
+
+            var newGroup = newGroupWithDisc.Value.Group;
+            decimal oldEcts = oldGroupWithDisc?.DisciplineEcts ?? enrollment.Ects;
+            decimal newEcts = newGroupWithDisc.Value.DisciplineEcts;
+            decimal ectsDelta = newEcts - oldEcts;
+
+            if (newGroup.Closed)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "group_closed",
+                    "Запис до групи закрито",
+                    $"Навчальна група '{newGroup.Id}' закрита працівником деканату.");
+            }
+
+            DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+            if (!EnrollmentDomainRules.IsWithinEnrollmentWindow(nowUtc, newGroup.OpensAt, newGroup.ClosesAt))
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "window_not_active",
+                    "Поза межами вікна запису",
+                    $"Вікно запису для групи '{newGroup.Id}' не є активним.");
+            }
+
+            if (newGroup.Available <= 0)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "group_full",
+                    "У групі немає вільних місць",
+                    $"У навчальній групі '{newGroup.Id}' вичерпано доступні місця.");
+            }
+
+            if (!string.Equals(enrollment.DisciplineId, newGroup.DisciplineId, StringComparison.Ordinal))
+            {
+                bool alreadyEnrolledNewDisc = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(
+                    studentId, newGroup.DisciplineId, conn, tx, cancellationToken);
+                if (alreadyEnrolledNewDisc)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                        StatusCodes.Status409Conflict,
+                        "duplicate_discipline_enrollment",
+                        "Повторний запис на дисципліну",
+                        $"Студент уже має активний запис на дисципліну '{newGroup.DisciplineId}'.");
+                }
+
+                if (student.ActiveEcts + ectsDelta > EnrollmentDomainRules.MaxSemesterEcts)
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                        StatusCodes.Status422UnprocessableEntity,
+                        "ects_limit_exceeded",
+                        "Перевищено ліміт кредитів ЄКТС",
+                        $"Перехід на дисципліну '{newGroup.DisciplineId}' перевищить ліміт {EnrollmentDomainRules.MaxSemesterEcts} ЄКТС.");
+                }
+            }
+
+            bool decremented = await _groupRepo.DecrementAvailableAsync(newGroupId, conn, tx, cancellationToken);
+            if (!decremented)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                    StatusCodes.Status409Conflict,
+                    "group_full",
+                    "У групі немає вільних місць",
+                    $"У навчальній групі '{newGroup.Id}' вичерпано доступні місця.");
+            }
+
+            await _groupRepo.IncrementAvailableAsync(enrollment.GroupId, conn, tx, cancellationToken);
+            if (ectsDelta != 0m)
+            {
+                await _enrollmentRepo.UpdateStudentStatsAsync(studentId, 0, ectsDelta, conn, tx, cancellationToken);
+            }
+
+            int updatedVersion = enrollment.Version + 1;
+            await _enrollmentRepo.UpdateEnrollmentGroupAsync(
+                enrollmentId,
+                newGroupId,
+                newGroup.DisciplineId,
+                updatedVersion,
+                conn,
+                tx,
+                cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+
+            var updated = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
+            return ServiceResult<WebEnrollmentResponseDto>.Ok(updated!);
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 
     public async Task<RosterConfirmationResult> ConfirmEnrollmentDetailedAsync(

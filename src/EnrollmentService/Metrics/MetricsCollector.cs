@@ -14,6 +14,7 @@ public sealed class MetricsCollector
     private readonly object _stateLock = new();
 
     private long _inProcessingCount;
+    private long _maxInFlightObserved;
     private long _totalAccepted;
     private long _totalDone;
     private long _totalRejected;
@@ -149,7 +150,8 @@ public sealed class MetricsCollector
         long now = Stopwatch.GetTimestamp();
         item.StartProcessingTimestamp = now;
 
-        Interlocked.Increment(ref _inProcessingCount);
+        long inFlight = Interlocked.Increment(ref _inProcessingCount);
+        UpdateMaxInFlight(inFlight);
         _trackedItems.TryAdd(item.Id, item);
 
         lock (_stateLock)
@@ -409,6 +411,7 @@ public sealed class MetricsCollector
         lock (_stateLock)
         {
             Interlocked.Exchange(ref _inProcessingCount, 0);
+            Interlocked.Exchange(ref _maxInFlightObserved, 0);
             Interlocked.Exchange(ref _totalAccepted, 0);
             Interlocked.Exchange(ref _totalDone, 0);
             Interlocked.Exchange(ref _totalRejected, 0);
@@ -441,7 +444,24 @@ public sealed class MetricsCollector
             _independentSampleSum = 0;
             _independentSampleCount = 0;
             _windowMaxQueueObserved = currentQueueLength;
+            Interlocked.Exchange(ref _maxInFlightObserved, 0);
             _windowStarted = true;
+        }
+    }
+
+    private void UpdateMaxInFlight(long currentInFlight)
+    {
+        while (true)
+        {
+            long snapshot = Interlocked.Read(ref _maxInFlightObserved);
+            if (currentInFlight <= snapshot)
+            {
+                break;
+            }
+            if (Interlocked.CompareExchange(ref _maxInFlightObserved, currentInFlight, snapshot) == snapshot)
+            {
+                break;
+            }
         }
     }
 
@@ -520,12 +540,15 @@ public sealed class MetricsCollector
                 queue_engine = options.QueueEngine,
                 queue_capacity = options.QueueCapacity,
                 workers = options.Workers,
+                in_flight_limit = options.InFlightLimit,
+                ray_dispatcher_url = options.RayDispatcherUrl,
                 unsafe_mode = options.UnsafeMode,
                 allow_test_overrides = options.AllowTestOverrides,
                 is_shutting_down = isShuttingDown
             },
             queue_length = currentQueueLength,
             in_flight = Interlocked.Read(ref _inProcessingCount),
+            max_in_flight_observed = Interlocked.Read(ref _maxInFlightObserved),
             in_processing = Interlocked.Read(ref _inProcessingCount),
             rejected = Interlocked.Read(ref _totalRejected),
             counters = new

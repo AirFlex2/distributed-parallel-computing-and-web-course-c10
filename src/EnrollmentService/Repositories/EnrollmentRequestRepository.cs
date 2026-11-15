@@ -14,6 +14,13 @@ public sealed record ExistingRequestRecord(
     Guid? RequestedEnrollmentId = null
 );
 
+public sealed record AppliedEffectDecision(
+    string Status,
+    string? RejectionReason,
+    string? AssignedGroupId,
+    bool RosterRecorded
+);
+
 public sealed class EnrollmentRequestRepository
 {
     private readonly IDbConnectionFactory _connectionFactory;
@@ -107,7 +114,8 @@ public sealed class EnrollmentRequestRepository
     public async Task<EnrollmentStatusResponseDto?> MarkFirstReadAndGetStatusAsync(
         Guid id,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? requiredStudentId = null)
     {
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
@@ -117,12 +125,17 @@ public sealed class EnrollmentRequestRepository
                 ELSE first_read_at
             END
             WHERE id = @id
+              AND (@requiredStudentId IS NULL OR student_id = @requiredStudentId)
             RETURNING id, student_id, group_id, status, rejection_reason,
                       created_at, started_at, finished_at, first_read_at,
                       assigned_group_id,
                       EXISTS(SELECT 1 FROM decanate_roster dr WHERE dr.request_id = enrollment_requests.id);", conn);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("now", now);
+        cmd.Parameters.Add(new NpgsqlParameter("requiredStudentId", NpgsqlTypes.NpgsqlDbType.Text)
+        {
+            Value = string.IsNullOrWhiteSpace(requiredStudentId) ? DBNull.Value : requiredStudentId
+        });
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
@@ -350,6 +363,30 @@ public sealed class EnrollmentRequestRepository
         await TryMarkStartedAsync(id, startedAt, cancellationToken);
     }
 
+    public async Task<AppliedEffectDecision?> GetAppliedEffectDecisionAsync(
+        Guid requestId,
+        NpgsqlConnection conn,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT status, rejection_reason, assigned_group_id, roster_recorded
+            FROM dpc_applied_effects
+            WHERE request_id = @id;", conn);
+        cmd.Parameters.AddWithValue("id", requestId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new AppliedEffectDecision(
+            reader.GetString(0),
+            reader.IsDBNull(1) ? null : reader.GetString(1),
+            reader.IsDBNull(2) ? null : reader.GetString(2),
+            reader.GetBoolean(3));
+    }
+
     public async Task UpdateStatusAsync(
         Guid id,
         string status,
@@ -360,21 +397,35 @@ public sealed class EnrollmentRequestRepository
         NpgsqlTransaction? tx = null,
         CancellationToken cancellationToken = default)
     {
-        // О1.4 РПО: Якщо статус відмінний від 'done' (наприклад 'failed' або 'rejected'),
-        // забороняємо перезапис уже зафіксованого термінального стану 'done'.
-        string sql = status == "done"
-            ? @"UPDATE enrollment_requests
+        // РПО О1.4 / О3.3: Захищаємо вже зафіксовані термінальні рішення ('done', 'rejected')
+        // і журнал dpc_applied_effects від перезапису статусом 'failed' при втраті відповіді Ray.
+        string sql = status switch
+        {
+            "done" => @"UPDATE enrollment_requests
                 SET status = @status,
                     rejection_reason = @rejectionReason,
                     assigned_group_id = @assignedGroupId,
                     finished_at = @finishedAt
-                WHERE id = @id;"
-            : @"UPDATE enrollment_requests
+                WHERE id = @id;",
+            "rejected" => @"UPDATE enrollment_requests
                 SET status = @status,
                     rejection_reason = @rejectionReason,
                     assigned_group_id = @assignedGroupId,
                     finished_at = @finishedAt
-                WHERE id = @id AND status != 'done';";
+                WHERE id = @id
+                  AND status != 'done';",
+            _ => @"UPDATE enrollment_requests
+                SET status = @status,
+                    rejection_reason = @rejectionReason,
+                    assigned_group_id = @assignedGroupId,
+                    finished_at = @finishedAt
+                WHERE id = @id
+                  AND status NOT IN ('done', 'rejected')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dpc_applied_effects e
+                      WHERE e.request_id = @id AND e.status IN ('done', 'rejected')
+                  );"
+        };
 
         await using var cmd = new NpgsqlCommand(sql, conn, tx);
         cmd.Parameters.AddWithValue("id", id);
@@ -397,14 +448,22 @@ public sealed class EnrollmentRequestRepository
         await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var cmd = new NpgsqlCommand(@"
             UPDATE enrollment_requests r
-            SET status = CASE
-                    WHEN EXISTS (SELECT 1 FROM decanate_roster d WHERE d.request_id = r.id) THEN 'done'
-                    ELSE 'failed'
-                END,
+            SET status = COALESCE(
+                    (SELECT e.status FROM dpc_applied_effects e WHERE e.request_id = r.id AND e.status IN ('done', 'rejected')),
+                    CASE WHEN EXISTS (SELECT 1 FROM decanate_roster d WHERE d.request_id = r.id) THEN 'done' ELSE 'failed' END
+                ),
                 rejection_reason = CASE
-                    WHEN EXISTS (SELECT 1 FROM decanate_roster d WHERE d.request_id = r.id) THEN NULL
+                    WHEN EXISTS (SELECT 1 FROM dpc_applied_effects e WHERE e.request_id = r.id AND e.status = 'done')
+                      OR EXISTS (SELECT 1 FROM decanate_roster d WHERE d.request_id = r.id) THEN NULL
+                    WHEN EXISTS (SELECT 1 FROM dpc_applied_effects e WHERE e.request_id = r.id AND e.status = 'rejected')
+                      THEN (SELECT e.rejection_reason FROM dpc_applied_effects e WHERE e.request_id = r.id)
                     ELSE 'Обробку перервано аварійним перезапуском сервісу до завершення.'
                 END,
+                assigned_group_id = COALESCE(
+                    r.assigned_group_id,
+                    (SELECT e.assigned_group_id FROM dpc_applied_effects e WHERE e.request_id = r.id),
+                    (SELECT d.group_id FROM decanate_roster d WHERE d.request_id = r.id LIMIT 1)
+                ),
                 finished_at = COALESCE(finished_at, NOW())
             WHERE status = 'processing';", conn);
         return await cmd.ExecuteNonQueryAsync(cancellationToken);

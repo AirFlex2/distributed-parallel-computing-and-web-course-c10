@@ -26,6 +26,8 @@ public static class HttpPayloadHelper
                 "empty_request_body"));
         }
 
+        string? forbiddenFieldType = null;
+
         // 1. Перевірка синтаксичної коректності JSON (Синтаксична помилка -> 400 Bad Request)
         try
         {
@@ -39,6 +41,23 @@ public static class HttpPayloadHelper
                     "Очікується коректний кореневий JSON-об'єкт.",
                     "invalid_json_syntax"));
             }
+
+            if (typeof(T) == typeof(CreateWebEnrollmentDto) || typeof(T) == typeof(PatchWebEnrollmentDto))
+            {
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (string.Equals(prop.Name, "student_id", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(prop.Name, "owner_id", StringComparison.OrdinalIgnoreCase))
+                    {
+                        forbiddenFieldType ??= "owner_in_body_forbidden";
+                    }
+                    else if (string.Equals(prop.Name, "status", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(prop.Name, "version", StringComparison.OrdinalIgnoreCase))
+                    {
+                        forbiddenFieldType = "protected_field_modification_forbidden";
+                    }
+                }
+            }
         }
         catch (JsonException ex)
         {
@@ -48,6 +67,16 @@ public static class HttpPayloadHelper
                 "Синтаксична помилка JSON",
                 $"Неможливо розібрати синтаксис JSON: {ex.Message}",
                 "invalid_json_syntax"));
+        }
+
+        if (forbiddenFieldType != null)
+        {
+            return (null, ProblemDetailsMapper.CreateProblemResult(
+                context, opts,
+                StatusCodes.Status422UnprocessableEntity,
+                "Заборонено змінювати захищені поля запису",
+                "Поля student_id, owner_id, status та version не можна задавати або змінювати у тілі запиту. Власник визначається токеном автентифікації.",
+                forbiddenFieldType));
         }
 
         // 2. Десеріалізація та валідація типів полів (Помилка типу або структури -> 422 Unprocessable Entity)
@@ -91,6 +120,18 @@ public static class HttpPayloadHelper
         }
         else if (dto is CreateWebEnrollmentDto webDto)
         {
+            if (!string.IsNullOrWhiteSpace(webDto.StudentId) ||
+                !string.IsNullOrWhiteSpace(webDto.Status) ||
+                webDto.Version.HasValue)
+            {
+                return (null, ProblemDetailsMapper.CreateProblemResult(
+                    context, opts,
+                    StatusCodes.Status422UnprocessableEntity,
+                    "Заборонено передавати захищені поля у тілі запиту",
+                    "Поля student_id, status та version визначаються сервером і не приймаються від клієнта.",
+                    "protected_field_modification_forbidden"));
+            }
+
             if (string.IsNullOrWhiteSpace(webDto.GroupId))
             {
                 return (null, ProblemDetailsMapper.CreateProblemResult(
@@ -100,15 +141,29 @@ public static class HttpPayloadHelper
                     "Поле group_id є обов'язковим для запису на дисципліну.",
                     "missing_required_fields"));
             }
-
-            if (!string.IsNullOrWhiteSpace(webDto.StudentId))
+        }
+        else if (dto is PatchWebEnrollmentDto patchDto)
+        {
+            if (!string.IsNullOrWhiteSpace(patchDto.StudentId) ||
+                !string.IsNullOrWhiteSpace(patchDto.Status) ||
+                patchDto.Version.HasValue)
             {
                 return (null, ProblemDetailsMapper.CreateProblemResult(
                     context, opts,
                     StatusCodes.Status422UnprocessableEntity,
-                    "Заборонено передавати student_id у тілі запиту",
-                    "Ідентифікатор студента визначається виключно із заголовка X-User-Id для запобігання підміні авторства.",
-                    "owner_in_body_forbidden"));
+                    "Заборонено змінювати захищені поля запису",
+                    "Поля student_id, status та version не підлягають зміні через PATCH.",
+                    "protected_field_modification_forbidden"));
+            }
+
+            if (string.IsNullOrWhiteSpace(patchDto.GroupId))
+            {
+                return (null, ProblemDetailsMapper.CreateProblemResult(
+                    context, opts,
+                    StatusCodes.Status422UnprocessableEntity,
+                    "Помилка валідації полів запиту",
+                    "Поле group_id є обов'язковим для зміни групи запису.",
+                    "missing_required_fields"));
             }
         }
 

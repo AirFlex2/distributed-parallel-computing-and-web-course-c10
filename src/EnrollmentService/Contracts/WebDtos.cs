@@ -14,7 +14,75 @@ public sealed class CreateWebEnrollmentDto
 
     [JsonPropertyName("student_id")]
     public string? StudentId { get; set; }
+
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+
+    [JsonPropertyName("version")]
+    public int? Version { get; set; }
 }
+
+public sealed class PatchWebEnrollmentDto
+{
+    [JsonPropertyName("group_id")]
+    public string? GroupId { get; set; }
+
+    [JsonPropertyName("student_id")]
+    public string? StudentId { get; set; }
+
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+
+    [JsonPropertyName("version")]
+    public int? Version { get; set; }
+}
+
+public sealed class WebLoginRequestDto
+{
+    [JsonPropertyName("username")]
+    public string? Username { get; set; }
+
+    [JsonPropertyName("login")]
+    public string? Login { get; set; }
+
+    [JsonPropertyName("user_id")]
+    public string? UserId { get; set; }
+
+    [JsonPropertyName("password")]
+    public string? Password { get; set; }
+}
+
+public sealed record WebUserProfileDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("username")] string Username,
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("student_id")] string? StudentId,
+    [property: JsonPropertyName("email")] string Email,
+    [property: JsonPropertyName("full_name")] string FullName
+);
+
+public sealed record WebLoginResponseDto(
+    [property: JsonPropertyName("access_token")] string AccessToken,
+    [property: JsonPropertyName("token")] string Token,
+    [property: JsonPropertyName("token_type")] string TokenType,
+    [property: JsonPropertyName("expires_in")] int ExpiresIn,
+    [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt,
+    [property: JsonPropertyName("user")] WebUserProfileDto User
+);
+
+public sealed record WebMeResponseDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("username")] string Username,
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("student_id")] string? StudentId,
+    [property: JsonPropertyName("email")] string Email,
+    [property: JsonPropertyName("full_name")] string FullName,
+    [property: JsonPropertyName("max_disciplines")] int? MaxDisciplines,
+    [property: JsonPropertyName("active_count")] int? ActiveCount,
+    [property: JsonPropertyName("active_ects")] decimal? ActiveEcts,
+    [property: JsonPropertyName("max_ects")] decimal? MaxEcts,
+    [property: JsonPropertyName("instance_id")] string InstanceId
+);
 
 public sealed record WebEnrollmentResponseDto(
     [property: JsonPropertyName("id")] string Id,

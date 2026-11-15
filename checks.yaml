@@ -1,4 +1,4 @@
-# Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1 + ЛР2)
+# Конфігурація автоматизованої перевірки викладача (Web + РПО, ЛР1 + ЛР2 + ЛР3)
 # Створено суворо на основі joint/checks-template.yaml та специфікацій checks.example.yaml обох курсів.
 
 # ==============================================================================
@@ -13,6 +13,8 @@ web:
     - Д1.4   # traceparent -> trace_id у структурованому журналі JSON
     - О2.3   # Повтор після втраченої відповіді (/faults/after_commit_before_response)
     - О2.4   # Повторні спроби в клієнті (exponential backoff + jitter + Retry-After)
+    - О3.3   # Захист браузерних запитів (явний CORS Allow-Origin без * та префлайт OPTIONS)
+    - О3.4   # Сценарії входу, доступу та виходу в клієнті (POST /v1/auth/login, /v1/me, /v1/auth/logout)
   instances:
     app-a: "http://localhost:8001"
     app-b: "http://localhost:8002"
@@ -38,9 +40,12 @@ dpc:
     - О1.5   # Час виконання, перцентилі p50/p95/p99 та метрики черги Літтла
     - Д1.4   # Graceful Shutdown (SIGTERM) із вивантаженням повної черги
     - О2.2   # Дослідження точності чисельного інтегрування (n та 2n)
+    - О3.2   # Обмеження кількості незавершених задач (IN_FLIGHT_LIMIT)
   services:
     api: app-a
     postgres: postgres
+    ray-head: ray-head
+    ray-worker: ray-worker
   load_s: 10
   resource:
     path: /v1/group-seats/DISC-DPC-01

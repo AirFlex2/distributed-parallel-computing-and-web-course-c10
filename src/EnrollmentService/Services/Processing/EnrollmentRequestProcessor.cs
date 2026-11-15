@@ -17,6 +17,8 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     private readonly MetricsCollector _metrics;
     private readonly ServiceOptions _options;
     private readonly IWebEnrollmentNotifier _webNotifier;
+    private readonly RayEffectReceiverService _receiverService;
+    private readonly IRayTaskClient _rayTaskClient;
 
     public EnrollmentRequestProcessor(
         EnrollmentRequestRepository requestRepo,
@@ -26,7 +28,9 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         IDbConnectionFactory connectionFactory,
         MetricsCollector metrics,
         ServiceOptions options,
-        IWebEnrollmentNotifier? webNotifier = null)
+        IWebEnrollmentNotifier? webNotifier = null,
+        RayEffectReceiverService? receiverService = null,
+        IRayTaskClient? rayTaskClient = null)
     {
         _requestRepo = requestRepo;
         _groupRepo = groupRepo;
@@ -37,10 +41,12 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         _options = options;
         _webNotifier = webNotifier ?? new WebEnrollmentNotifier(
             new WebEnrollmentService(groupRepo, enrollmentRepo, decanateRepo, connectionFactory, options));
+        _receiverService = receiverService ?? new RayEffectReceiverService(
+            requestRepo, groupRepo, enrollmentRepo, decanateRepo, connectionFactory, metrics, options, _webNotifier);
+        _rayTaskClient = rayTaskClient ?? new RayTaskClient(options, _receiverService);
     }
 
     private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPreProcessingHooks = new();
-    private readonly ConcurrentDictionary<Guid, Func<QueuedRequestItem, Task>> _scopedPostCommitBeforeNotifyHooks = new();
 
     /// <summary>
     /// Реєструє тестову точку перехоплення, ізольовану виключно для конкретного ідентифікатора заявки (requestId).
@@ -72,14 +78,15 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     {
         ArgumentNullException.ThrowIfNull(hook);
 
-        if (!_scopedPostCommitBeforeNotifyHooks.TryAdd(requestId, hook))
+        if (!_receiverService.ScopedPostCommitBeforeNotifyHooks.TryAdd(requestId, hook))
         {
             throw new InvalidOperationException($"Хук після коміту для requestId '{requestId}' вже зареєстровано.");
         }
 
         return new ScopedHookRegistration(() =>
         {
-            _scopedPostCommitBeforeNotifyHooks.TryRemove(new KeyValuePair<Guid, Func<QueuedRequestItem, Task>>(requestId, hook));
+            _receiverService.ScopedPostCommitBeforeNotifyHooks.TryRemove(
+                new KeyValuePair<Guid, Func<QueuedRequestItem, Task>>(requestId, hook));
         });
     }
 
@@ -94,7 +101,11 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
     /// Тестова точка перехоплення, що викликається детерміновано одразу після COMMIT бізнес-транзакції,
     /// але до виходу з методу обробки (для перевірки відсутності гонки публікації FinishProcessingTimestamp).
     /// </summary>
-    public Func<QueuedRequestItem, Task>? TestHookAfterCommitAsync { get; set; }
+    public Func<QueuedRequestItem, Task>? TestHookAfterCommitAsync
+    {
+        get => _receiverService.TestHookAfterCommitAsync;
+        set => _receiverService.TestHookAfterCommitAsync = value;
+    }
 
     /// <summary>
     /// Глобальна тестова точка перехоплення перед початком обробки заявки воркером (для детермінованого тестування черги та ідемпотентності).
@@ -193,26 +204,8 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         try
         {
             bool isUnsafe = _options.AllowTestOverrides && _options.UnsafeMode;
-            // Єдиний конвеєр обробки для SAFE та UNSAFE режимів (О1.4 РПО):
-            // Єдина відмінність між ними — наявність транзакційного блокування FOR UPDATE у SAFE.
-            (finalStatus, rejectionReason, committed) = await ProcessEnrollmentCoreAsync(item, isUnsafe, cancellationToken);
-
-            if (committed && _options.AllowTestOverrides && TestHookAfterCommitAsync != null)
-            {
-                try
-                {
-                    await TestHookAfterCommitAsync(item);
-                }
-                catch (Exception hookEx)
-                {
-                    StructuredJsonLogger.LogEvent(_options.InstanceId, "test_hook_after_commit_exception", new Dictionary<string, object?>
-                    {
-                        ["worker_id"] = workerId,
-                        ["request_id"] = item.Id,
-                        ["error"] = hookEx.ToString()
-                    });
-                }
-            }
+            // РПО ЛР3 (О3.1, О3.3, О3.4): Виконання задачі в Ray + атомарне застосування ефекту приймачем
+            (finalStatus, rejectionReason, committed) = await _rayTaskClient.ExecuteAsync(item, isUnsafe, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -241,9 +234,6 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
         {
             var finishedAtUtc = _metrics.MarkProcessingFinished(item);
 
-            // Якщо це не done або транзакція не була зафіксована (наприклад, rejected або failed до коміту),
-            // записуємо фінальний статус у БД.
-            // (Для статусу 'done' у SAFE та UNSAFE режимах він вже зафіксований атомарно всередині tx)
             if (!committed && finalStatus != "done")
             {
                 bool updated = false;
@@ -252,6 +242,38 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
                     try
                     {
                         await using var conn = await _connectionFactory.OpenConnectionAsync(CancellationToken.None);
+                        if (finalStatus == "failed")
+                        {
+                            var appliedEffect = await _requestRepo.GetAppliedEffectDecisionAsync(
+                                item.Id, conn, CancellationToken.None);
+                            if (appliedEffect != null && appliedEffect.Status is "done" or "rejected")
+                            {
+                                finalStatus = appliedEffect.Status;
+                                rejectionReason = appliedEffect.RejectionReason;
+                                committed = string.Equals(appliedEffect.Status, "done", StringComparison.Ordinal);
+
+                                await _requestRepo.UpdateStatusAsync(
+                                    item.Id,
+                                    appliedEffect.Status,
+                                    appliedEffect.RejectionReason,
+                                    appliedEffect.AssignedGroupId,
+                                    finishedAtUtc,
+                                    conn,
+                                    tx: null,
+                                    CancellationToken.None);
+
+                                StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_reconciled_from_applied_effects", new Dictionary<string, object?>
+                                {
+                                    ["worker_id"] = workerId,
+                                    ["request_id"] = item.Id,
+                                    ["status"] = finalStatus
+                                });
+
+                                updated = true;
+                                break;
+                            }
+                        }
+
                         await _requestRepo.UpdateStatusAsync(
                             item.Id,
                             finalStatus,
@@ -299,396 +321,5 @@ public sealed class EnrollmentRequestProcessor : IEnrollmentRequestProcessor
             ["status"] = finalStatus,
             ["rejection_reason"] = rejectionReason
         });
-    }
-
-    private async Task<(string Status, string? Reason, bool Committed)> ProcessEnrollmentCoreAsync(
-        QueuedRequestItem item,
-        bool isUnsafe,
-        CancellationToken cancellationToken)
-    {
-        // Симуляція повільного виклику деканату (200–700 мс) виконується
-        // СТРОГО ПОЗА критичною секцією (до відкриття транзакції та взяття блокувань БД)
-        // в обох режимах (SAFE та UNSAFE, О1.3 РПО).
-        // В UNSAFE фіксована затримка (SlowCallMinMs = 200 мс) забезпечує одночасний вхід
-        // паралельних воркерів у транзакцію для надійної демонстрації Lost Update без блокування FOR UPDATE.
-        int slowDelayMs = isUnsafe
-            ? _options.SlowCallMinMs
-            : Random.Shared.Next(_options.SlowCallMinMs, _options.SlowCallMaxMs + 1);
-        await Task.Delay(slowDelayMs, cancellationToken);
-
-        await using var conn = await _connectionFactory.OpenConnectionAsync(cancellationToken);
-        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
-        bool committed = false;
-
-        try
-        {
-            // Канонічний порядок блокувань для виключення взаємоблокувань (deadlocks):
-            // 1. student FOR UPDATE (у SAFE режимі) або звичайний SELECT (в UNSAFE)
-            var student = isUnsafe
-                ? await _enrollmentRepo.GetStudentByIdAsync(item.StudentId, cancellationToken)
-                : await _enrollmentRepo.GetStudentForUpdateAsync(item.StudentId, conn, tx, cancellationToken);
-
-            if (student == null)
-            {
-                await tx.RollbackAsync(cancellationToken);
-                return ("rejected", $"Студента '{item.StudentId}' не знайдено в базі даних.", false);
-            }
-
-            // 2. discipline_group FOR UPDATE (у SAFE режимі) або звичайний SELECT (в UNSAFE)
-            var groupWithDisc = await _groupRepo.GetGroupWithDisciplineAsync(
-                item.GroupId,
-                conn,
-                tx,
-                forUpdate: !isUnsafe,
-                cancellationToken);
-
-            if (!groupWithDisc.HasValue)
-            {
-                await tx.RollbackAsync(cancellationToken);
-                return ("failed", $"Навчальну групу '{item.GroupId}' не знайдено.", false);
-            }
-
-            var group = groupWithDisc.Value.Group;
-            Guid? targetEnrollmentId = item.RequestedEnrollmentId ?? item.EnrollmentId;
-
-            if (!group.DpcSandboxEnabled && !targetEnrollmentId.HasValue)
-            {
-                await tx.RollbackAsync(cancellationToken);
-                return ("rejected", $"Група '{item.GroupId}' не призначена для автономної обробки РПО (dpc_sandbox_enabled = false).", false);
-            }
-
-            // У режимі UNSAFE спільний наскрізний сценарій Web + DPC суворо заборонено,
-            // оскільки UNSAFE призначений виключно для лабораторної демонстрації Lost Update на автономному прийомі
-            if (isUnsafe && targetEnrollmentId.HasValue)
-            {
-                await tx.RollbackAsync(cancellationToken);
-                return ("rejected", "Спільний наскрізний сценарій Web + DPC підтримується виключно в безпечному режимі SAFE (атомарна транзакція з блокуванням FOR UPDATE).", false);
-            }
-
-            string disciplineId = group.DisciplineId;
-            decimal disciplineEcts = groupWithDisc.Value.DisciplineEcts;
-
-            // 3. Перевірка ідемпотентності за request_id
-            string? existingRosterGroup = await _decanateRepo.GetRosterGroupForRequestAsync(item.Id, conn, tx, cancellationToken);
-            if (existingRosterGroup != null)
-            {
-                var finishedAtUtc = DateTimeOffset.UtcNow;
-                await _requestRepo.UpdateStatusAsync(
-                    item.Id,
-                    "done",
-                    null,
-                    existingRosterGroup,
-                    finishedAtUtc,
-                    conn,
-                    tx,
-                    cancellationToken);
-                await tx.CommitAsync(cancellationToken);
-                committed = true;
-
-                // О1.5 DPC: час завершення обробки публікується СТРОГО ПІСЛЯ завершення коміту транзакції
-                _metrics.MarkProcessingFinished(item);
-
-                // Якщо це спільний запис Web + DPC, ідемпотентно повідомляємо Web
-                if (targetEnrollmentId.HasValue)
-                {
-                    try
-                    {
-                        await _webNotifier.NotifyRosterRecordedAsync(targetEnrollmentId.Value, item.Id, cancellationToken);
-                    }
-                    catch (Exception notifyEx)
-                    {
-                        StructuredJsonLogger.LogEvent(_options.InstanceId, "web_notification_failed", new Dictionary<string, object?>
-                        {
-                            ["request_id"] = item.Id,
-                            ["enrollment_id"] = targetEnrollmentId.Value,
-                            ["error"] = notifyEx.Message
-                        });
-                    }
-                }
-
-                return ("done", null, true);
-            }
-
-            if (!isUnsafe)
-            {
-                // Спільний наскрізний сценарій Web + DPC (тема C10, §2.6.4):
-                // Якщо передано requested_enrollment_id (або enrollment_id), місце вже зарезервовано Web-контуром (held).
-                // DPC перевіряє відповідність даних та записує студента у відомість decanate_roster у власній транзакції.
-                // Після фіксації транзакції DPC повідомляє Web через IWebEnrollmentNotifier, а Web самостійно
-                // переводить запис із held у confirmed у своїй транзакції.
-                if (targetEnrollmentId.HasValue)
-                {
-                    // 1. Перевіряємо існування та блокуємо запис enrollment FOR UPDATE
-                    var heldEnrollment = await _enrollmentRepo.GetEnrollmentForJointVerificationAsync(
-                        targetEnrollmentId.Value, conn, tx, cancellationToken);
-
-                    if (!heldEnrollment.HasValue)
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Пов'язаний Web-запис '{targetEnrollmentId.Value}' не знайдено або було видалено з бази даних.", false);
-                    }
-
-                    // 2. Перевіряємо відповідність студента
-                    if (!string.Equals(heldEnrollment.Value.StudentId, item.StudentId, StringComparison.Ordinal))
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' належить іншому студенту ('{heldEnrollment.Value.StudentId}', очікувався '{item.StudentId}').", false);
-                    }
-
-                    // 3. Перевіряємо відповідність групи
-                    if (!string.Equals(heldEnrollment.Value.GroupId, item.GroupId, StringComparison.Ordinal))
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' відноситься до групи '{heldEnrollment.Value.GroupId}', а не '{item.GroupId}'.", false);
-                    }
-
-                    // 4. Перевіряємо статус (має бути 'held')
-                    if (!string.Equals(heldEnrollment.Value.Status, "held", StringComparison.Ordinal))
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Web-запис '{targetEnrollmentId.Value}' перебуває у неприпустимому для підтвердження стані '{heldEnrollment.Value.Status}'.", false);
-                    }
-
-                    // 5. Перевіряємо строк дії резервування (held)
-                    if (heldEnrollment.Value.ExpiresAt <= DateTimeOffset.UtcNow)
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Термін дії резервування Web-запису '{targetEnrollmentId.Value}' сплив.", false);
-                    }
-
-                    // 6. Перевіряємо чи група не закрита деканатом
-                    if (group.Closed)
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", $"Навчальна група '{group.Id}' закрита працівником деканату (closed = true).", false);
-                    }
-
-                    var finishedAtUtcJoint = DateTimeOffset.UtcNow;
-
-                    try
-                    {
-                        // РПО вносить запис до відомості decanate_roster у транзакції DPC
-                        await _decanateRepo.InsertRosterEntryAsync(
-                            item.Id,
-                            item.StudentId,
-                            item.GroupId,
-                            disciplineId,
-                            disciplineEcts,
-                            targetEnrollmentId.Value,
-                            "joint_web_enrollment",
-                            finishedAtUtcJoint,
-                            conn,
-                            tx,
-                            cancellationToken);
-                    }
-                    catch (DecanateConflictException ex)
-                    {
-                        await tx.RollbackAsync(cancellationToken);
-                        return ("rejected", ex.Message, false);
-                    }
-
-                    await _requestRepo.UpdateStatusAsync(
-                        item.Id,
-                        "done",
-                        null,
-                        item.GroupId,
-                        finishedAtUtcJoint,
-                        conn,
-                        tx,
-                        cancellationToken);
-
-                    await tx.CommitAsync(cancellationToken);
-                    committed = true;
-
-                    // О1.5 DPC: час завершення обробки фіксується СТРОГО ПІСЛЯ завершення коміту транзакції
-                    _metrics.MarkProcessingFinished(item);
-
-                    if (_scopedPostCommitBeforeNotifyHooks.TryGetValue(item.Id, out var postCommitHook))
-                    {
-                        try
-                        {
-                            await postCommitHook(item);
-                        }
-                        catch (Exception hookEx)
-                        {
-                            StructuredJsonLogger.LogEvent(_options.InstanceId, "scoped_post_commit_hook_exception", new Dictionary<string, object?>
-                            {
-                                ["request_id"] = item.Id,
-                                ["error"] = hookEx.ToString()
-                            });
-                        }
-                    }
-
-                    // Web самостійно виконує перехід held -> confirmed у власній окремій транзакції.
-                    // DPC повідомляє Web про результат через нотифікатор IWebEnrollmentNotifier.
-                    try
-                    {
-                        await _webNotifier.NotifyRosterRecordedAsync(targetEnrollmentId.Value, item.Id, cancellationToken);
-                    }
-                    catch (Exception notifyEx)
-                    {
-                        StructuredJsonLogger.LogEvent(_options.InstanceId, "web_notification_failed", new Dictionary<string, object?>
-                        {
-                            ["request_id"] = item.Id,
-                            ["enrollment_id"] = targetEnrollmentId.Value,
-                            ["error"] = notifyEx.Message
-                        });
-                    }
-
-                    return ("done", null, true);
-                }
-
-                // 4. Перевірка наявності активного запису на дисципліну в обох таблицях для автономного прийому (єдине предметне правило §1.10)
-                bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(item.StudentId, disciplineId, conn, tx, cancellationToken);
-
-                var policyResult = EnrollmentPolicy.Check(
-                    student,
-                    group,
-                    disciplineEcts,
-                    DateTimeOffset.UtcNow,
-                    alreadyEnrolled);
-
-                if (!policyResult.Allowed)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", policyResult.RejectionReason, false);
-                }
-
-                // БЕЗПЕЧНИЙ РЕЖИМ (SAFE) — Сценарій А (Автономний стенд РПО ЛР1):
-                // Пряма паралельна обробка заявок черги з атомарним декрементом available під FOR UPDATE.
-                bool decremented = await _groupRepo.DecrementAvailableAsync(item.GroupId, conn, tx, cancellationToken);
-                if (!decremented)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", $"У навчальній групі '{item.GroupId}' немає вільних місць (декремент available повернув false).", false);
-                }
-
-                // Оновлення кількості та кредитів студента
-                await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
-
-                var finishedAtUtc = DateTimeOffset.UtcNow;
-
-                try
-                {
-                    // Запис до відомості деканату
-                    await _decanateRepo.InsertRosterEntryAsync(
-                        item.Id,
-                        item.StudentId,
-                        item.GroupId,
-                        disciplineId,
-                        disciplineEcts,
-                        null,
-                        "primary_roster",
-                        finishedAtUtc,
-                        conn,
-                        tx,
-                        cancellationToken);
-                }
-                catch (DecanateConflictException ex)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", ex.Message, false);
-                }
-
-                // Запис кінцевого стану 'done' у тій самій транзакції, що і предметний ефект
-                await _requestRepo.UpdateStatusAsync(
-                    item.Id,
-                    "done",
-                    null,
-                    item.GroupId,
-                    finishedAtUtc,
-                    conn,
-                    tx,
-                    cancellationToken);
-
-                await tx.CommitAsync(cancellationToken);
-                committed = true;
-
-                // О1.5 DPC: час завершення обробки публікується СТРОГО ПІСЛЯ завершення коміту транзакції
-                _metrics.MarkProcessingFinished(item);
-
-                return ("done", null, true);
-            }
-            else
-            {
-                // НЕБЕЗПЕЧНИЙ РЕЖИМ (UNSAFE): автономний прийом без транзакційного блокування FOR UPDATE.
-                bool alreadyEnrolled = await _enrollmentRepo.HasActiveEnrollmentForDisciplineAsync(item.StudentId, disciplineId, conn, tx, cancellationToken);
-
-                var policyResult = EnrollmentPolicy.Check(
-                    student,
-                    group,
-                    disciplineEcts,
-                    DateTimeOffset.UtcNow,
-                    alreadyEnrolled);
-
-                if (!policyResult.Allowed)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", policyResult.RejectionReason, false);
-                }
-
-                // Прочитали available, потім записали available - 1 без умови WHERE available > 0 (Lost Update).
-                int newAvailable = group.Available - 1;
-                await _groupRepo.SetAvailableUnsafeAsync(item.GroupId, newAvailable, conn, tx, cancellationToken);
-
-                await _enrollmentRepo.UpdateStudentStatsAsync(item.StudentId, +1, disciplineEcts, conn, tx, cancellationToken);
-
-                var finishedAtUtc = DateTimeOffset.UtcNow;
-                try
-                {
-                    await _decanateRepo.InsertRosterEntryAsync(
-                        item.Id,
-                        item.StudentId,
-                        item.GroupId,
-                        disciplineId,
-                        disciplineEcts,
-                        null,
-                        "unsafe_overcommit",
-                        finishedAtUtc,
-                        conn,
-                        tx,
-                        cancellationToken);
-                }
-                catch (DecanateConflictException ex)
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    return ("rejected", ex.Message, false);
-                }
-
-                await _requestRepo.UpdateStatusAsync(
-                    item.Id,
-                    "done",
-                    null,
-                    item.GroupId,
-                    finishedAtUtc,
-                    conn,
-                    tx,
-                    cancellationToken);
-
-                await tx.CommitAsync(cancellationToken);
-                committed = true;
-
-                // О1.5 DPC: час завершення обробки публікується СТРОГО ПІСЛЯ завершення коміту транзакції
-                _metrics.MarkProcessingFinished(item);
-
-                return ("done", null, true);
-            }
-        }
-        catch
-        {
-            if (!committed)
-            {
-                _metrics.ResetProcessingFinished(item);
-                try
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                }
-                catch
-                {
-                    // Транзакція могла вже бути зафіксована до виникнення помилки
-                }
-            }
-            throw;
-        }
     }
 }

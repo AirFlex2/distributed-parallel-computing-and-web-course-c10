@@ -33,6 +33,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ray-head:
+        condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: "${ASPNETCORE_ENVIRONMENT:-Development}"
       ASPNETCORE_URLS: "http://+:8080"
@@ -51,6 +53,15 @@ services:
       FAULTS: "${FAULTS:-off}"
       FAULTS_DIR: "/faults"
       IDEMPOTENCY_KEY_TTL_MINUTES: "${IDEMPOTENCY_KEY_TTL_MINUTES:-1440}"
+      IN_FLIGHT_LIMIT: "${IN_FLIGHT_LIMIT:-3}"
+      RAY_DISPATCHER_URL: "${RAY_DISPATCHER_URL:-http://ray-head:8266}"
+      RAY_TASK_MAX_RETRIES: "${RAY_TASK_MAX_RETRIES:-3}"
+      INTERNAL_RECEIVER_URL: "http://app-a:8080/v1/internal/ray-effect-receiver"
+      INTERNAL_RECEIVER_SECRET: "${INTERNAL_RECEIVER_SECRET:-c10-internal-ray-secret}"
+      AUTH_TOKEN_TTL_MINUTES: "${AUTH_TOKEN_TTL_MINUTES:-120}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"
+      DEMO_STUDENT_PASSWORD: "${DEMO_STUDENT_PASSWORD:-StudentPass2026!}"
+      DEMO_STAFF_PASSWORD: "${DEMO_STAFF_PASSWORD:-StaffPass2026!}"
     volumes:
       - ./faults:/faults
     healthcheck:
@@ -76,6 +87,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ray-head:
+        condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: "${ASPNETCORE_ENVIRONMENT:-Development}"
       ASPNETCORE_URLS: "http://+:8080"
@@ -94,6 +107,15 @@ services:
       FAULTS: "${FAULTS:-off}"
       FAULTS_DIR: "/faults"
       IDEMPOTENCY_KEY_TTL_MINUTES: "${IDEMPOTENCY_KEY_TTL_MINUTES:-1440}"
+      IN_FLIGHT_LIMIT: "${IN_FLIGHT_LIMIT:-3}"
+      RAY_DISPATCHER_URL: "${RAY_DISPATCHER_URL:-http://ray-head:8266}"
+      RAY_TASK_MAX_RETRIES: "${RAY_TASK_MAX_RETRIES:-3}"
+      INTERNAL_RECEIVER_URL: "http://app-a:8080/v1/internal/ray-effect-receiver"
+      INTERNAL_RECEIVER_SECRET: "${INTERNAL_RECEIVER_SECRET:-c10-internal-ray-secret}"
+      AUTH_TOKEN_TTL_MINUTES: "${AUTH_TOKEN_TTL_MINUTES:-120}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"
+      DEMO_STUDENT_PASSWORD: "${DEMO_STUDENT_PASSWORD:-StudentPass2026!}"
+      DEMO_STAFF_PASSWORD: "${DEMO_STAFF_PASSWORD:-StaffPass2026!}"
     volumes:
       - ./faults:/faults
     healthcheck:
@@ -103,6 +125,56 @@ services:
       retries: 10
       start_period: 3s
     stop_grace_period: 60s
+
+  ray-head:
+    build:
+      context: .
+      dockerfile: ray_worker/Dockerfile
+    container_name: dpc-c10-ray-head
+    hostname: ray-head
+    shm_size: "512mb"
+    ports:
+      - "127.0.0.1:8266:8266"
+    command:
+      - sh
+      - -c
+      - "ray start --head --port=6379 --include-dashboard=false --num-cpus=1 && RAY_ADDRESS=auto uvicorn app:app --host 0.0.0.0 --port 8266"
+    environment:
+      RAY_ADDRESS: "auto"
+      FAULTS_DIR: "/faults"
+      API_AUTH_TOKEN: "${API_AUTH_TOKEN:-secret-c10-token-2026}"
+      INTERNAL_RECEIVER_URL: "http://app-a:8080/v1/internal/ray-effect-receiver"
+      INTERNAL_RECEIVER_SECRET: "${INTERNAL_RECEIVER_SECRET:-c10-internal-ray-secret}"
+    volumes:
+      - ./faults:/faults
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8266/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 8s
+
+  ray-worker:
+    build:
+      context: .
+      dockerfile: ray_worker/Dockerfile
+    container_name: dpc-c10-ray-worker
+    hostname: ray-worker
+    shm_size: "512mb"
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - "ray start --address=ray-head:6379 --num-cpus=4 --block"
+    environment:
+      FAULTS_DIR: "/faults"
+      API_AUTH_TOKEN: "${API_AUTH_TOKEN:-secret-c10-token-2026}"
+      INTERNAL_RECEIVER_URL: "http://app-a:8080/v1/internal/ray-effect-receiver"
+      INTERNAL_RECEIVER_SECRET: "${INTERNAL_RECEIVER_SECRET:-c10-internal-ray-secret}"
+    volumes:
+      - ./faults:/faults
 
   nginx:
     image: nginx:1.27-alpine

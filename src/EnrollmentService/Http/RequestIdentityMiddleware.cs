@@ -128,7 +128,9 @@ public sealed class RequestIdentityMiddleware
             string routeTemplate = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText
                 ?? context.Request.Path.Value
                 ?? "/";
-            string? userId = context.Request.Headers["X-User-Id"].FirstOrDefault();
+            string? userId = (context.Items.TryGetValue("WebUser", out var webUserObj) && webUserObj is EnrollmentService.Repositories.AuthenticatedWebUser authenticatedUser)
+                ? authenticatedUser.UserId
+                : null;
 
             string timestampIso = DateTimeOffset.UtcNow.ToString("O");
             var logEntry = new Dictionary<string, object?>

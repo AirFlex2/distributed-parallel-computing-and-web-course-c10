@@ -7,6 +7,7 @@ using EnrollmentService;
 using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
+using EnrollmentService.Services;
 using EnrollmentService.Services.Processing;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
@@ -79,6 +80,94 @@ public sealed partial class E2EHttpEndpointTests : IClassFixture<WebApplicationF
         cmdGroup.Parameters.AddWithValue("closesAt", closesAt);
         cmdGroup.Parameters.AddWithValue("dpcSandboxEnabled", dpcSandboxEnabled);
         await cmdGroup.ExecuteNonQueryAsync();
+    }
+
+    private static bool IsStaffLogin(string login)
+        => string.Equals(login, "staff-1", StringComparison.Ordinal)
+           || string.Equals(login, "deanery", StringComparison.Ordinal);
+
+    private static string ResolveDefaultPassword(string login)
+        => IsStaffLogin(login) ? "StaffPass2026!" : "StudentPass2026!";
+
+    private static async Task EnsureTestStudentIfMissingAsync(string studentId)
+    {
+        await using var conn = await TestEnvironment.OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(@"
+            INSERT INTO student (id, email, full_name, max_disciplines, active_count, active_ects)
+            VALUES (@id, @email, @name, 5, 0, 0.0)
+            ON CONFLICT (id) DO NOTHING;", conn);
+        cmd.Parameters.AddWithValue("id", studentId);
+        cmd.Parameters.AddWithValue("email", $"{studentId}@test.local");
+        cmd.Parameters.AddWithValue("name", $"E2E Test Student {studentId}");
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string> LoginWebAsync(
+        HttpClient client,
+        string login,
+        string? password = null)
+    {
+        var payload = JsonSerializer.Serialize(new
+        {
+            login,
+            password = password ?? ResolveDefaultPassword(login)
+        });
+        var response = await client.PostAsync(
+            "/v1/auth/login",
+            new StringContent(payload, Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var token = doc.RootElement.GetProperty("access_token").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(token));
+
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        return token!;
+    }
+
+    private async Task<HttpClient> CreateAuthenticatedWebClientAsync(
+        string login,
+        string? password = null,
+        WebApplicationFactory<Program>? customFactory = null)
+    {
+        var client = (customFactory ?? _factory).CreateClient();
+        if (!IsStaffLogin(login))
+        {
+            await EnsureTestStudentIfMissingAsync(login);
+        }
+
+        await LoginWebAsync(client, login, password);
+        return client;
+    }
+
+    private async Task<string> IssueFastWebTokenAsync(
+        string userId,
+        string role = "user",
+        string? studentId = null,
+        WebApplicationFactory<Program>? customFactory = null)
+    {
+        var targetFactory = customFactory ?? _factory;
+        using var scope = targetFactory.Services.CreateScope();
+
+        if (string.Equals(role, "user", StringComparison.Ordinal))
+        {
+            await EnsureTestStudentIfMissingAsync(studentId ?? userId);
+        }
+
+        var authRepo = scope.ServiceProvider.GetRequiredService<AuthRepository>();
+        var rawToken = WebAuthService.GenerateOpaqueToken();
+        var tokenHash = WebAuthService.HashToken(rawToken);
+        await authRepo.CreateTokenAsync(
+            tokenHash,
+            userId,
+            userId,
+            role,
+            string.Equals(role, "user", StringComparison.Ordinal) ? (studentId ?? userId) : null,
+            DateTimeOffset.UtcNow.AddHours(2));
+
+        return rawToken;
     }
 
     private static async Task WaitForTerminalStatusAsync(

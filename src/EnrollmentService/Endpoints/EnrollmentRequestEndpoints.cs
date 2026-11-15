@@ -312,7 +312,19 @@ public static class EnrollmentRequestEndpoints
                     "invalid_request_id_format");
             }
 
-            var status = await requestRepo.MarkFirstReadAndGetStatusAsync(parsedId, DateTimeOffset.UtcNow, ctx.RequestAborted);
+            string? requiredStudentId = null;
+            if (ctx.Items.TryGetValue("WebUser", out var webUserObj) &&
+                webUserObj is AuthenticatedWebUser webUser &&
+                string.Equals(webUser.Role, "user", StringComparison.Ordinal))
+            {
+                requiredStudentId = webUser.StudentId ?? webUser.UserId;
+            }
+
+            var status = await requestRepo.MarkFirstReadAndGetStatusAsync(
+                parsedId,
+                DateTimeOffset.UtcNow,
+                ctx.RequestAborted,
+                requiredStudentId);
 
             if (status == null)
             {
@@ -320,7 +332,7 @@ public static class EnrollmentRequestEndpoints
                     ctx, opts,
                     StatusCodes.Status404NotFound,
                     "Заявку не знайдено",
-                    $"Заявка з ідентифікатором '{parsedId}' відсутня в базі даних.",
+                    $"Заявка з ідентифікатором '{parsedId}' не знайдена.",
                     "request_not_found");
             }
 

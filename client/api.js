@@ -15,25 +15,183 @@ function getApiBase() {
     return document.getElementById('apiUrl').value.replace(/\/+$/, '');
 }
 
-function getSelectedStudentId() {
-    const el = document.getElementById('webUserSelect');
-    return el ? el.value : 'student-1';
+const WEB_SESSION_TOKEN_KEY = 'c10_web_access_token';
+let currentWebAccessToken = sessionStorage.getItem(WEB_SESSION_TOKEN_KEY) || '';
+let currentWebUser = null;
+
+function getDemoPasswordForLogin(login) {
+    if (!login) return 'StudentPass2026!';
+    const norm = String(login).trim().toLowerCase();
+    return (norm === 'staff-1' || norm === 'deanery') ? 'StaffPass2026!' : 'StudentPass2026!';
 }
 
-function getAuthHeaders(customRequestId = null) {
-    const token = document.getElementById('authToken').value.trim();
+function getSelectedStudentId() {
+    if (currentWebUser && currentWebUser.student_id) {
+        return currentWebUser.student_id;
+    }
+    const loginEl = document.getElementById('webLoginInput');
+    return loginEl ? loginEl.value.trim() : 'student-1';
+}
+
+function setWebSession(token, user = null) {
+    currentWebAccessToken = token || '';
+    currentWebUser = user || null;
+    if (currentWebAccessToken) {
+        sessionStorage.setItem(WEB_SESSION_TOKEN_KEY, currentWebAccessToken);
+    } else {
+        sessionStorage.removeItem(WEB_SESSION_TOKEN_KEY);
+    }
+    updateWebSessionUi();
+}
+
+function updateWebSessionUi() {
+    const sessionBadge = document.getElementById('webCurrentSessionBadge');
+    const bannerBadge = document.getElementById('webStudentStatusBadge');
+    if (currentWebUser && currentWebAccessToken) {
+        if (sessionBadge) {
+            sessionBadge.className = 'badge badge-ok';
+            sessionBadge.textContent = `Увійшов: ${currentWebUser.username} (роль: ${currentWebUser.role}${currentWebUser.student_id ? ', студент: ' + currentWebUser.student_id : ''})`;
+        }
+        if (bannerBadge && currentWebUser.role === 'staff') {
+            bannerBadge.textContent = `Персонал деканату: ${currentWebUser.username} (role: staff)`;
+        }
+    } else {
+        if (sessionBadge) {
+            sessionBadge.className = 'badge badge-warn';
+            sessionBadge.textContent = 'Не авторизовано (увійдіть через POST /v1/auth/login)';
+        }
+        if (bannerBadge) {
+            bannerBadge.textContent = 'Сесія Web не активна';
+        }
+    }
+}
+
+// Заголовки Web-користувача: ЛИШЕ непрозорий Bearer-токен Web-сесії (без X-User-Id та без службового токена РПО)
+function getWebAuthHeaders(customRequestId = null, tokenOverride = undefined) {
+    const token = tokenOverride !== undefined ? tokenOverride : currentWebAccessToken;
     const traceparent = document.getElementById('traceparentInput')?.value?.trim();
     const reqId = customRequestId || `web-req-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     const headers = {
         'Content-Type': 'application/json',
+        'X-Request-ID': reqId
+    };
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+    if (traceparent) {
+        headers['traceparent'] = traceparent;
+    }
+    return headers;
+}
+
+// Службові заголовки контуру РПО (окремо від Web-сесії користувача)
+function getDpcAuthHeaders(customRequestId = null) {
+    const token = document.getElementById('authToken').value.trim();
+    const traceparent = document.getElementById('traceparentInput')?.value?.trim();
+    const reqId = customRequestId || `dpc-req-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+    const headers = {
+        'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
-        'X-User-Id': getSelectedStudentId(),
         'X-Request-ID': reqId
     };
     if (traceparent) {
         headers['traceparent'] = traceparent;
     }
     return headers;
+}
+
+async function loginWebUser(loginOverride = null, passwordOverride = null, options = {}) {
+    const login = (loginOverride ?? document.getElementById('webLoginInput')?.value ?? '').trim();
+    const password = passwordOverride ?? (document.getElementById('webPasswordInput')?.value ?? '');
+
+    if (document.getElementById('webLoginInput') && loginOverride !== null) {
+        document.getElementById('webLoginInput').value = login;
+    }
+    if (document.getElementById('webPasswordInput') && passwordOverride !== null) {
+        document.getElementById('webPasswordInput').value = password;
+    }
+
+    const res = await fetch(`${getApiBase()}/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Request-ID': `web-login-${Date.now()}`
+        },
+        body: JSON.stringify({ login, password })
+    });
+
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        if (!options.silent) {
+            appendWebOpLog(`[HTTP ${res.status}] Помилка входу для '${login}': ${body.detail || body.title || 'Невірні дані'}`);
+        }
+        return { ok: false, status: res.status, body };
+    }
+
+    setWebSession(body.access_token, body.user);
+    if (!options.silent) {
+        appendWebOpLog(
+            `[200 OK | POST /v1/auth/login] Вхід виконано: username="${body.user?.username}", role="${body.user?.role}", ` +
+            `expires_at=${body.expires_at}, instance=${res.headers.get('X-Instance-Id') || '—'}.`
+        );
+    }
+    if (!options.skipRefresh) {
+        await refreshAll();
+    }
+    return { ok: true, status: res.status, body };
+}
+
+async function loadWebMe(customToken = undefined, options = {}) {
+    const headers = getWebAuthHeaders(null, customToken);
+    const res = await fetch(`${getApiBase()}/v1/me`, { headers });
+    const body = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+        if (customToken === undefined && res.status === 401) {
+            setWebSession('', null);
+        }
+        if (!options.silent) {
+            appendWebOpLog(`[HTTP ${res.status} | GET /v1/me] Сесія недійсна: ${body.detail || body.title || 'Unauthorized'}`);
+        }
+        return { ok: false, status: res.status, body };
+    }
+
+    const profile = body.user ?? body;
+    if (customToken === undefined) {
+        setWebSession(currentWebAccessToken, profile);
+    }
+    if (!options.silent) {
+        appendWebOpLog(
+            `[200 OK | GET /v1/me] Поточний користувач: ${profile?.username} (role=${profile?.role}, ` +
+            `student_id=${profile?.student_id || 'null'}), instance=${res.headers.get('X-Instance-Id') || '—'}.`
+        );
+    }
+    return { ok: true, status: res.status, body };
+}
+
+async function logoutWebUser(options = {}) {
+    if (!currentWebAccessToken) {
+        if (!options.silent) {
+            appendWebOpLog(`[Logout] Немає активного токена Web-сесії.`);
+        }
+        return { ok: false, status: 401 };
+    }
+
+    const revokedToken = currentWebAccessToken;
+    const res = await fetch(`${getApiBase()}/v1/auth/logout`, {
+        method: 'POST',
+        headers: getWebAuthHeaders(null, revokedToken)
+    });
+    const body = await res.json().catch(() => ({}));
+    setWebSession('', null);
+
+    if (!options.silent) {
+        appendWebOpLog(`[HTTP ${res.status} | POST /v1/auth/logout] Вихід виконано, серверний токен відкликано.`);
+    }
+    if (!options.skipRefresh) {
+        await refreshAll();
+    }
+    return { ok: res.ok, status: res.status, revokedToken, body };
 }
 
 function appendLog(message) {
@@ -92,7 +250,7 @@ async function loadWebDisciplines() {
             }
 
             const res = await fetch(url.toString(), {
-                headers: getAuthHeaders()
+                headers: getWebAuthHeaders()
             });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
@@ -255,6 +413,13 @@ function sleepMs(ms) {
 // Головна операція (О1.4, О1.7, О2.2, О2.4): POST /v1/enrollments із Idempotency-Key,
 // повторними спробами (exponential backoff + jitter + Retry-After) та захистом від хибного успіху («Результат невідомий»).
 async function createWebEnrollment(overrideGroupId = null, overrideStudentId = null, customOptions = {}) {
+    if (overrideStudentId) {
+        await loginWebUser(overrideStudentId, getDemoPasswordForLogin(overrideStudentId), {
+            silent: true,
+            skipRefresh: true
+        });
+    }
+
     const groupId = overrideGroupId !== null
         ? overrideGroupId
         : document.getElementById('webGroupIdSelect').value;
@@ -285,10 +450,7 @@ async function createWebEnrollment(overrideGroupId = null, overrideStudentId = n
         }
 
         attempt++;
-        const headers = getAuthHeaders();
-        if (overrideStudentId) {
-            headers['X-User-Id'] = overrideStudentId;
-        }
+        const headers = getWebAuthHeaders(null, customOptions.tokenOverride);
         headers['Idempotency-Key'] = idempotencyKey;
 
         // О2.4: Гарантоване обмеження часу виконання як окремої спроби, так і загального бюджету операції через AbortController.
@@ -439,7 +601,7 @@ async function cancelWebEnrollment(enrollmentId) {
     try {
         const res = await fetch(`${getApiBase()}/v1/enrollments/${enrollmentId}/cancel`, {
             method: 'POST',
-            headers: getAuthHeaders(),
+            headers: getWebAuthHeaders(),
             body: JSON.stringify({ reason: 'Скасовано студентом через веб-клієнт' })
         });
         const body = await res.json().catch(() => ({}));
@@ -545,7 +707,7 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
             appendWebOpLog(`[Відновлення/Повтор] Перевірка існуючої заявки ${requestId} для запису ${targetId}...`);
         } else {
             appendWebOpLog(`[1/3] Реєстрація Web-запису ${targetId} у відомості деканату (POST /v1/enrollments/${targetId}/registrations)...`);
-            const headers = getAuthHeaders();
+            const headers = getWebAuthHeaders();
             headers['Idempotency-Key'] = ik;
 
             const res = await fetch(`${getApiBase()}/v1/enrollments/${targetId}/registrations`, {
@@ -590,7 +752,7 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
             let pollRes;
             try {
                 pollRes = await fetch(`${getApiBase()}/v1/enrollment-requests/${requestId}`, {
-                    headers: getAuthHeaders()
+                    headers: getWebAuthHeaders()
                 });
             } catch (netErr) {
                 transientErrorCount++;
@@ -687,7 +849,7 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
 
         // Отримуємо оновлений Web-запис
         const webEnrRes = await fetch(`${getApiBase()}/v1/enrollments/${targetId}`, {
-            headers: getAuthHeaders()
+            headers: getWebAuthHeaders()
         });
         if (!webEnrRes.ok) {
             const errWeb = await webEnrRes.json().catch(() => ({}));
@@ -774,7 +936,7 @@ async function confirmWebEnrollment(enrollmentId) {
     try {
         const res = await fetch(`${getApiBase()}/v1/enrollments/${enrollmentId}/confirm`, {
             method: 'POST',
-            headers: getAuthHeaders()
+            headers: getWebAuthHeaders()
         });
         const body = await res.json().catch(() => ({}));
         if (res.ok) {
@@ -793,19 +955,48 @@ async function confirmWebEnrollment(enrollmentId) {
     }
 }
 
-// Закриття групи працівником деканату: POST /v1/groups/{id}/close
+// Зміна групи запису студентом (Web О3.2): PATCH /v1/enrollments/{id} із If-Match
+async function patchWebEnrollmentGroup(enrollmentId, targetGroupId = null, version = null) {
+    if (isRegistrationBusy(enrollmentId)) {
+        appendWebOpLog(`Неможливо змінити запис ${enrollmentId}: реєстрація у відомості ще виконується.`);
+        return;
+    }
+    const groupId = targetGroupId || document.getElementById('webPatchTargetGroupSelect')?.value || 'DISC-AI-02';
+    const headers = getWebAuthHeaders();
+    if (version !== null && version !== undefined) {
+        headers['If-Match'] = `"${version}"`;
+    }
+    try {
+        const res = await fetch(`${getApiBase()}/v1/enrollments/${enrollmentId}`, {
+            method: 'PATCH',
+            headers,
+            body: JSON.stringify({ group_id: groupId })
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok) {
+            appendWebOpLog(`[200 OK | PATCH] Запис ${enrollmentId} переведено в групу ${body.group_id} (нова версія v${body.version}).`);
+        } else {
+            appendWebOpLog(`[HTTP ${res.status} | PATCH] Помилка зміни групи: ${body.detail || body.title}`);
+        }
+        await refreshAll();
+    } catch (err) {
+        appendWebOpLog(`Помилка PATCH запису: ${err.message}`);
+    }
+}
+
+// Закриття групи працівником деканату (лише role=staff): POST /v1/groups/{id}/close
 async function closeWebGroup(groupId) {
     try {
         const res = await fetch(`${getApiBase()}/v1/groups/${groupId}/close`, {
             method: 'POST',
-            headers: getAuthHeaders(),
+            headers: getWebAuthHeaders(),
             body: JSON.stringify({ reason: 'Закрито деканатом' })
         });
         const body = await res.json().catch(() => ({}));
         if (res.ok) {
             appendWebOpLog(`[200 OK] Групу ${groupId} закрито працівником деканату (closed=${body.closed}).`);
         } else {
-            appendWebOpLog(`[HTTP ${res.status}] Помилка закриття групи: ${body.detail || body.title}`);
+            appendWebOpLog(`[HTTP ${res.status}] Відмова/помилка закриття групи: ${body.detail || body.title}`);
         }
         await refreshAll();
     } catch (err) {
@@ -819,6 +1010,12 @@ async function readAllWebEnrollmentPages() {
     const studentId = getSelectedStudentId();
     const tbody = document.getElementById('webEnrollmentsTableBody');
     tbody.innerHTML = '';
+
+    if (!currentWebAccessToken) {
+        appendWebCursorLog(`Потрібен вхід (POST /v1/auth/login) для читання GET /v1/enrollments.`);
+        updateWebSessionUi();
+        return;
+    }
 
     let cursor = null;
     let pageNum = 0;
@@ -836,7 +1033,7 @@ async function readAllWebEnrollmentPages() {
             url.searchParams.set('after', cursor);
         }
 
-        const res = await fetch(url.toString(), { headers: getAuthHeaders() });
+        const res = await fetch(url.toString(), { headers: getWebAuthHeaders() });
         const body = await res.json().catch(() => ({}));
 
         if (!res.ok) {
@@ -936,6 +1133,18 @@ async function readAllWebEnrollmentPages() {
         // Кнопки прямого підтвердження та скасування створюються виключно для held.
         // Для підтвердженого запису (confirmed) з незавершеною перевіркою відображається лише кнопка «Перевірити».
         if (item.status === 'held') {
+            const btnPatch = document.createElement('button');
+            btnPatch.className = 'teal';
+            btnPatch.style.padding = '3px 7px';
+            btnPatch.style.fontSize = '11px';
+            btnPatch.style.marginRight = '4px';
+            btnPatch.dataset.action = 'patch';
+            btnPatch.textContent = 'Змінити (PATCH)';
+            btnPatch.title = 'Перевести запис в обрану групу (PATCH /v1/enrollments/{id})';
+            btnPatch.disabled = isBusy;
+            btnPatch.addEventListener('click', () => patchWebEnrollmentGroup(item.id, null, item.version));
+            tdActions.appendChild(btnPatch);
+
             const btnConfirm = document.createElement('button');
             btnConfirm.className = 'secondary';
             btnConfirm.style.padding = '3px 7px';
@@ -972,8 +1181,11 @@ async function readAllWebEnrollmentPages() {
 
 // Перевірка відхилення пошкодженого курсора з кодом 400 Bad Request у форматі Problem Details (О1.5)
 async function testCorruptedCursor() {
+    if (!currentWebAccessToken) {
+        await loginWebUser('student-1', getDemoPasswordForLogin('student-1'), { silent: true, skipRefresh: true });
+    }
     const res = await fetch(`${getApiBase()}/v1/enrollments?limit=2&after=corrupted_cursor_!@#`, {
-        headers: getAuthHeaders()
+        headers: getWebAuthHeaders()
     });
     const body = await res.json().catch(() => ({}));
     appendWebCursorLog(
@@ -995,38 +1207,46 @@ async function runWebBoundaryTests() {
     await createWebEnrollment('DISC-ECTS-10-G1', 'student-ects-20');
 }
 
-// Автотест усіх кодів помилок Problem Details (400, 404, 409, 422) + захисту X-User-Id (О1.4, Д1.3)
+// Автотест кодів помилок Problem Details (401, 400, 422, 404, 409) без довіри до X-User-Id (Web ЛР1–ЛР3)
 async function runWebProblemDetailsTests() {
-    appendWebOpLog(`=== Старт автотесту Problem Details (400 / 422 / 404 / 409) ===`);
+    appendWebOpLog(`=== Старт автотесту Problem Details (401 / 400 / 422 / 404 / 409) ===`);
 
-    // 1. 400 Bad Request (відсутній обов'язковий заголовок X-User-Id)
-    const headersWithoutUser = getAuthHeaders();
-    delete headersWithoutUser['X-User-Id'];
-    const resNoUser = await fetch(`${getApiBase()}/v1/enrollments`, {
-        method: 'POST',
-        headers: headersWithoutUser,
-        body: JSON.stringify({ group_id: 'DISC-WEB-01' })
+    // 1. 401 Unauthorized (без Bearer-токена Web-сесії)
+    const anonHeaders = getWebAuthHeaders(null, '');
+    const resNoAuth = await fetch(`${getApiBase()}/v1/enrollments`, {
+        method: 'GET',
+        headers: anonHeaders
     });
-    const bNoUser = await resNoUser.json().catch(() => ({}));
-    appendWebOpLog(`[Тест 400 без X-User-Id] Статус=${resNoUser.status}, error_code="${bNoUser.error_code}", detail="${bNoUser.detail}"`);
+    const bNoAuth = await resNoAuth.json().catch(() => ({}));
+    appendWebOpLog(`[Тест 401 без токена] Статус=${resNoAuth.status}, error_code="${bNoAuth.error_code}", detail="${bNoAuth.detail}"`);
+
+    await loginWebUser('student-1', getDemoPasswordForLogin('student-1'), { silent: true, skipRefresh: true });
 
     // 2. 400 Bad Request (синтаксично некоректний JSON)
     const res400 = await fetch(`${getApiBase()}/v1/enrollments`, {
         method: 'POST',
-        headers: getAuthHeaders(),
+        headers: getWebAuthHeaders(),
         body: '{"group_id": "DISC-WEB-01"'
     });
     const b400 = await res400.json().catch(() => ({}));
     appendWebOpLog(`[Тест 400 битий JSON] Статус=${res400.status}, title="${b400.title}", error_code="${b400.error_code}"`);
 
-    // 3. 422 Unprocessable Entity (спроба передати student_id у тілі запиту — заборонено)
+    // 3. 422 Unprocessable Entity (спроба передати student_id або status у тілі запиту — заборонено)
     const resOwnerBody = await fetch(`${getApiBase()}/v1/enrollments`, {
         method: 'POST',
-        headers: getAuthHeaders(),
+        headers: getWebAuthHeaders(),
         body: JSON.stringify({ group_id: 'DISC-WEB-01', student_id: 'student-2' })
     });
     const bOwnerBody = await resOwnerBody.json().catch(() => ({}));
     appendWebOpLog(`[Тест 422 student_id у тілі] Статус=${resOwnerBody.status}, error_code="${bOwnerBody.error_code}"`);
+
+    const resStatusBody = await fetch(`${getApiBase()}/v1/enrollments`, {
+        method: 'POST',
+        headers: getWebAuthHeaders(),
+        body: JSON.stringify({ group_id: 'DISC-WEB-01', status: 'confirmed' })
+    });
+    const bStatusBody = await resStatusBody.json().catch(() => ({}));
+    appendWebOpLog(`[Тест 422 status у тілі] Статус=${resStatusBody.status}, error_code="${bStatusBody.error_code}"`);
 
     // 4. 422 Unprocessable Entity (порожній group_id)
     await createWebEnrollment('   ');
@@ -1036,6 +1256,82 @@ async function runWebProblemDetailsTests() {
 
     // 6. 409 Conflict (перевищення ліміту K дисциплін у student-limit-max)
     await createWebEnrollment('DISC-DB-01', 'student-limit-max');
+
+    await loginWebUser('student-1', getDemoPasswordForLogin('student-1'), { silent: true });
+}
+
+// Web ЛР3 (О3.4): Повний 7-кроковий сценарій входу, доступу до власних/чужих об'єктів, ролі staff та виходу
+async function runWebLab3Scenario() {
+    appendWebOpLog(`=== Старт сценарію Web ЛР3 (О3.1–О3.4): Вхід, Доступ, Ролі та Вихід ===`);
+
+    // Крок 1: Анонімний запит (та ігнорування підміни X-User-Id без токена) -> 401
+    const resAnon = await fetch(`${getApiBase()}/v1/enrollments`, {
+        method: 'GET',
+        headers: { 'X-User-Id': 'student-1', 'X-Request-ID': `web-lr3-1-${Date.now()}` }
+    });
+    appendWebOpLog(`[О3.1 Крок 1] Анонімний GET /v1/enrollments (навіть із X-User-Id) -> HTTP ${resAnon.status} (очікується 401).`);
+
+    // Крок 2: Вхід студента student-1 -> токен і /v1/me
+    const login1 = await loginWebUser('student-1', getDemoPasswordForLogin('student-1'), { silent: true, skipRefresh: true });
+    const me1 = await loadWebMe(login1.body?.access_token, { silent: true });
+    const me1Profile = me1.body?.user ?? me1.body;
+    appendWebOpLog(`[О3.1 Крок 2] Вхід student-1 -> HTTP ${login1.status}, /v1/me role="${me1Profile?.role}".`);
+
+    // Крок 3: Створення запису + список своїх записів + PATCH зміни групи (попередньо підстраховуємо вільні записи)
+    const createRes = await createWebEnrollment('DISC-SEC-03');
+    const createdId = createRes.body?.id;
+    let targetGroupForPatch = 'DISC-DB-01';
+    if (createdId) {
+        const patchHeaders = getWebAuthHeaders(null, login1.body.access_token);
+        const etag = createRes.headers?.get('ETag');
+        if (etag) patchHeaders['If-Match'] = etag;
+        const patchRes = await fetch(`${getApiBase()}/v1/enrollments/${createdId}`, {
+            method: 'PATCH',
+            headers: patchHeaders,
+            body: JSON.stringify({ group_id: targetGroupForPatch })
+        });
+        appendWebOpLog(`[О3.2 Крок 3] Створено ${createdId} (HTTP ${createRes.status}) та виконано PATCH -> ${targetGroupForPatch} (HTTP ${patchRes.status}).`);
+    } else {
+        appendWebOpLog(`[О3.2 Крок 3] Запис повернув HTTP ${createRes.status}.`);
+    }
+
+    // Крок 4: Спроба студента закрити групу (staff-only) -> 403 Forbidden
+    const resStudentClose = await fetch(`${getApiBase()}/v1/groups/DISC-WEB-01/close`, {
+        method: 'POST',
+        headers: getWebAuthHeaders(null, login1.body.access_token),
+        body: JSON.stringify({ reason: 'Спроба студента' })
+    });
+    appendWebOpLog(`[О3.2 Крок 4] Спроба student-1 (role=user) викликати POST /v1/groups/.../close -> HTTP ${resStudentClose.status} (очікується 403).`);
+
+    // Крок 5: Вхід як student-2 -> перевірка відсутності чужого запису у списку та однакового 404 на чужий і неіснуючий ID
+    const login2 = await loginWebUser('student-2', getDemoPasswordForLogin('student-2'), { silent: true, skipRefresh: true });
+    if (createdId) {
+        const resForeign = await fetch(`${getApiBase()}/v1/enrollments/${createdId}`, {
+            headers: getWebAuthHeaders(null, login2.body.access_token)
+        });
+        const resMissing = await fetch(`${getApiBase()}/v1/enrollments/00000000-0000-0000-0000-000000000999`, {
+            headers: getWebAuthHeaders(null, login2.body.access_token)
+        });
+        appendWebOpLog(
+            `[О3.2 Крок 5] student-2 читає чужий запис (${resForeign.status}) vs неіснуючий (${resMissing.status}) — однаково 404.`
+        );
+    }
+
+    // Крок 6: Вхід персоналу staff-1 (role=staff) -> перевірка /v1/me
+    const loginStaff = await loginWebUser('staff-1', getDemoPasswordForLogin('staff-1'), { silent: true, skipRefresh: true });
+    appendWebOpLog(`[О3.1/О3.2 Крок 6] Вхід staff-1 -> HTTP ${loginStaff.status}, role="${loginStaff.body?.user?.role}".`);
+
+    // Крок 7: Logout та перевірка, що відкликаний токен більше не приймається (401)
+    const tokenToRevoke = loginStaff.body?.access_token;
+    await logoutWebUser({ silent: true, skipRefresh: true });
+    const resAfterLogout = await fetch(`${getApiBase()}/v1/me`, {
+        headers: getWebAuthHeaders(null, tokenToRevoke)
+    });
+    appendWebOpLog(`[О3.1 Крок 7] GET /v1/me з відкликаним після Logout токеном -> HTTP ${resAfterLogout.status} (очікується 401).`);
+
+    // Повертаємо сесію student-1 для зручності подальшої роботи в інтерфейсі
+    await loginWebUser('student-1', getDemoPasswordForLogin('student-1'), { silent: true });
+    appendWebOpLog(`=== Сценарій Web ЛР3 завершено, відновлено сесію student-1 ===`);
 }
 
 // ============================================================================
@@ -1044,7 +1340,7 @@ async function runWebProblemDetailsTests() {
 
 async function loadGroups() {
     try {
-        const res = await fetch(`${getApiBase()}/v1/group-seats`, { headers: getAuthHeaders() });
+        const res = await fetch(`${getApiBase()}/v1/group-seats`, { headers: getDpcAuthHeaders() });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const groups = await res.json();
         const tbody = document.getElementById('groupsTableBody');
@@ -1097,7 +1393,7 @@ async function loadGroups() {
 async function loadMetrics() {
     try {
         const [res, healthRes] = await Promise.all([
-            fetch(`${getApiBase()}/metrics?format=json`, { headers: getAuthHeaders() }),
+            fetch(`${getApiBase()}/metrics?format=json`, { headers: getDpcAuthHeaders() }),
             fetch(`${getApiBase()}/health`)
         ]);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1120,8 +1416,8 @@ async function loadMetrics() {
 
         summary.innerHTML = `
             <div class="stat-box">
-                <div class="stat-label">У черзі / В обробці</div>
-                <div class="stat-val">${escapeHtml(data.queue_length)} / ${escapeHtml(data.in_processing)}</div>
+                <div class="stat-label">Черга / Активні / IN_FLIGHT_LIMIT (max)</div>
+                <div class="stat-val" style="font-size: 14px;">${escapeHtml(data.queue_length)} / ${escapeHtml(data.in_flight ?? data.in_processing)} / ${escapeHtml(data.configuration?.in_flight_limit ?? data.configuration?.workers)} (${escapeHtml(data.max_in_flight_observed ?? '—')})</div>
             </div>
             <div class="stat-box">
                 <div class="stat-label">Успішно (done) / Відмов (rejected)</div>
@@ -1169,7 +1465,7 @@ async function submitSingleEnrollment() {
         resultBox.textContent = 'Надсилання запиту...';
         const res = await fetch(`${getApiBase()}/v1/enrollment-requests`, {
             method: 'POST',
-            headers: getAuthHeaders(),
+            headers: getDpcAuthHeaders(),
             body: JSON.stringify({ student_id: studentId, group_id: groupId })
         });
 
@@ -1185,7 +1481,7 @@ async function submitSingleEnrollment() {
 
         const pollTimer = setInterval(async () => {
             const pollRes = await fetch(`${getApiBase()}/v1/enrollment-requests/${reqId}`, {
-                headers: getAuthHeaders()
+                headers: getDpcAuthHeaders()
             });
             if (!pollRes.ok) return;
             const statusData = await pollRes.json();
@@ -1227,7 +1523,7 @@ async function runStressBatch() {
         requests.push(
             fetch(`${getApiBase()}/v1/enrollment-requests`, {
                 method: 'POST',
-                headers: getAuthHeaders(),
+                headers: getDpcAuthHeaders(),
                 body: JSON.stringify({ student_id: studentId, group_id: groupId })
             }).then(async r => ({ status: r.status, retryAfter: r.headers.get('Retry-After'), body: await r.json().catch(() => ({})) }))
         );
@@ -1255,7 +1551,7 @@ async function runStressBatch() {
     setTimeout(async () => {
         for (const item of code202.slice(0, 30)) {
             if (item.body && item.body.id) {
-                await fetch(`${getApiBase()}/v1/enrollment-requests/${item.body.id}`, { headers: getAuthHeaders() });
+                await fetch(`${getApiBase()}/v1/enrollment-requests/${item.body.id}`, { headers: getDpcAuthHeaders() });
             }
         }
         await refreshAll();
@@ -1278,7 +1574,7 @@ async function runLittlesLawExperiment() {
 
     const resetRes = await fetch(`${getApiBase()}/v1/admin/reset?unsafeMode=false`, {
         method: 'POST',
-        headers: getAuthHeaders()
+        headers: getDpcAuthHeaders()
     });
     if (resetRes.status === 403) {
         appendLog(`[Увага] Скидання стенду вимкнено (ALLOW_TEST_OVERRIDES=false). Дослід Д1.2 виконується без скидання БД...`);
@@ -1294,7 +1590,7 @@ async function runLittlesLawExperiment() {
         if (sec === warmupSeconds) {
             await fetch(`${getApiBase()}/v1/admin/reset?metricsOnly=true`, {
                 method: 'POST',
-                headers: getAuthHeaders()
+                headers: getDpcAuthHeaders()
             });
             appendLog(`Розігрів (${warmupSeconds} с) завершено. Розпочато залікове вікно вимірювань (${totalSeconds - warmupSeconds} с)...`);
         }
@@ -1304,7 +1600,7 @@ async function runLittlesLawExperiment() {
             const studentId = `student-safe-${String(((reqCounter - 1) % 20) + 1).padStart(2, '0')}`;
             fetch(`${getApiBase()}/v1/enrollment-requests`, {
                 method: 'POST',
-                headers: getAuthHeaders(),
+                headers: getDpcAuthHeaders(),
                 body: JSON.stringify({ student_id: studentId, group_id: groupId })
             })
                 .then(r => r.json())
@@ -1334,7 +1630,7 @@ async function runLittlesLawExperiment() {
         }
     }
 
-    const metricsRes = await fetch(`${getApiBase()}/metrics?format=json`, { headers: getAuthHeaders() });
+    const metricsRes = await fetch(`${getApiBase()}/metrics?format=json`, { headers: getDpcAuthHeaders() });
     const metricsData = await metricsRes.json();
     const ll = metricsData.littles_law;
 
@@ -1364,7 +1660,7 @@ async function runLittlesLawExperiment() {
 
     await new Promise(r => setTimeout(r, 1500));
     for (const id of createdIds.slice(-40)) {
-        await fetch(`${getApiBase()}/v1/enrollment-requests/${id}`, { headers: getAuthHeaders() });
+        await fetch(`${getApiBase()}/v1/enrollment-requests/${id}`, { headers: getDpcAuthHeaders() });
     }
     await refreshAll();
 }
@@ -1373,7 +1669,7 @@ async function resetEnvironment(unsafeMode) {
     try {
         const res = await fetch(`${getApiBase()}/v1/admin/reset?unsafeMode=${unsafeMode}`, {
             method: 'POST',
-            headers: getAuthHeaders()
+            headers: getDpcAuthHeaders()
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -1390,8 +1686,20 @@ async function resetEnvironment(unsafeMode) {
     }
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-    // Прив'язка обробників подій до кнопок та селектів без inline обробників (О1.7, Д1.2)
+window.addEventListener('DOMContentLoaded', async () => {
+    // Прив'язка обробників подій до кнопок та селектів без inline обробників (О1.7, Д1.2, Web ЛР3 О3.4)
+    document.getElementById('btnWebLogin')?.addEventListener('click', () => loginWebUser());
+    document.getElementById('btnWebMe')?.addEventListener('click', () => loadWebMe());
+    document.getElementById('btnWebLogout')?.addEventListener('click', () => logoutWebUser());
+    document.getElementById('btnRunWebLab3Scenario')?.addEventListener('click', () => runWebLab3Scenario());
+    document.getElementById('webUserSelect')?.addEventListener('change', (e) => {
+        const login = e.target.value;
+        const loginInput = document.getElementById('webLoginInput');
+        const passInput = document.getElementById('webPasswordInput');
+        if (loginInput) loginInput.value = login;
+        if (passInput) passInput.value = getDemoPasswordForLogin(login);
+    });
+
     document.getElementById('btnRefreshAll')?.addEventListener('click', () => refreshAll());
     document.getElementById('btnCreateWebEnrollment')?.addEventListener('click', () => createWebEnrollment());
     document.getElementById('btnRegisterWebEnrollmentToRoster')?.addEventListener('click', (e) => registerWebEnrollmentToRoster(null, e.currentTarget));
@@ -1404,9 +1712,12 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btnSubmitSingleEnrollment')?.addEventListener('click', () => submitSingleEnrollment());
     document.getElementById('btnRunStressBatch')?.addEventListener('click', () => runStressBatch());
     document.getElementById('btnRunLittlesLaw')?.addEventListener('click', () => runLittlesLawExperiment());
-    document.getElementById('webUserSelect')?.addEventListener('change', () => refreshAll());
 
-    refreshAll();
+    updateWebSessionUi();
+    if (currentWebAccessToken) {
+        await loadWebMe(undefined, { silent: true });
+    }
+    await refreshAll();
     loadPendingRegistrationsFromStorage();
     if (pendingRegistrations.size > 0) {
         appendWebOpLog(`[Відновлення сесії] Виявлено ${pendingRegistrations.size} незавершених реєстрацій у відомості. Відновлюємо перевірку стану...`);

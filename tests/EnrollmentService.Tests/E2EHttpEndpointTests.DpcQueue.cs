@@ -288,8 +288,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-reg-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));

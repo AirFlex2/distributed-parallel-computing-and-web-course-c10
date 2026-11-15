@@ -1,32 +1,20 @@
 openapi: 3.1.0
 info:
-  title: "C10: Запис на вибіркові дисципліни — Спільний контракт API (Web + РПО, ЛР1–ЛР2)"
-  version: "1.2.0"
+  title: "C10: Запис на вибіркові дисципліни — Спільний контракт API (Web + РПО, ЛР1–ЛР3)"
+  version: "1.3.0"
   description: |
     Єдиний контракт API у форматі OpenAPI 3.1 для спільної теми **С10 «Запис на вибіркові дисципліни»**:
-    - **Курс «Обмін даними у Web-застосунках» (ЛР1–ЛР2)**:
-      - **ЛР1 (О1.1–О1.7, Д1.1–Д1.5)**:
-        - Головна операція `POST /v1/enrollments` (атомарна транзакція БД поверх єдиного ресурсу `discipline_group`, `201 Created` із заголовком `Location`, помилки `400`, `404`, `409`, `422` у форматі `Problem Details` RFC 9457);
-        - Обов'язковий заголовок `X-User-Id` на користувацьких маршрутах (заборона визначення власника з тіла запиту);
-        - Курсорне пагінування `GET /v1/enrollments?limit=...&after=...` за парою `(created_at DESC, id DESC)`;
-        - Каталог дисциплін і груп `GET /v1/disciplines` із часовим вікном `[opens_at, closes_at)` (`Europe/Kyiv`) та кредитами ЄКТС (`<= 30.0`), довідник студентів `GET /v1/students`;
-        - Скасування запису `POST /v1/enrollments/{id}/cancel` та закриття групи `POST /v1/groups/{id}/close`;
-        - Наскрізний `X-Request-ID` та підтримка `traceparent` (W3C Trace Context).
-      - **ЛР2 (О2.1–О2.4)**:
-        - Конкурентність (О2.1): збереження інваріанта ємності групи при одночасних запитах через два вузли `app-a` та `app-b` (500 запитів на 25 місць);
-        - Ідемпотентність (О2.2): заголовок `Idempotency-Key`, канонічний SHA-256 fingerprint нормалізованого запиту, персистентне збереження початкової відповіді 201 у БД в тій самій транзакції, захист від паралельних запитів (`409 idempotency_key_in_progress`) через advisory-блокування;
-        - Повтор після втраченої відповіді (О2.3): підтримка контрольованої точки відмови після `COMMIT` до надсилання HTTP-відповіді з коректним повтором через інший вузол без дублювання записів;
-        - Повторні спроби клієнта (О2.4): алгоритм повторів з адитивним обмеженим джитером, повагою до `Retry-After`, загальним бюджетом часу 8000 мс та обробкою стану «Результат невідомий».
-    - **Курс «Розподілені та паралельні обчислення» (ЛР1–ЛР2)**:
-      - **ЛР1 (О1.1–О1.5, Д1.1–Д1.4)**:
-        - Приймання заявок у внутрішню обмежену чергу `POST /v1/enrollment-requests` (`202 Accepted`, відсікання перевантаження `429 Too Many Requests` + `Retry-After: 1`, `503 Service Unavailable` під час SIGTERM);
-        - Опитування стану заявки `GET /v1/enrollment-requests/{id}` із одноразовою фіксацією `first_read_at`;
-        - Стан спільного ресурсу через SQL-представлення `VIEW group_seats` (`GET /v1/group-seats`, `GET /v1/group-seats/{id}`) та метрики черги і закону Літтла `GET /metrics`.
-      - **ЛР2 (О2.1–О2.4)**:
-        - Паралельне чисельне інтегрування `POST /v1/compute` (О2.1) для функції інтенсивності напливу заявок $\lambda(t) = B + A e^{-t/\tau}$ за складеною формулою трапецій з розбиттям на окремі дочірні процеси ОС;
-        - Аналітичний еталон $I(a, b) = F(b) - F(a)$ та дослідження порядку збіжності $O(h^2)$ (О2.2);
-        - Дослідження прискорення $S(p)$, ефективності $E(p)$, закону Амдала та оптимізація обчислювального ядра (`naive` $\to$ `composite`) (О2.3);
-        - Порівняння режимів пам'яті (О2.4): `none` (спільна сума в `MemoryMappedFile` без синхронізації — демонстрація втрати оновлень), `lock` (міжпроцесне спін-блокування через атомарний `Interlocked.CompareExchange`), `local` (локальне накопичення з фінальним детермінованим сумуванням).
+    - **Курс «Обмін даними у Web-застосунках» (ЛР1–ЛР3)**:
+      - **ЛР1 (О1.1–О1.7, Д1.1–Д1.5)** та **ЛР2 (О2.1–О2.4)**: атомарна транзакція `POST /v1/enrollments`, курсорне пагінування, `Idempotency-Key`, контрольовані відмови `/faults`, ретраї клієнта.
+      - **ЛР3 (О3.1–О3.4)**:
+        - Серверна автентифікація з непрозорими Bearer-токенами (`POST /v1/auth/login`, `POST /v1/auth/logout`, `GET /v1/me`) та повною відмовою від довіри до `X-User-Id`;
+        - Об'єктна авторизація власника (`404` для чужих і відсутніх об'єктів, `422` при спробі передати `student_id`/`status` у тілі), `PATCH /v1/enrollments/{id}` та рольовий доступ персоналу (`role: staff`) на `POST /v1/groups/{id}/close`;
+        - Явний CORS із фіксованими origin-ами та сценарій входу/виходу в клієнті.
+    - **Курс «Розподілені та паралельні обчислення» (ЛР1–ЛР3)**:
+      - **ЛР1–ЛР2**: обмежена черга `POST /v1/enrollment-requests`, інваріант `taken <= seats`, метрики Літтла, `SIGTERM`, паралельне чисельне інтегрування `POST /v1/compute`.
+      - **ЛР3 (О3.1–О3.4)**:
+        - Розподілене виконання задач у **Ray** (`ray-head`, `ray-worker`), обмеження кількості незавершених задач (`IN_FLIGHT_LIMIT`) до вибирання з черги;
+        - Відокремлений приймач результатів (Result Receiver) з атомарним журналом ефектів `dpc_applied_effects` за ключем `request_id` та відновленням після `/faults/after_effect_before_ack`.
 
 servers:
   - url: http://localhost:8080
@@ -36,18 +24,22 @@ servers:
 
 tags:
   - name: Shared
-    description: Спільні службові та стендові маршрути обох курсів (ЛР1–ЛР2)
+    description: Спільні службові та стендові маршрути обох курсів (ЛР1–ЛР3)
   - name: Web
-    description: Маршрути курсу «Обмін даними у Web-застосунках» (ЛР1–ЛР2)
+    description: Маршрути курсу «Обмін даними у Web-застосунках» (ЛР1–ЛР3)
   - name: DPC
-    description: Маршрути курсу «Розподілені та паралельні обчислення» (ЛР1–ЛР2)
+    description: Маршрути курсу «Розподілені та паралельні обчислення» (ЛР1–ЛР3)
 
 components:
   securitySchemes:
+    webBearerAuth:
+      type: http
+      scheme: bearer
+      description: Непрозорий Bearer-токен Web-сесії користувача (`user` або `staff`), отриманий через `POST /v1/auth/login`
     bearerAuth:
       type: http
       scheme: bearer
-      description: Токен авторизації для захищених маршрутів РПО (задається через змінну оточення API_AUTH_TOKEN; значення `secret-c10-token-2026` є локальним значенням за замовчуванням для навчального стенда)
+      description: Службовий Bearer-токен контуру РПО (`API_AUTH_TOKEN`, суворо відокремлений від користувацьких Web-токенів)
 
   parameters:
     XRequestIdHeader:
@@ -58,24 +50,6 @@ components:
       schema:
         type: string
       example: "req-c10-2026-0001"
-    XUserIdRequiredHeader:
-      name: X-User-Id
-      in: header
-      required: true
-      description: Обов'язковий ідентифікатор наперед створеного студента в БД до введення автентифікації в ЛР3 (О1.4 Web). Якщо відсутній — повертається 400 Bad Request Problem Details.
-      schema:
-        type: string
-        minLength: 1
-        maxLength: 64
-      example: "student-1"
-    XUserIdOptionalHeader:
-      name: X-User-Id
-      in: header
-      required: false
-      description: Опційний ідентифікатор користувача для запису в журнал запитів.
-      schema:
-        type: string
-      example: "student-1"
     TraceparentHeader:
       name: traceparent
       in: header
@@ -111,6 +85,76 @@ components:
       example: "1"
 
   schemas:
+    WebLoginRequest:
+      type: object
+      required: [login, password]
+      properties:
+        login:
+          type: string
+        password:
+          type: string
+          format: password
+
+    WebUserProfile:
+      type: object
+      required: [id, username, email, full_name, role]
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        email:
+          type: string
+        full_name:
+          type: string
+        role:
+          type: string
+          enum: [user, staff]
+        student_id:
+          type: [string, "null"]
+
+    WebLoginResponse:
+      type: object
+      required: [access_token, token_type, expires_in, expires_at, user]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+        expires_at:
+          type: string
+          format: date-time
+        user:
+          $ref: "#/components/schemas/WebUserProfile"
+
+    WebMeResponse:
+      type: object
+      required: [authenticated, user]
+      properties:
+        authenticated:
+          type: boolean
+        user:
+          $ref: "#/components/schemas/WebUserProfile"
+
+    WebLogoutResponse:
+      type: object
+      required: [logged_out, detail]
+      properties:
+        logged_out:
+          type: boolean
+        detail:
+          type: string
+
+    PatchWebEnrollmentRequest:
+      type: object
+      required: [group_id]
+      properties:
+        group_id:
+          type: string
+
     ProblemDetails:
       type: object
       description: Повідомлення про помилку у форматі RFC 9457 Problem Details (application/problem+json)
@@ -787,21 +831,108 @@ paths:
                 queue_capacity: 100
                 allow_test_overrides: false
 
+  /v1/auth/login:
+    post:
+      operationId: loginWebUser
+      tags: [Web]
+      summary: Вхід користувача або персоналу деканату (Web ЛР3 О3.1)
+      description: Перевіряє логін і пароль (PBKDF2-SHA256) та видає серверний непрозорий Bearer-токен Web-сесії.
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebLoginRequest"
+            example:
+              login: "student-1"
+              password: "StudentPass2026!"
+      responses:
+        "200":
+          description: Успішний вхід та видача токена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebLoginResponse"
+        "400":
+          description: Некоректне тіло запиту
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Невірний логін або пароль
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/auth/logout:
+    post:
+      operationId: logoutWebUser
+      tags: [Web]
+      summary: Вихід користувача та відкликання токена на сервері (Web ЛР3 О3.1)
+      description: Позначає непрозорий токен Web-сесії як відкликаний у PostgreSQL, роблячи його недійсним на app-a і app-b.
+      security:
+        - webBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Токен відкликано
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebLogoutResponse"
+        "401":
+          description: Відсутній або недійсний токен Web-сесії
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/me:
+    get:
+      operationId: getCurrentWebUser
+      tags: [Web]
+      summary: Отримання профілю та ролі поточного автентифікованого користувача (Web ЛР3 О3.1)
+      description: Перевіряє непрозорий Bearer-токен Web-сесії у PostgreSQL та повертає ідентифікатор, роль (`user` або `staff`) і дані поточного користувача.
+      security:
+        - webBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Інформація про поточного користувача
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebMeResponse"
+        "401":
+          description: Неавторизований запит
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
   /v1/students:
     get:
       operationId: listPrecreatedStudents
       tags: [Web]
       summary: Список студентів у БД із захистом персональних даних (Web О1.4, О3.2)
       description: |
-        Повертає перелік студентів із дотриманням рольового доступу (RBAC):
-        - Персонал (із заголовком Authorization: Bearer <token>) має право переглядати повний список студентів або фільтрувати за ?student_id=...;
-        - Студент (із заголовком X-User-Id — навчальна емуляція контексту користувача для ЛР1 до впровадження JWT у ЛР3) має доступ виключно до власного профілю (спроба отримати чужі дані через ?student_id=... повертає 403 Forbidden);
-        - Неавтентифіковані запити (без валідного токена або заголовка) відхиляються зі статусом 401 Unauthorized.
+        Повертає перелік студентів із дотриманням рольового доступу (RBAC) за Bearer-токеном Web-сесії:
+        - Персонал (`role = staff`) може переглядати повний список студентів або фільтрувати за `?student_id=...`;
+        - Студент (`role = user`) отримує виключно власний профіль (спроба запросити чужі дані повертає 403/404);
+        - Анонімні запити та службовий токен РПО відхиляються зі статусом 401 Unauthorized.
       security:
-        - bearerAuth: []
+        - webBearerAuth: []
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdOptionalHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
         - name: student_id
           in: query
@@ -826,13 +957,13 @@ paths:
                     active_ects: 6.0
                     max_ects: 30.0
         "401":
-          description: Неавторизований доступ (відсутній токен або заголовок X-User-Id)
+          description: Неавторизований доступ (відсутній або недійсний Bearer-токен Web-сесії)
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "403":
-          description: Доступ заборонено (студент намагається переглянути чужі дані)
+          description: Доступ заборонено (студент намагається переглянути чужі дані або використана недозволена роль)
           content:
             application/problem+json:
               schema:
@@ -844,12 +975,12 @@ paths:
       tags: [Web]
       summary: Отримання профілю конкретного студента (Web О3.2)
       description: |
-        Повертає профіль студента за його ідентифікатором:
-        - Персонал (із Bearer токеном) може отримати профіль будь-якого студента;
-        - Студент (із X-User-Id) може отримати виключно власний профіль (спроба запитати чуже ID повертає 403 Forbidden);
+        Повертає профіль студента за його ідентифікатором (тільки з дійсним Bearer-токеном Web-сесії):
+        - Персонал (`role = staff`) може отримати профіль будь-якого студента;
+        - Студент (`role = user`) може отримати виключно власний профіль (для чужого чи відсутнього повертається 404);
         - Неавтентифіковані запити відхиляються зі статусом 401 Unauthorized.
       security:
-        - bearerAuth: []
+        - webBearerAuth: []
       parameters:
         - name: id
           in: path
@@ -858,7 +989,6 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdOptionalHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
       responses:
         "200":
@@ -902,7 +1032,6 @@ paths:
       description: Читає каталог дисциплін і груп із єдиного спільного ресурсу discipline_group з підтримкою курсорної пагінації за id.
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdOptionalHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
         - name: limit
           in: query
@@ -963,15 +1092,16 @@ paths:
     post:
       operationId: createEnrollment
       tags: [Web]
-      summary: Головна операція запису студента на групу вибіркової дисципліни в одній транзакції БД (О1.4, Д1.1, Д1.5 Web)
+      summary: Головна операція запису студента на групу вибіркової дисципліни в одній транзакції БД (О1.4, Д1.1, Д1.5, О3.2 Web)
       description: |
         Виконує перевірку інваріантів (вікно `[opens_at, closes_at)`, ліміт K дисциплін, ліміт `30.0` ЄКТС, наявність вільних місць),
         зменшення `discipline_group.available` та створення запису `enrollment` в одній транзакції PostgreSQL.
-        Власник визначається виключно із заголовка `X-User-Id` (передача `student_id` у тілі повертає `422`).
+        Студент-власник визначається виключно з серверної Web-сесії (`Authorization: Bearer <token>`, роль `user`); заголовок `X-User-Id` ігнорується, а передача `student_id`/`status` у тілі повертає `422`.
       x-course: main
+      security:
+        - webBearerAuth: []
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdRequiredHeader"
         - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/TraceparentHeader"
       requestBody:
@@ -1028,13 +1158,30 @@ paths:
                 instance_id: "app-a"
                 extra_server_field: "forward_compatible_o1_7"
         "400":
-          description: Синтаксично некоректний JSON або відсутній обов'язковий заголовок X-User-Id
+          description: Синтаксично некоректний JSON або порожнє тіло запиту
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
               example:
-                type: "https://urn.c10.edu.ua/problems/missing_user_header"
+                type: "https://urn.c10.edu.ua/problems/invalid_json_syntax"
+                title: "Некоректний синтаксис JSON"
+                status: 400
+                detail: "Тіло запиту не є валідним JSON-об'єктом."
+                instance: "/v1/enrollments"
+                error_code: "invalid_json_syntax"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          description: Роль користувача не дозволяє створення студентського запису
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
                 title: "Відсутній обов'язковий заголовок X-User-Id"
                 status: 400
                 detail: "До введення автентифікації в ЛР3 ідентифікатор студента має обов'язково передаватися у заголовку X-User-Id."
@@ -1113,12 +1260,13 @@ paths:
     get:
       operationId: listStudentEnrollments
       tags: [Web]
-      summary: Список записів студента з курсорним пагінуванням за парою (created_at DESC, id DESC) (О1.5 Web)
-      description: Повертає сторінку записів виключно для користувача із заголовка `X-User-Id` із непрозорим курсором `next_cursor`.
+      summary: Список записів студента з курсорним пагінуванням за парою (created_at DESC, id DESC) (О1.5, О3.2 Web)
+      description: Повертає сторінку записів виключно для автентифікованого студента з непрозорим курсором `next_cursor`.
       x-course: list
+      security:
+        - webBearerAuth: []
       parameters:
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdRequiredHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
         - name: limit
           in: query
@@ -1171,7 +1319,7 @@ paths:
                 active_ects: 5.0
                 max_ects: 30.0
         "400":
-          description: Відсутній X-User-Id, пошкоджений курсор або некоректний limit поза діапазоном [1, 50]
+          description: Пошкоджений курсор або некоректний limit поза діапазоном [1, 50]
           content:
             application/problem+json:
               schema:
@@ -1183,14 +1331,22 @@ paths:
                 detail: "Значення курсора 'corrupted-cursor-xyz' не вдалося розпізнати."
                 instance: "/v1/enrollments"
                 error_code: "invalid_cursor"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
 
   /v1/enrollments/{id}:
     get:
       operationId: getStudentEnrollmentById
       tags: [Web]
-      summary: Отримання конкретного запису студента за ідентифікатором із перевіркою власника X-User-Id (С10 Web)
-      description: Повертає запис студента за рядковим UUID, якщо він належить поточному користувачу `X-User-Id`.
+      summary: Отримання конкретного запису студента за ідентифікатором із перевіркою власника (С10, О3.2 Web)
+      description: Повертає запис студента за рядковим UUID, якщо він належить поточному автентифікованому користувачу (для чужого чи неіснуючого повертає однаковий 404).
       x-course: object
+      security:
+        - webBearerAuth: []
       parameters:
         - name: id
           in: path
@@ -1199,7 +1355,6 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdRequiredHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
       responses:
         "200":
@@ -1223,7 +1378,13 @@ paths:
                 expires_at_local: "2026-11-01T14:15:00+02:00"
                 university_tz: "Europe/Kyiv"
         "400":
-          description: Відсутній заголовок X-User-Id або ідентифікатор id не є валідним UUID
+          description: Ідентифікатор id не є валідним UUID
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
           content:
             application/problem+json:
               schema:
@@ -1235,13 +1396,83 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
 
+    patch:
+      operationId: patchStudentEnrollmentGroup
+      tags: [Web]
+      summary: Зміна групи активного запису (held) власником із перевіркою версії ETag (Web О3.2)
+      description: Переводить власний запис студента в стані `held` в іншу відкриту групу. Для чужого об'єкта повертає 404; при спробі змінити `student_id`, `status` або `version` — 422.
+      security:
+        - webBearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Рядковий UUID запису студента
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: false
+          description: Поточна версія або ETag запису для оптимістичного блокування
+          schema:
+            type: string
+        - $ref: "#/components/parameters/XRequestIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchWebEnrollmentRequest"
+            example:
+              group_id: "DISC-AI-02"
+      responses:
+        "200":
+          description: Групу запису успішно змінено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebEnrollmentResponse"
+        "400":
+          description: Некоректний ідентифікатор або синтаксис JSON
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Запис чи нову групу не знайдено або запис належить іншому студенту
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "409":
+          description: Конфлікт стану, брак місць або конфлікт версії If-Match
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Спроба передати захищене поле (student_id, status, version) або некоректне значення
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
   /v1/enrollments/{id}/confirm:
     post:
       operationId: confirmStudentEnrollment
       tags: [Web]
-      summary: "Підтвердження попереднього запису студентом (Web О1.1: held -> confirmed)"
-      description: Переводить запис студента у стан `confirmed` (остаточне зарахування).
+      summary: "Підтвердження попереднього запису студентом (Web О1.1, О3.2: held -> confirmed)"
+      description: Переводить власний запис студента у стан `confirmed` (остаточне зарахування).
       x-course: update
+      security:
+        - webBearerAuth: []
       parameters:
         - name: id
           in: path
@@ -1250,7 +1481,6 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdRequiredHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
       responses:
         "200":
@@ -1260,13 +1490,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebEnrollmentResponse"
         "400":
-          description: Некоректний ідентифікатор або відсутній заголовок X-User-Id
+          description: Некоректний ідентифікатор
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "404":
-          description: Запис студента не знайдено
+          description: Запис студента не знайдено або належить іншому студенту
           content:
             application/problem+json:
               schema:
@@ -1282,9 +1518,11 @@ paths:
     post:
       operationId: cancelStudentEnrollment
       tags: [Web]
-      summary: Скасування запису студентом із поверненням вільного місця в групі (С10 Web)
-      description: Переводить власний запис користувача `X-User-Id` у стан `cancelled` і повертає місце в `discipline_group` у канонічному порядку блокувань (`student -> discipline_group -> enrollment`).
+      summary: Скасування запису студентом із поверненням вільного місця в групі (С10, О3.2 Web)
+      description: Переводить власний запис автентифікованого студента у стан `cancelled` і повертає місце в `discipline_group` у канонічному порядку блокувань (`student -> discipline_group -> enrollment`).
       x-course: cancel
+      security:
+        - webBearerAuth: []
       parameters:
         - name: id
           in: path
@@ -1293,7 +1531,6 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdRequiredHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
       requestBody:
         required: false
@@ -1331,7 +1568,13 @@ paths:
                 expires_at_local: "2026-11-01T14:15:00+02:00"
                 university_tz: "Europe/Kyiv"
         "400":
-          description: Відсутній заголовок X-User-Id
+          description: Некоректний ідентифікатор
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
           content:
             application/problem+json:
               schema:
@@ -1390,6 +1633,8 @@ paths:
           як до початку обробки, так і після її завершення (done), без додаткового споживання слотів черги.
         - При зміні параметрів (студент, запис) повертається 409 Conflict (idempotency_conflict).
       x-course: long-operation
+      security:
+        - webBearerAuth: []
       parameters:
         - name: id
           in: path
@@ -1398,7 +1643,6 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/XRequestIdHeader"
-        - $ref: "#/components/parameters/XUserIdRequiredHeader"
         - $ref: "#/components/parameters/TraceparentHeader"
         - name: Idempotency-Key
           in: header
@@ -1419,13 +1663,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/DpcEnrollmentAcceptedResponse"
         "400":
-          description: Некоректний ідентифікатор запису або відсутній X-User-Id
+          description: Некоректний ідентифікатор запису
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Відсутній або недійсний Bearer-токен Web-сесії
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "404":
-          description: Запис не знайдено
+          description: Запис не знайдено або належить іншому користувачу
           content:
             application/problem+json:
               schema:
@@ -1458,11 +1708,11 @@ paths:
     post:
       operationId: closeDisciplineGroup
       tags: [Web]
-      summary: Закриття запису на навчальну групу працівником деканату (С10 Web)
-      description: "Встановлює прапорець closed = true для групи дисципліни в discipline_group, після чого як синхронні Web-записи, так і асинхронні заявки РПО відхиляються. У межах ЛР1 операція захищена Bearer-токеном (API_AUTH_TOKEN), а повноцінне розмежування прав за ролями (RBAC: деканат проти студента) реалізується в ЛР3."
+      summary: Закриття запису на навчальну групу працівником деканату (С10, О3.2 Web)
+      description: "Встановлює прапорець closed = true для групи дисципліни в discipline_group. Доступно виключно персоналу деканату (role = staff за Web Bearer-токеном); звичайний студент отримує 403 Forbidden."
       x-course: staff-action
       security:
-        - bearerAuth: []
+        - webBearerAuth: []
       parameters:
         - name: id
           in: path
@@ -1507,7 +1757,13 @@ paths:
                 closed: true
                 window_active: false
         "401":
-          description: Відсутній або недійсний Bearer-токен
+          description: Відсутній або недійсний Bearer-токен Web-сесії
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          description: Доступ заборонено (потрібна роль staff)
           content:
             application/problem+json:
               schema:
@@ -1642,7 +1898,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "401":
-          description: Відсутній або недійсний Bearer-токен
+          description: Відсутній або недійсний службовий Bearer-токен РПО
           content:
             application/problem+json:
               schema:
@@ -1729,7 +1985,7 @@ paths:
                 processing_time_ms: 438.06
                 delivery_wait_ms: 94.06
         "401":
-          description: Відсутній або недійсний Bearer-токен
+          description: Відсутній або недійсний службовий Bearer-токен РПО
           content:
             application/problem+json:
               schema:
@@ -1807,7 +2063,7 @@ paths:
                 capacity: 30
                 used: 0
         "401":
-          description: Відсутній або недійсний Bearer-токен
+          description: Відсутній або недійсний службовий Bearer-токен РПО
           content:
             application/problem+json:
               schema:

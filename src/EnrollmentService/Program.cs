@@ -42,14 +42,14 @@ builder.Services
 // а StopApplication() викликається тільки після повного спустошення черги воркерів.
 builder.Services.AddSingleton<IHostLifetime, DisabledConsoleLifetime>();
 
-// П. 13 (Web О3.3): Явна заборона AllowAnyOrigin (*); дозволено виключно origin клієнта
+// Web ЛР3 (О3.3): Явна заборона AllowAnyOrigin (*); дозволено виключно явно задані origin клієнта
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
-        policy.WithOrigins("http://localhost:3000", "http://127.0.0.1:3000")
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .WithExposedHeaders("X-Request-ID", "X-Instance-Id", "X-Trace-Id", "Location", "Retry-After"));
+        policy.WithOrigins(serviceOptions.AllowedOrigins)
+              .WithHeaders("Content-Type", "Authorization", "Idempotency-Key", "X-Request-ID", "If-Match", "traceparent")
+              .WithMethods("GET", "POST", "PATCH", "OPTIONS")
+              .WithExposedHeaders("X-Request-ID", "X-Instance-Id", "X-Trace-Id", "Location", "Retry-After", "ETag"));
 });
 
 var app = builder.Build();
@@ -59,6 +59,8 @@ using (var scope = app.Services.CreateScope())
 {
     var dbInit = scope.ServiceProvider.GetRequiredService<DatabaseInitializer>();
     await dbInit.InitializeAsync();
+    var authService = scope.ServiceProvider.GetRequiredService<EnrollmentService.Services.WebAuthService>();
+    await authService.SyncConfiguredDemoPasswordsAsync();
 }
 
 if (migrateOnly)
@@ -131,11 +133,13 @@ app.UseMiddleware<BearerAuthMiddleware>();
 
 // Реєстрація модульних HTTP-маршрутів
 app.MapDiagnosticsEndpoints();
+app.MapAuthEndpoints();
 app.MapEnrollmentEndpoints();
 app.MapEnrollmentRequestEndpoints();
 app.MapGroupEndpoints();
 app.MapAdminEndpoints();
 app.MapComputeEndpoints();
+app.MapInternalReceiverEndpoints();
 
 app.Run();
 

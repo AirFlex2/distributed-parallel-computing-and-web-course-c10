@@ -24,8 +24,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
         client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-syntax-err");
 
         var content = new StringContent("{ group_id: unquoted_syntax_error }", Encoding.UTF8, "application/json");
@@ -42,18 +41,20 @@ public sealed partial class E2EHttpEndpointTests
     }
 
     [SkippableFact]
-    public async Task PostEnrollment_MissingUserIdHeader_Returns400BadRequest()
+    public async Task PostEnrollment_MissingAuthToken_EvenWithXUserId_Returns401Unauthorized()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
         var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
         var content = new StringContent("{\"group_id\": \"DISC-WEB-01\"}", Encoding.UTF8, "application/json");
         var response = await client.PostAsync("/v1/enrollments", content);
 
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         var json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
-        Assert.Contains("missing_user_header", doc.RootElement.GetProperty("type").GetString());
+        Assert.Equal(401, doc.RootElement.GetProperty("status").GetInt32());
+        Assert.Contains("unauthorized", doc.RootElement.GetProperty("type").GetString());
     }
 
     [SkippableFact]
@@ -61,8 +62,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
         client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-non-existent");
 
         var content = new StringContent("{\"group_id\": \"NON-EXISTENT-GROUP-XYZ\"}", Encoding.UTF8, "application/json");
@@ -99,8 +99,7 @@ public sealed partial class E2EHttpEndpointTests
                 opensAt: DateTimeOffset.UtcNow.AddDays(-1),
                 closesAt: DateTimeOffset.UtcNow.AddDays(1));
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-full-group");
 
             var content = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -142,8 +141,7 @@ public sealed partial class E2EHttpEndpointTests
                 opensAt: DateTimeOffset.UtcNow.AddDays(-1),
                 closesAt: DateTimeOffset.UtcNow.AddDays(1));
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
 
             // Перший запис — успішний (201 Created)
             var content1 = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -195,8 +193,7 @@ public sealed partial class E2EHttpEndpointTests
                 closesAt: DateTimeOffset.UtcNow.AddDays(1),
                 ects: 6.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-ects");
 
             var content = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -239,8 +236,7 @@ public sealed partial class E2EHttpEndpointTests
                 opensAt: DateTimeOffset.UtcNow.AddDays(2),
                 closesAt: DateTimeOffset.UtcNow.AddDays(5));
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-ects");
 
             var content = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -283,8 +279,7 @@ public sealed partial class E2EHttpEndpointTests
                 opensAt: DateTimeOffset.UtcNow.AddDays(-10),
                 closesAt: DateTimeOffset.UtcNow.AddDays(-5));
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-ects");
 
             var content = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -310,8 +305,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
         client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-owner");
 
         // Заборонено передавати student_id у тілі для захисту від підміни авторства (Web О1.4)
@@ -350,8 +344,7 @@ public sealed partial class E2EHttpEndpointTests
                 closesAt: DateTimeOffset.UtcNow.AddDays(1),
                 ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", "test-idem-ects");
 
             var content = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -396,8 +389,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-held-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -459,8 +451,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-conf-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -511,8 +502,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-exp-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -558,8 +548,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"cancel-idem-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -606,12 +595,23 @@ public sealed partial class E2EHttpEndpointTests
     }
 
     [SkippableFact]
-    public async Task GetStudents_WithBearerToken_ReturnsFullList()
+    public async Task GetStudents_WithDpcToken_Returns401Unauthorized()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
         var client = _factory.CreateClient();
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+
+        var resp = await client.GetAsync("/v1/students");
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
+    }
+
+    [SkippableFact]
+    public async Task GetStudents_WithStaffWebToken_ReturnsFullList()
+    {
+        Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
+
+        var client = await CreateAuthenticatedWebClientAsync("staff-1");
 
         var resp = await client.GetAsync("/v1/students");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
@@ -623,12 +623,11 @@ public sealed partial class E2EHttpEndpointTests
     }
 
     [SkippableFact]
-    public async Task GetStudents_WithStudentXUserId_ReturnsOnlyOwnData()
+    public async Task GetStudents_WithStudentWebToken_ReturnsOnlyOwnData()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
 
         var resp = await client.GetAsync("/v1/students");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
@@ -641,12 +640,11 @@ public sealed partial class E2EHttpEndpointTests
     }
 
     [SkippableFact]
-    public async Task GetStudents_WithStudentXUserId_AccessingOtherStudent_Returns403Forbidden()
+    public async Task GetStudents_WithStudentWebToken_AccessingOtherStudent_Returns403Forbidden()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
 
         var resp = await client.GetAsync("/v1/students?student_id=student-2");
         Assert.Equal(HttpStatusCode.Forbidden, resp.StatusCode);
@@ -671,8 +669,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
 
         var resp = await client.GetAsync("/v1/students/student-1");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
@@ -683,15 +680,14 @@ public sealed partial class E2EHttpEndpointTests
     }
 
     [SkippableFact]
-    public async Task GetStudentById_ByStudent_OtherData_Returns403Forbidden()
+    public async Task GetStudentById_ByStudent_OtherData_Returns404NotFound()
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Add("X-User-Id", "student-1");
+        var client = await CreateAuthenticatedWebClientAsync("student-1");
 
         var resp = await client.GetAsync("/v1/students/student-2");
-        Assert.Equal(HttpStatusCode.Forbidden, resp.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 
     [SkippableFact]
@@ -699,8 +695,7 @@ public sealed partial class E2EHttpEndpointTests
     {
         Skip.If(!await IsDatabaseAvailableAsync(), "PostgreSQL is not accessible. Integration test skipped.");
 
-        var client = _factory.CreateClient();
-        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+        var client = await CreateAuthenticatedWebClientAsync("staff-1");
 
         var resp = await client.GetAsync("/v1/students/student-1");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
@@ -726,8 +721,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), ects: 4.0m);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-get-safe-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));

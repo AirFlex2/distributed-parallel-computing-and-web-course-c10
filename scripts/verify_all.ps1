@@ -1,13 +1,13 @@
-<#
+﻿<#
 .SYNOPSIS
-    Комплексний сценарій автоматизованого тестування та перевірки ЛР1–ЛР2 (Web + РПО)
+    Комплексний сценарій автоматизованого тестування та перевірки ЛР1–ЛР3 (Web + РПО)
     Тема С10: «Запис на вибіркові дисципліни»
     Студент: Зінківський Тимур Євгенійович, група ІТІНФ-23-2
 .DESCRIPTION
     Послідовно перевіряє:
     0. Лінтер OpenAPI 3.1 (Spectral CLI), модульні тести (dotnet test), версіоновані міграції schema_migrations та VIEW group_seats.
-    1-2. Захищений робочий режим (ALLOW_TEST_OVERRIDES=false): обов'язковий X-User-Id (400), заборона student_id у тілі (422),
-         блокування /v1/admin/reset (403), обов'язкова авторизація Bearer (401).
+    1-2. Захищений робочий режим (ALLOW_TEST_OVERRIDES=false): Bearer-автентифікація Web (401 без токена), заборона student_id у тілі (422),
+         блокування /v1/admin/reset (403), розділення токенів Web і РПО (401).
     3. Розподіл відповідальності Web і РПО (§1.10), відомість деканату, ліміти K та ЄКТС, ідемпотентність.
     4. Пункт О1.2 (РПО): Обмежена черга QUEUE_CAPACITY=100, 429 Backpressure та p95 /health під навантаженням.
     5. Пункт О1.4 (РПО): Захист спільного ресурсу discipline_group (порівняння SAFE vs UNSAFE, демонстрація гонитви).
@@ -18,6 +18,8 @@
     10. Курс «Web» (О1.1–О1.7, Д1.1–Д1.5): пагінація курсором, скасування (п. 10), ліміти K/ЄКТС, балансування least_conn.
     11. Курс «Web» ЛР2 (О2.1–О2.4): конкурентний інваріант, ідемпотентність, збій після COMMIT.
     12. Курс «РПО» ЛР2 (О2.1–О2.4): чисельне інтегрування, аналітичний еталон, режими пам'яті (local, lock, none).
+    13. Курс «Web» ЛР3 (О3.1–О3.4): непрозорі серверні токени, вхід/вихід app-a/app-b, ізоляція об'єктів/404, PATCH/If-Match, staff RBAC, CORS.
+    14. Курс «РПО» ЛР3 (О3.1–О3.4): розподілене виконання у Ray (ray-head + ray-worker), IN_FLIGHT_LIMIT, dpc_applied_effects, відмова after_effect_before_ack.
 #>
 
 param(
@@ -79,6 +81,68 @@ function Get-ResponseText($resp) {
     return [string]$resp.Content
 }
 
+$script:WebTokenCache = @{}
+$script:SpawnedClientProcess = $null
+
+function Ensure-ClientServerRunning {
+    param([string]$ClientUrl = "http://localhost:3000/api.js")
+    try {
+        $probe = Invoke-WebRequest -Uri $ClientUrl -Method Get -TimeoutSec 2 -SkipHttpErrorCheck
+        if ([int]$probe.StatusCode -eq 200) {
+            Write-Info "Клієнтський сервер на :3000 вже активний."
+            return $true
+        }
+    } catch { }
+
+    if (-not (Get-Command "node" -ErrorAction SilentlyContinue)) {
+        Write-Fail "CLI 'node' не знайдено в PATH — неможливо запустити client/serve.mjs."
+        return $false
+    }
+
+    Write-Info "Автоматичний запуск клієнтського HTTP-сервера (node client/serve.mjs) на :3000..."
+    $script:SpawnedClientProcess = Start-Process -FilePath "node" -ArgumentList "client/serve.mjs" -WorkingDirectory $RepoRoot -PassThru -WindowStyle Hidden
+    for ($cw = 0; $cw -lt 20; $cw++) {
+        Start-Sleep -Milliseconds 250
+        try {
+            $chk = Invoke-WebRequest -Uri $ClientUrl -Method Get -TimeoutSec 2 -SkipHttpErrorCheck
+            if ([int]$chk.StatusCode -eq 200) {
+                Write-Info "Тимчасовий клієнтський сервер на :3000 запущено (PID=$($script:SpawnedClientProcess.Id))."
+                return $true
+            }
+        } catch { }
+    }
+    return $false
+}
+
+function Stop-SpawnedClientServer {
+    if ($null -ne $script:SpawnedClientProcess -and -not $script:SpawnedClientProcess.HasExited) {
+        Write-Info "Зупинка тимчасового клієнтського сервера на :3000 (PID=$($script:SpawnedClientProcess.Id))..."
+        Stop-Process -Id $script:SpawnedClientProcess.Id -Force -ErrorAction SilentlyContinue
+        $script:SpawnedClientProcess = $null
+    }
+}
+
+function Get-WebToken([string]$login, [string]$password = $null) {
+    if ($script:WebTokenCache.ContainsKey($login)) {
+        return $script:WebTokenCache[$login]
+    }
+    $pwdValue = if (![string]::IsNullOrEmpty($password)) {
+        $password
+    } elseif ($login -in @("staff-1", "deanery")) {
+        if (![string]::IsNullOrWhiteSpace($env:DEMO_STAFF_PASSWORD)) { $env:DEMO_STAFF_PASSWORD } else { "StaffPass2026!" }
+    } else {
+        if (![string]::IsNullOrWhiteSpace($env:DEMO_STUDENT_PASSWORD)) { $env:DEMO_STUDENT_PASSWORD } else { "StudentPass2026!" }
+    }
+    $body = @{ login = $login; password = $pwdValue } | ConvertTo-Json
+    $resp = Invoke-RestMethod -Uri "$BaseUrl/v1/auth/login" -Method Post -ContentType "application/json" -Body $body
+    $tok = [string]$resp.access_token
+    if ([string]::IsNullOrWhiteSpace($tok)) {
+        throw "Failed to obtain Web Bearer token for '$login'"
+    }
+    $script:WebTokenCache[$login] = $tok
+    return $tok
+}
+
 function Set-TestOverridesMode([bool]$enable) {
     $val = if ($enable) { "true" } else { "false" }
     $env:ALLOW_TEST_OVERRIDES = $val
@@ -126,7 +190,7 @@ function Restart-AppWithConfig([string]$engine, [string]$model) {
     return $false
 }
 
-Write-Header "СТАРТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1–ЛР2 (Тема С10: Web + РПО)"
+Write-Header "СТАРТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1–ЛР3 (Тема С10: Web + РПО)"
 Write-Info "Цільовий сервіс (через балансувальник Nginx): $BaseUrl"
 
 # Перевірка доступності демона Docker
@@ -209,8 +273,8 @@ if ($total -eq 0) {
 if ($testExit -eq 0 -and
     $failed -eq 0 -and
     $skipped -eq 0 -and
-    $passed -ge 184 -and
-    $total -ge 184) {
+    $passed -ge 206 -and
+    $total -ge 206) {
     Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
     if ($skipped -gt 0) {
@@ -250,7 +314,7 @@ if ($isReady) {
 # ------------------------------------------------------------------------------
 # 2. Перевірка безпеки у робочому режимі (ALLOW_TEST_OVERRIDES=false)
 # ------------------------------------------------------------------------------
-Write-Header "2. Безпека API у робочому режимі: Bearer (401), X-User-Id (400/422), валідація вхідних даних (404)"
+Write-Header "2. Безпека API у робочому режимі: Bearer (401), ігнорування X-User-Id, заборона полів у тілі (422), CORS (О3.3)"
 
 $healthBRes = Invoke-WebRequest -Uri "$BaseUrl/health-app-b" -Method Get -TimeoutSec 2 -SkipHttpErrorCheck
 $healthBJson = (Get-ResponseText $healthBRes) | ConvertFrom-Json
@@ -263,7 +327,7 @@ if ([int]$healthBRes.StatusCode -eq 200 -and $healthBJson.status -eq "ok" -and $
 $corsOptHeaders = @{
     "Origin" = "http://localhost:3000"
     "Access-Control-Request-Method" = "POST"
-    "Access-Control-Request-Headers" = "content-type,x-user-id"
+    "Access-Control-Request-Headers" = "content-type,authorization,idempotency-key"
 }
 $corsOptRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Options -Headers $corsOptHeaders -SkipHttpErrorCheck
 $corsOptReqId = [string]($corsOptRes.Headers["X-Request-ID"] | Select-Object -First 1)
@@ -272,9 +336,17 @@ $corsLogs = (& $DockerExe compose logs app-a app-b --tail 50 2>&1)
 $hasCorsLog = $corsLogs | Where-Object { $_ -match '"event"\s*:\s*"http_request"' -and $_ -match '"method"\s*:\s*"OPTIONS"' -and $_ -match [regex]::Escape($corsOptReqId) }
 
 if ([int]$corsOptRes.StatusCode -eq 204 -and $corsOptAllowOrigin -eq "http://localhost:3000" -and !([string]::IsNullOrWhiteSpace($corsOptReqId)) -and $hasCorsLog) {
-    Write-Pass "О1.6 (Web): CORS preflight (OPTIONS) містить X-Request-ID ($corsOptReqId) та зафіксований у JSON-лозі зі статусом 204"
+    Write-Pass "О1.6 / О3.3 (Web): CORS preflight (OPTIONS) містить X-Request-ID ($corsOptReqId), Access-Control-Allow-Origin=http://localhost:3000 та зафіксований у JSON-лозі"
 } else {
     Write-Fail "Помилка перевірки CORS preflight: Status=$([int]$corsOptRes.StatusCode), X-Request-ID=$corsOptReqId, AllowOrigin=$corsOptAllowOrigin, Log=$([bool]$hasCorsLog)"
+}
+
+$evilCorsRes = Invoke-WebRequest -Uri "$BaseUrl/v1/disciplines" -Method Get -Headers @{ "Origin" = "http://evil.example" } -SkipHttpErrorCheck
+$evilAllowOrigin = [string]($evilCorsRes.Headers["Access-Control-Allow-Origin"] | Select-Object -First 1)
+if ([string]::IsNullOrEmpty($evilAllowOrigin)) {
+    Write-Pass "Web О3.3: Сторонній Origin http://evil.example не отримує Access-Control-Allow-Origin (і ніколи '*')"
+} else {
+    Write-Fail "Помилка CORS захисту: для http://evil.example повернуто Allow-Origin='$evilAllowOrigin'"
 }
 
 $unauthRes = Invoke-WebRequest -Uri "$BaseUrl/v1/group-seats" -Method Get -SkipHttpErrorCheck
@@ -285,12 +357,15 @@ if ([int]$unauthRes.StatusCode -eq 401 -and $unauthCt -match "application/proble
     Write-Fail "Очікувався HTTP 401 problem+json, отримано: $([int]$unauthRes.StatusCode) ($unauthCt)"
 }
 
+$tokStudent1 = Get-WebToken "student-1"
 $unauthGroupClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-WEB-01/close" -Method Post -SkipHttpErrorCheck
 $invalidAuthGroupClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-WEB-01/close" -Method Post -Headers @{ "Authorization" = "Bearer invalid-token-12345" } -SkipHttpErrorCheck
-if ([int]$unauthGroupClose.StatusCode -eq 401 -and [int]$invalidAuthGroupClose.StatusCode -eq 401) {
-    Write-Pass "Маршрут POST /v1/groups/{id}/close надійно захищено Bearer-токеном (без токена: 401, недійсний токен: 401)"
+$dpcTokenGroupClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-WEB-01/close" -Method Post -Headers @{ "Authorization" = "Bearer $Token" } -SkipHttpErrorCheck
+$userRoleGroupClose = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-WEB-01/close" -Method Post -Headers @{ "Authorization" = "Bearer $tokStudent1" } -SkipHttpErrorCheck
+if ([int]$unauthGroupClose.StatusCode -eq 401 -and [int]$invalidAuthGroupClose.StatusCode -eq 401 -and [int]$dpcTokenGroupClose.StatusCode -eq 401 -and [int]$userRoleGroupClose.StatusCode -eq 403) {
+    Write-Pass "Маршрут POST /v1/groups/{id}/close надійно захищено (анон/недійсний/DPC: 401, роль student 'user': 403)"
 } else {
-    Write-Fail "Помилка автентифікації POST /v1/groups/{id}/close: unauth=$([int]$unauthGroupClose.StatusCode), invalid=$([int]$invalidAuthGroupClose.StatusCode)"
+    Write-Fail "Помилка автентифікації POST /v1/groups/{id}/close: unauth=$([int]$unauthGroupClose.StatusCode), invalid=$([int]$invalidAuthGroupClose.StatusCode), dpc=$([int]$dpcTokenGroupClose.StatusCode), user=$([int]$userRoleGroupClose.StatusCode)"
 }
 
 $unauthMetrics = Invoke-WebRequest -Uri "$BaseUrl/metrics" -Method Get -SkipHttpErrorCheck
@@ -301,16 +376,15 @@ if ([int]$unauthMetrics.StatusCode -eq 401 -and [int]$invalidAuthMetrics.StatusC
     Write-Fail "Помилка автентифікації GET /metrics: unauth=$([int]$unauthMetrics.StatusCode), invalid=$([int]$invalidAuthMetrics.StatusCode)"
 }
 
-$noUserPost = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json" } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
-$noUserGet  = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Get -SkipHttpErrorCheck
-$noUserBody = (Get-ResponseText $noUserPost) | ConvertFrom-Json
-if ([int]$noUserPost.StatusCode -eq 400 -and [int]$noUserGet.StatusCode -eq 400 -and $noUserBody.error_code -eq "missing_user_header") {
-    Write-Pass "Запити без обов'язкового заголовка X-User-Id відхилено з HTTP 400 Bad Request (error_code=missing_user_header)"
+$noUserPost = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1" } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+$noUserGet  = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Get -Headers @{ "X-User-Id" = "student-1" } -SkipHttpErrorCheck
+if ([int]$noUserPost.StatusCode -eq 401 -and [int]$noUserGet.StatusCode -eq 401) {
+    Write-Pass "Web О3.1: Запити без дійсного Bearer-токена (навіть з підставленим X-User-Id) відхилено з HTTP 401 Unauthorized"
 } else {
-    Write-Fail "Помилка перевірки обов'язковості X-User-Id: POST=$([int]$noUserPost.StatusCode), GET=$([int]$noUserGet.StatusCode)"
+    Write-Fail "Помилка перевірки обов'язковості Web Bearer-токена: POST=$([int]$noUserPost.StatusCode), GET=$([int]$noUserGet.StatusCode)"
 }
 
-$ownerInBodyRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = "owner-test-idem" } -Body '{"group_id":"DISC-WEB-01","student_id":"student-2"}' -SkipHttpErrorCheck
+$ownerInBodyRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokStudent1"; "Idempotency-Key" = "owner-test-idem" } -Body '{"group_id":"DISC-WEB-01","student_id":"student-2"}' -SkipHttpErrorCheck
 $ownerInBodyJson = (Get-ResponseText $ownerInBodyRes) | ConvertFrom-Json
 if ([int]$ownerInBodyRes.StatusCode -eq 422 -and $ownerInBodyJson.error_code -eq "owner_in_body_forbidden") {
     Write-Pass "Спробу передати власника student_id у тілі POST /v1/enrollments відхилено з HTTP 422 (error_code=owner_in_body_forbidden)"
@@ -944,10 +1018,10 @@ try {
 
     function Get-WebEnrollmentHeaders($studentId, $ik = $null) {
         $key = if ([string]::IsNullOrWhiteSpace($ik)) { "web-$studentId-$([System.Guid]::NewGuid().ToString('N'))" } else { $ik }
+        $webTok = Get-WebToken $studentId
         return @{
             "Content-Type" = "application/json"
-            "X-User-Id" = $studentId
-            "Authorization" = "Bearer $Token"
+            "Authorization" = "Bearer $webTok"
             "Idempotency-Key" = $key
         }
     }
@@ -955,9 +1029,10 @@ try {
     $webHeadersStudent1 = Get-WebEnrollmentHeaders "student-1"
     $webHeadersStudent2 = Get-WebEnrollmentHeaders "student-2"
     $webHeadersStudent3 = Get-WebEnrollmentHeaders "student-3"
+    $tokWebS1 = Get-WebToken "student-1"
 
     # 10.0 Перевірка обов'язковості заголовка Idempotency-Key для POST /v1/enrollments (О1.4 Web)
-    $missingIkRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Authorization" = "Bearer $Token" } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $missingIkRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokWebS1" } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
     $missingIkBody = (Get-ResponseText $missingIkRes) | ConvertFrom-Json
     if ([int]$missingIkRes.StatusCode -eq 400 -and $missingIkBody.error_code -eq "missing_idempotency_key") {
         Write-Pass "Web О1.4: Відсутній заголовок Idempotency-Key відхилено з HTTP 400 Bad Request (error_code=missing_idempotency_key)"
@@ -965,7 +1040,7 @@ try {
         Write-Fail "Помилка перевірки обов'язковості Idempotency-Key: status=$([int]$missingIkRes.StatusCode)"
     }
 
-    $emptyIkRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Authorization" = "Bearer $Token"; "Idempotency-Key" = "   " } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $emptyIkRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokWebS1"; "Idempotency-Key" = "   " } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
     $emptyIkBody = (Get-ResponseText $emptyIkRes) | ConvertFrom-Json
     if ([int]$emptyIkRes.StatusCode -eq 400 -and $emptyIkBody.error_code -eq "missing_idempotency_key") {
         Write-Pass "Web О1.4: Порожній заголовок Idempotency-Key відхилено з HTTP 400 Bad Request (error_code=missing_idempotency_key)"
@@ -1145,14 +1220,14 @@ try {
         Write-Fail "Очікувався 401 для анонімного GET /v1/students, отримано: $([int]$anonStudentsRes.StatusCode)"
     }
 
-    $studentSelfRes = Invoke-RestMethod -Uri "$BaseUrl/v1/students" -Method Get -Headers @{ "X-User-Id" = "student-1" }
+    $studentSelfRes = Invoke-RestMethod -Uri "$BaseUrl/v1/students" -Method Get -Headers @{ "Authorization" = "Bearer $tokWebS1" }
     if ($studentSelfRes.items.Count -eq 1 -and $studentSelfRes.items[0].id -eq "student-1") {
         Write-Pass "Web О3.2: Студент отримує виключно власний профіль у GET /v1/students (items count = 1)"
     } else {
         Write-Fail "Помилка фільтрації профілю студента: items=$($studentSelfRes.items.Count)"
     }
 
-    $forbiddenStudentRes = Invoke-WebRequest -Uri "$BaseUrl/v1/students?student_id=student-2" -Method Get -Headers @{ "X-User-Id" = "student-1" } -SkipHttpErrorCheck
+    $forbiddenStudentRes = Invoke-WebRequest -Uri "$BaseUrl/v1/students?student_id=student-2" -Method Get -Headers @{ "Authorization" = "Bearer $tokWebS1" } -SkipHttpErrorCheck
     if ([int]$forbiddenStudentRes.StatusCode -eq 403) {
         Write-Pass "Web О3.2: Спроба студента отримати чужі персональні дані відхилена з HTTP 403 Forbidden"
     } else {
@@ -1161,8 +1236,8 @@ try {
 
     # 10.13.3 Повторний Idempotency-Key з іншим тілом -> 422 Unprocessable Content (О2.2 Web)
     $ikTestKey = "ik-diff-body-" + [guid]::NewGuid().ToString("N")
-    $ikFirstRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-DB-01"}' -SkipHttpErrorCheck
-    $ikSecondRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-AI-02"}' -SkipHttpErrorCheck
+    $ikFirstRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokWebS1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-DB-01"}' -SkipHttpErrorCheck
+    $ikSecondRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokWebS1"; "Idempotency-Key" = $ikTestKey } -Body '{"group_id":"DISC-AI-02"}' -SkipHttpErrorCheck
     $ikSecondJson = (Get-ResponseText $ikSecondRes) | ConvertFrom-Json
     if ([int]$ikSecondRes.StatusCode -eq 422 -and $ikSecondJson.error_code -eq "idempotency_key_payload_mismatch") {
         Write-Pass "Web О2.2: Повторний Idempotency-Key з іншим тілом повернув HTTP 422 Unprocessable Content (error_code=idempotency_key_payload_mismatch)"
@@ -1196,19 +1271,28 @@ try {
     $concGroupId = "22222222-2222-2222-2222-222222222209"
     $concTotal = 45
     $concSeats = 25
-    Write-Info "Крок 11.1 (Web О2.1): Надсилання $concTotal одночасних POST /v1/enrollments безпосередньо на app-a (:8001) та app-b (:8002) для групи $concGroupId ($concSeats місць)..."
+    Write-Info "Крок 11.1 (Web О2.1): Отримання токенів Web-автентифікації та надсилання $concTotal одночасних POST /v1/enrollments на app-a (:8001) та app-b (:8002)..."
 
+    $concTokens = @{}
+    for ($cIdx = 1; $cIdx -le $concTotal; $cIdx++) {
+        $stConc = "student-web-conc-$("{0:D2}" -f $cIdx)"
+        $concTokens[$stConc] = Get-WebToken $stConc
+    }
+
+    $webConcClient = [System.Net.Http.HttpClient]::new()
+    $webConcClient.Timeout = [TimeSpan]::FromSeconds(15)
     $concTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
     for ($cIdx = 1; $cIdx -le $concTotal; $cIdx++) {
         $stConc = "student-web-conc-$("{0:D2}" -f $cIdx)"
         $targetPort = if ($cIdx % 2 -eq 1) { 8001 } else { 8002 }
         $reqMsg = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "http://localhost:$targetPort/v1/enrollments")
-        $reqMsg.Headers.Add("X-User-Id", $stConc)
+        $reqMsg.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $concTokens[$stConc])
         $reqMsg.Headers.Add("Idempotency-Key", "idem-conc-o21-$stConc")
         $reqMsg.Content = [System.Net.Http.StringContent]::new("{`"group_id`":`"$concGroupId`"}", [System.Text.Encoding]::UTF8, "application/json")
-        $concTasks.Add($httpClient.SendAsync($reqMsg))
+        $concTasks.Add($webConcClient.SendAsync($reqMsg))
     }
     [System.Threading.Tasks.Task]::WaitAll($concTasks.ToArray())
+    $webConcClient.Dispose()
 
     $conc201 = 0
     $conc409 = 0
@@ -1227,9 +1311,10 @@ try {
 
     # 11.2 Web О2.2: Збережена початкова HTTP-відповідь при повторі Idempotency-Key між app-a та app-b навіть після підтвердження запису
     $o22Key = "idem-verify-o22-" + [guid]::NewGuid().ToString("N")
-    $o22First = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $o22Key } -Body '{  "group_id" : "DISC-WEB-01"  }'
-    $null = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments/$($o22First.id)/confirm" -Method Post -Headers @{ "X-User-Id" = "student-1" }
-    $o22ReplayOnB = Invoke-RestMethod -Uri "http://localhost:8002/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-1"; "Idempotency-Key" = $o22Key } -Body '{"group_id":"DISC-WEB-01"}'
+    $tokO22S1 = Get-WebToken "student-1"
+    $o22First = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokO22S1"; "Idempotency-Key" = $o22Key } -Body '{  "group_id" : "DISC-WEB-01"  }'
+    $null = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments/$($o22First.id)/confirm" -Method Post -Headers @{ "Authorization" = "Bearer $tokO22S1" }
+    $o22ReplayOnB = Invoke-RestMethod -Uri "http://localhost:8002/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokO22S1"; "Idempotency-Key" = $o22Key } -Body '{"group_id":"DISC-WEB-01"}'
 
     if ($o22ReplayOnB.id -eq $o22First.id -and $o22ReplayOnB.status -eq "held" -and $o22ReplayOnB.version -eq 1 -and $o22ReplayOnB.instance_id -eq "app-a") {
         Write-Pass "Web О2.2: Повтор із тим самим Idempotency-Key на примірнику app-b повернув збережену початкову відповідь (id=$($o22ReplayOnB.id), status='held', version=1, instance_id='app-a')"
@@ -1259,10 +1344,11 @@ try {
     Set-Content -Path $faultFileHost -Value "1" -Encoding UTF8
     $faultKey = "idem-verify-o23-" + [guid]::NewGuid().ToString("N")
     $faultSinceUtc = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $tokO23S2 = Get-WebToken "student-2"
 
     $lostResponseObserved = $false
     try {
-        $null = Invoke-WebRequest -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "Idempotency-Key" = $faultKey } -Body '{"group_id":"DISC-WEB-01"}' -TimeoutSec 5
+        $null = Invoke-WebRequest -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokO23S2"; "Idempotency-Key" = $faultKey } -Body '{"group_id":"DISC-WEB-01"}' -TimeoutSec 5
     } catch {
         $lostResponseObserved = $true
     }
@@ -1273,7 +1359,7 @@ try {
     $flagRemoved = -not (Test-Path $faultFileHost)
 
     # Повтор клієнта з ТИМ САМИМ Idempotency-Key через балансувальник Nginx (який направляє запит на живий app-b)
-    $retryAfterFaultRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "X-User-Id" = "student-2"; "Idempotency-Key" = $faultKey } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
+    $retryAfterFaultRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokO23S2"; "Idempotency-Key" = $faultKey } -Body '{"group_id":"DISC-WEB-01"}' -SkipHttpErrorCheck
     $retryAfterFaultBody = (Get-ResponseText $retryAfterFaultRes) | ConvertFrom-Json
 
     if ($lostResponseObserved -and $hasFaultHitLog -and $flagRemoved -and [int]$retryAfterFaultRes.StatusCode -eq 201 -and $retryAfterFaultBody.student_id -eq "student-2") {
@@ -1353,13 +1439,341 @@ try {
         Write-Fail "Помилка РПО О2.4: local_err=$($cLocal.abs_error), lock_err=$($cLock.abs_error), none_err=$($cNone.abs_error)"
     }
 
+    # --------------------------------------------------------------------------
+    # 13. Пункти ЛР3 курсу Web (О3.1–О3.4): Вхід, вихід, ізоляція, RBAC, CORS та клієнт
+    # --------------------------------------------------------------------------
+    Write-Header "13. Курс «Web» ЛР3: Вхід/вихід app-a/app-b (О3.1), ізоляція/PATCH/staff (О3.2), CORS (О3.3) та клієнт (О3.4)"
+
+    $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+    $script:WebTokenCache.Clear()
+
+    # 13.1 О3.1: Вхід на app-a -> перевірка /v1/me на app-b (ігноруючи підроблений X-User-Id) -> вихід на app-a -> 401 на обох
+    $login13Body = @{ login = "student-1"; password = $(if (![string]::IsNullOrWhiteSpace($env:DEMO_STUDENT_PASSWORD)) { $env:DEMO_STUDENT_PASSWORD } else { "StudentPass2026!" }) } | ConvertTo-Json
+    $login13Res = Invoke-RestMethod -Uri "http://localhost:8001/v1/auth/login" -Method Post -ContentType "application/json" -Body $login13Body
+    $session13Tok = [string]$login13Res.access_token
+
+    $me13OnB = Invoke-RestMethod -Uri "http://localhost:8002/v1/me" -Method Get -Headers @{ "Authorization" = "Bearer $session13Tok"; "X-User-Id" = "student-2" }
+    $null = Invoke-RestMethod -Uri "http://localhost:8001/v1/auth/logout" -Method Post -Headers @{ "Authorization" = "Bearer $session13Tok" }
+    $meAfterLogoutA = Invoke-WebRequest -Uri "http://localhost:8001/v1/me" -Method Get -Headers @{ "Authorization" = "Bearer $session13Tok" } -SkipHttpErrorCheck
+    $meAfterLogoutB = Invoke-WebRequest -Uri "http://localhost:8002/v1/me" -Method Get -Headers @{ "Authorization" = "Bearer $session13Tok" } -SkipHttpErrorCheck
+
+    $freshS1Tok = Get-WebToken "student-1"
+    $dpcOnMeRes = Invoke-WebRequest -Uri "$BaseUrl/v1/me" -Method Get -Headers @{ "Authorization" = "Bearer $Token" } -SkipHttpErrorCheck
+    $webOnMetricsRes = Invoke-WebRequest -Uri "$BaseUrl/metrics" -Method Get -Headers @{ "Authorization" = "Bearer $freshS1Tok" } -SkipHttpErrorCheck
+
+    if ($me13OnB.id -eq "student-1" -and [int]$meAfterLogoutA.StatusCode -eq 401 -and [int]$meAfterLogoutB.StatusCode -eq 401 -and [int]$dpcOnMeRes.StatusCode -eq 401 -and [int]$webOnMetricsRes.StatusCode -eq 401) {
+        Write-Pass "Web О3.1: Вхід на app-a, перевірка /v1/me на app-b (підроблений X-User-Id проігноровано), відкликання logout на обох вузлах (401) та суворе розділення токенів Web/РПО підтверджено."
+    } else {
+        Write-Fail "Помилка Web О3.1: meId=$($me13OnB.id), afterLogoutA=$([int]$meAfterLogoutA.StatusCode), afterLogoutB=$([int]$meAfterLogoutB.StatusCode), dpcOnMe=$([int]$dpcOnMeRes.StatusCode), webOnMetrics=$([int]$webOnMetricsRes.StatusCode)"
+    }
+
+    # 13.2 О3.2: Ізоляція записів (однаковий 404), PATCH + If-Match, заборона підміни полів (422), RBAC staff на /close
+    $tok13S1 = Get-WebToken "student-1"
+    $tok13S2 = Get-WebToken "student-2"
+    $tok13Staff = Get-WebToken "staff-1"
+
+    $enr13 = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tok13S1"; "Idempotency-Key" = "lr3-web-o32-$([guid]::NewGuid().ToString('N'))" } -Body '{"group_id":"DISC-WEB-01"}'
+    $enr13Id = [string]$enr13.id
+
+    $s2List = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments" -Method Get -Headers @{ "Authorization" = "Bearer $tok13S2" }
+    $s2SeesS1 = ($s2List.items | Where-Object { $_.id -eq $enr13Id }).Count -gt 0
+
+    $randomGuid = [guid]::NewGuid().ToString("D")
+    $foreignGet = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$enr13Id" -Method Get -Headers @{ "Authorization" = "Bearer $tok13S2" } -SkipHttpErrorCheck
+    $missingGet = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$randomGuid" -Method Get -Headers @{ "Authorization" = "Bearer $tok13S2" } -SkipHttpErrorCheck
+    $foreignCancel = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$enr13Id/cancel" -Method Post -Headers @{ "Authorization" = "Bearer $tok13S2" } -SkipHttpErrorCheck
+
+    $patchConflict = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$enr13Id" -Method Patch -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tok13S1"; "If-Match" = '"v99"' } -Body '{"group_id":"DISC-DB-01"}' -SkipHttpErrorCheck
+    $patchOk = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$enr13Id" -Method Patch -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tok13S1"; "If-Match" = '"v1"' } -Body '{"group_id":"DISC-DB-01"}' -SkipHttpErrorCheck
+    $patchOkBody = (Get-ResponseText $patchOk) | ConvertFrom-Json
+    $patchEtag = [string]($patchOk.Headers["ETag"] | Select-Object -First 1)
+    $patchBodyTamper = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$enr13Id" -Method Patch -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tok13S1" } -Body '{"group_id":"DISC-SEC-03","status":"confirmed"}' -SkipHttpErrorCheck
+
+    $closeUserRes = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-ONE-SEAT/close" -Method Post -Headers @{ "Authorization" = "Bearer $tok13S1" } -SkipHttpErrorCheck
+    $closeStaffRes = Invoke-WebRequest -Uri "$BaseUrl/v1/groups/DISC-ONE-SEAT/close" -Method Post -Headers @{ "Authorization" = "Bearer $tok13Staff" } -SkipHttpErrorCheck
+    $closeStaffBody = (Get-ResponseText $closeStaffRes) | ConvertFrom-Json
+
+    if (-not $s2SeesS1 -and [int]$foreignGet.StatusCode -eq 404 -and [int]$missingGet.StatusCode -eq 404 -and [int]$foreignCancel.StatusCode -eq 404 -and [int]$patchConflict.StatusCode -eq 409 -and [int]$patchOk.StatusCode -eq 200 -and $patchOkBody.group_id -eq "DISC-DB-01" -and $patchOkBody.version -eq 2 -and $patchEtag -eq '"v2"' -and [int]$patchBodyTamper.StatusCode -eq 422 -and [int]$closeUserRes.StatusCode -eq 403 -and [int]$closeStaffRes.StatusCode -eq 200 -and $closeStaffBody.closed -eq $true) {
+        Write-Pass "Web О3.2: Ізоляція списку/404 для чужих об'єктів, PATCH /v1/enrollments/{id} (v1->v2, If-Match, ETag='$patchEtag'), 422 при підміні полів і RBAC 403/200 для staff /close підтверджено."
+    } else {
+        Write-Fail "Помилка Web О3.2: s2SeesS1=$s2SeesS1, foreign404=$([int]$foreignGet.StatusCode)/$([int]$missingGet.StatusCode)/$([int]$foreignCancel.StatusCode), patchConflict=$([int]$patchConflict.StatusCode), patchOk=$([int]$patchOk.StatusCode), tamper=$([int]$patchBodyTamper.StatusCode), closeUser=$([int]$closeUserRes.StatusCode), closeStaff=$([int]$closeStaffRes.StatusCode)"
+    }
+
+    # 13.4 О3.4: Автозапуск клієнта (:3000) за потреби та реальне виконання runWebLab3Scenario() у JS + перевірка CORS
+    $clientRunning = Ensure-ClientServerRunning
+    if ($clientRunning) {
+        $indexHtmlRes = Invoke-WebRequest -Uri "http://localhost:3000/index.html" -Method Get -TimeoutSec 5 -SkipHttpErrorCheck
+        $clientApiRes = Invoke-WebRequest -Uri "http://localhost:3000/api.js" -Method Get -TimeoutSec 5 -SkipHttpErrorCheck
+        $indexHtmlText = Get-ResponseText $indexHtmlRes
+        $clientApiText = Get-ResponseText $clientApiRes
+        $hasClientMarkup = ([int]$indexHtmlRes.StatusCode -eq 200) -and ($indexHtmlText -match 'btnWebLogin') -and ($indexHtmlText -match 'btnRunWebLab3Scenario') -and ($indexHtmlText -match 'api\.js')
+
+        $null = Invoke-RestMethod -Uri "$BaseUrl/v1/admin/reset?unsafeMode=false" -Method Post -Headers $Headers
+        $studentPassVal = if (![string]::IsNullOrWhiteSpace($env:DEMO_STUDENT_PASSWORD)) { $env:DEMO_STUDENT_PASSWORD } else { "StudentPass2026!" }
+
+        $nodeRunner = @'
+import vm from 'node:vm';
+const clientBase = process.env.C10_CLIENT_BASE;
+const apiBase = process.env.C10_API_BASE;
+const svcToken = process.env.C10_SVC_TOKEN;
+const studentPwd = process.env.C10_STUDENT_PWD;
+
+const apiRes = await fetch(`${clientBase}/api.js`);
+if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status} loading api.js`);
+const code = await apiRes.text();
+
+const elements = new Map();
+function makeEl(id = '') {
+  const children = [];
+  return {
+    id,
+    value: '',
+    textContent: '',
+    innerHTML: '',
+    className: '',
+    title: '',
+    disabled: false,
+    dataset: {},
+    style: {},
+    appendChild(c) { children.push(c); return c; },
+    hasChildNodes() { return children.length > 0; },
+    addEventListener() {},
+    querySelectorAll() { return []; },
+  };
+}
+function getEl(id) {
+  if (!elements.has(id)) elements.set(id, makeEl(id));
+  return elements.get(id);
+}
+getEl('apiUrl').value = apiBase;
+getEl('authToken').value = svcToken;
+getEl('webCursorLimit').value = '2';
+getEl('webLoginInput').value = 'student-1';
+getEl('webPasswordInput').value = studentPwd;
+getEl('webGroupIdSelect').value = 'DISC-WEB-01';
+getEl('webPatchTargetGroupSelect').value = 'DISC-DB-01';
+
+const makeStorage = () => {
+  const m = new Map();
+  return {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => m.set(k, String(v)),
+    removeItem: (k) => m.delete(k),
+  };
+};
+
+const corsIssues = [];
+let corsChecked = 0;
+async function browserFetch(url, opts = {}) {
+  const mergedHeaders = { Origin: clientBase, ...(opts.headers || {}) };
+  const res = await fetch(url, { ...opts, headers: mergedHeaders });
+  if (String(url).startsWith(apiBase)) {
+    corsChecked++;
+    const acao = res.headers.get('access-control-allow-origin');
+    if (acao !== clientBase) {
+      corsIssues.push(`${url} [${res.status}] -> acao=${acao}`);
+    }
+  }
+  return res;
+}
+
+const context = {
+  document: {
+    getElementById: getEl,
+    querySelectorAll: () => [],
+    createElement: () => makeEl(),
+    createTextNode: (t) => ({ textContent: String(t) }),
+  },
+  window: { addEventListener() {} },
+  sessionStorage: makeStorage(),
+  localStorage: makeStorage(),
+  fetch: browserFetch,
+  URL,
+  AbortController,
+  setTimeout,
+  clearTimeout,
+  setInterval: () => 0,
+  clearInterval: () => {},
+  console,
+  crypto: globalThis.crypto,
+  performance: globalThis.performance,
+};
+vm.createContext(context);
+vm.runInContext(code, context, { filename: 'http://localhost:3000/api.js' });
+await context.runWebLab3Scenario();
+const logText = getEl('webMainOpResult').textContent;
+const sessionUser = vm.runInContext(
+  "typeof currentWebUser !== 'undefined' && currentWebUser ? currentWebUser.username : null",
+  context
+);
+console.log(JSON.stringify({
+  corsChecked,
+  corsIssues,
+  sessionUser,
+  logText,
+}));
+'@
+
+        $env:C10_CLIENT_BASE = "http://localhost:3000"
+        $env:C10_API_BASE = $BaseUrl
+        $env:C10_SVC_TOKEN = $Token
+        $env:C10_STUDENT_PWD = $studentPassVal
+        try {
+            $nodeOut = ($nodeRunner | node --input-type=module - 2>&1) -join "`n"
+            $nodeExit = $LASTEXITCODE
+        } finally {
+            Remove-Item Env:C10_CLIENT_BASE, Env:C10_API_BASE, Env:C10_SVC_TOKEN, Env:C10_STUDENT_PWD -ErrorAction SilentlyContinue
+        }
+
+        if ($nodeExit -eq 0) {
+            $nodeJson = $nodeOut | ConvertFrom-Json
+            $opLog = [string]$nodeJson.logText
+            $hasAllSteps = ($opLog -match 'Крок 1.*HTTP 401') -and
+                           ($opLog -match 'Крок 2.*HTTP 200') -and
+                           ($opLog -match 'Крок 3.*HTTP 201.*PATCH.*HTTP 200') -and
+                           ($opLog -match 'Крок 4.*HTTP 403') -and
+                           ($opLog -match 'Крок 5.*404.*404') -and
+                           ($opLog -match 'Крок 6.*HTTP 200.*role="staff"') -and
+                           ($opLog -match 'Крок 7.*HTTP 401') -and
+                           ($nodeJson.sessionUser -eq "student-1") -and
+                           ($nodeJson.corsChecked -ge 8) -and
+                           ($nodeJson.corsIssues.Count -eq 0)
+            if ($hasClientMarkup -and $hasAllSteps -and ($clientApiText -match 'getWebAuthHeaders')) {
+                Write-Pass "Web О3.4: Клієнт (:3000/index.html і :3000/api.js) успішно виконав живий 7-кроковий сценарій runWebLab3Scenario() (401 -> login -> 201+PATCH -> 403 -> 404/404 -> staff -> logout/401; CORS перевірено $($nodeJson.corsChecked) разів, збоїв=0)."
+            } else {
+                Write-Fail "Помилка виконання сценарію клієнта Web О3.4: markup=$hasClientMarkup, steps=$hasAllSteps, corsChecked=$($nodeJson.corsChecked), corsIssues=$($nodeJson.corsIssues -join '; '), log=`n$opLog"
+            }
+        } else {
+            Write-Fail "Помилка виконання сценарію Web О3.4 у Node.js:`n$nodeOut"
+        }
+    } else {
+        Write-Fail "Клієнтський сервер http://localhost:3000 недоступний і не зміг бути запущений автоматично."
+    }
+
+    # --------------------------------------------------------------------------
+    # 14. Пункти ЛР3 курсу РПО (О3.1–О3.4): Ray, IN_FLIGHT_LIMIT, dpc_applied_effects, after_effect_before_ack
+    # --------------------------------------------------------------------------
+    Write-Header "14. Курс «РПО» ЛР3: Кластер Ray (О3.1), IN_FLIGHT_LIMIT (О3.2), ідемпотентний ефект (О3.3) та збій до ack (О3.4)"
+
+    # 14.1 О3.1: Стан Ray кластера (ray-head + ray-worker >= 2 вузли), захист /dispatch та виконання заявки через Ray
+    $rayHealth = Invoke-RestMethod -Uri "http://127.0.0.1:8266/health" -Method Get -TimeoutSec 5
+    if ((($rayHealth.ray_connected -eq $true) -or ($rayHealth.status -eq "ok")) -and [int]$rayHealth.alive_nodes -ge 2) {
+        Write-Pass "РПО О3.1: Кластер Ray активний (ray_connected=$($rayHealth.ray_connected), status=$($rayHealth.status), alive_nodes=$($rayHealth.alive_nodes))."
+    } else {
+        Write-Fail "Кластер Ray не готовий або менше 2 вузлів: ray_connected=$($rayHealth.ray_connected), status=$($rayHealth.status), alive_nodes=$($rayHealth.alive_nodes)"
+    }
+
+    $rayDispatchPayload = '{"request_id":"00000000-0000-0000-0000-000000000001","student_id":"student-1","group_id":"DISC-DPC-01"}'
+    $rayDispatchNoAuth = Invoke-WebRequest -Uri "http://127.0.0.1:8266/dispatch" -Method Post -ContentType "application/json" -Body $rayDispatchPayload -SkipHttpErrorCheck
+    $rayDispatchBadSecret = Invoke-WebRequest -Uri "http://127.0.0.1:8266/dispatch" -Method Post -Headers @{ "Authorization" = "Bearer $Token"; "X-Ray-Internal-Secret" = "wrong-secret" } -ContentType "application/json" -Body $rayDispatchPayload -SkipHttpErrorCheck
+    if ([int]$rayDispatchNoAuth.StatusCode -eq 401 -and [int]$rayDispatchBadSecret.StatusCode -eq 403) {
+        Write-Pass "РПО О3.1: Диспетчер Ray (POST /dispatch на 127.0.0.1:8266) захищено службовою автентифікацією (без Bearer: 401, недійсний X-Ray-Internal-Secret: 403)."
+    } else {
+        Write-Fail "Помилка захисту диспетчера Ray /dispatch: noAuth=$([int]$rayDispatchNoAuth.StatusCode), badSecret=$([int]$rayDispatchBadSecret.StatusCode)"
+    }
+
+    $null = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/admin/reset?unsafeMode=false&inFlightLimit=3&slowCallMinMs=100&slowCallMaxMs=150" -Method Post -Headers $Headers
+    $rayReqResp = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"student_id":"student-3","group_id":"DISC-DPC-01"}'
+    $rayReqId = [string]$rayReqResp.id
+    $rayFinal = $null
+    for ($rw = 0; $rw -lt 40; $rw++) {
+        Start-Sleep -Milliseconds 150
+        $rayCheck = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/enrollment-requests/$rayReqId" -Method Get -Headers $Headers
+        if ($rayCheck.status -in @("done", "rejected", "failed")) {
+            $rayFinal = $rayCheck
+            break
+        }
+    }
+    $effRow = (& $DockerExe compose exec -e PGPASSWORD=dpc_password -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT status || '|' || delivery_count || '|' || worker_id FROM dpc_applied_effects WHERE request_id = '$rayReqId';") | Out-String
+    $effRowTrim = $effRow.Trim()
+    if ($null -ne $rayFinal -and $rayFinal.status -eq "done" -and $effRowTrim -match '^done\|1\|ray:') {
+        Write-Pass "РПО О3.1 та О3.3: Заявка $rayReqId виконана у Ray-кластері зі збереженням у dpc_applied_effects ($effRowTrim) та decanate_roster."
+    } else {
+        Write-Fail "Помилка виконання заявки у Ray О3.1/О3.3: status=$($rayFinal.status), effect='$effRowTrim'"
+    }
+
+    # 14.2 О3.2: Обмеження кількості незавершених задач IN_FLIGHT_LIMIT=2
+    $null = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/admin/reset?unsafeMode=false&inFlightLimit=2&slowCallMinMs=250&slowCallMaxMs=300" -Method Post -Headers $Headers
+    $burstIds = [System.Collections.Generic.List[string]]::new()
+    for ($bIdx = 1; $bIdx -le 6; $bIdx++) {
+        $bSt = "student-web-conc-$("{0:D2}" -f $bIdx)"
+        $bResp = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -ContentType "application/json" -Body "{`"student_id`":`"$bSt`",`"group_id`":`"DISC-DPC-01`"}"
+        $burstIds.Add([string]$bResp.id)
+    }
+
+    for ($bw = 0; $bw -lt 60; $bw++) {
+        Start-Sleep -Milliseconds 200
+        $mBurst = Invoke-RestMethod -Uri "$dpcBaseUrl/metrics" -Method Get -Headers $Headers
+        $burstProcessed = [int]$mBurst.counters.total_done + [int]$mBurst.counters.total_rejected
+        if ($burstProcessed -ge 6 -and [int]$mBurst.in_flight -eq 0) { break }
+    }
+    $metricsO32 = Invoke-RestMethod -Uri "$dpcBaseUrl/metrics" -Method Get -Headers $Headers
+    $o32Processed = [int]$metricsO32.counters.total_done + [int]$metricsO32.counters.total_rejected
+    if ([int]$metricsO32.configuration.in_flight_limit -eq 2 -and [int]$metricsO32.max_in_flight_observed -ge 1 -and [int]$metricsO32.max_in_flight_observed -le 2 -and $o32Processed -ge 6) {
+        Write-Pass "РПО О3.2: Обмеження IN_FLIGHT_LIMIT=2 дотримано на 6 одночасних задачах у Ray (max_in_flight_observed=$($metricsO32.max_in_flight_observed), processed=$o32Processed)."
+    } else {
+        Write-Fail "Порушення РПО О3.2 IN_FLIGHT_LIMIT: limit=$($metricsO32.configuration.in_flight_limit), max_observed=$($metricsO32.max_in_flight_observed), processed=$o32Processed"
+    }
+
+    # 14.3 О3.4: Керована відмова /faults/after_effect_before_ack у воркері Ray + автоматичний retry без дублювання ефекту
+    Write-Info "Крок 14.3 (РПО О3.4): Увімкнення FAULTS=on для перевірки /faults/after_effect_before_ack у Ray..."
+    $env:FAULTS = "on"
+    $env:ALLOW_TEST_OVERRIDES = "true"
+    & $DockerExe compose up -d --force-recreate app-a app-b | Out-Null
+    & $DockerExe compose restart nginx | Out-Null
+    Remove-Item Env:FAULTS -ErrorAction SilentlyContinue
+    Remove-Item Env:ALLOW_TEST_OVERRIDES -ErrorAction SilentlyContinue
+
+    for ($w = 0; $w -lt 40; $w++) {
+        Start-Sleep -Milliseconds 300
+        try {
+            $hd = Invoke-RestMethod -Uri "$dpcBaseUrl/health" -Method Get -TimeoutSec 2
+            if ($hd.status -eq "ok") { break }
+        } catch {}
+    }
+
+    $null = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/admin/reset?unsafeMode=false&inFlightLimit=2&slowCallMinMs=30&slowCallMaxMs=60" -Method Post -Headers $Headers
+    $rayFaultHostFile = Join-Path $RepoRoot "faults/after_effect_before_ack"
+    Set-Content -Path $rayFaultHostFile -Value "1" -Encoding UTF8
+    $rayFaultSinceUtc = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    $rayFaultReq = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/enrollment-requests" -Method Post -Headers $Headers -ContentType "application/json" -Body '{"student_id":"student-web-conc-10","group_id":"DISC-DPC-01"}'
+    $rayFaultId = [string]$rayFaultReq.id
+
+    $rayFaultDone = $false
+    for ($fw = 0; $fw -lt 80; $fw++) {
+        Start-Sleep -Milliseconds 250
+        $fChk = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/enrollment-requests/$rayFaultId" -Method Get -Headers $Headers
+        $fMetrics = Invoke-RestMethod -Uri "$dpcBaseUrl/metrics" -Method Get -Headers $Headers
+        $effFaultCheck = ((& $DockerExe compose exec -e PGPASSWORD=dpc_password -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT status || '|' || delivery_count || '|' || (SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = '$rayFaultId') FROM dpc_applied_effects WHERE request_id = '$rayFaultId';") | Out-String).Trim()
+        if ($fChk.status -eq "done" -and [int]$fMetrics.in_flight -eq 0 -and $effFaultCheck -match '^done\|([2-9]\d*)\|1$') {
+            $rayFaultDone = $true
+            break
+        }
+        if ($fChk.status -in @("rejected", "failed")) { break }
+    }
+
+    Start-Sleep -Milliseconds 500
+    $rayLogs = (& $DockerExe compose logs --since $rayFaultSinceUtc ray-head ray-worker 2>&1) -join "`n"
+    $hasRayFaultHit = $rayLogs -match 'fault\.hit' -and $rayLogs -match 'after_effect_before_ack'
+    $rayFlagDeleted = -not (Test-Path $rayFaultHostFile)
+    $effFaultInfo = ((& $DockerExe compose exec -e PGPASSWORD=dpc_password -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT status || '|' || delivery_count || '|' || (SELECT COUNT(*)::INT FROM decanate_roster WHERE request_id = '$rayFaultId') FROM dpc_applied_effects WHERE request_id = '$rayFaultId';") | Out-String).Trim()
+    $dpcGroupSeatsAfterFault = Invoke-RestMethod -Uri "$dpcBaseUrl/v1/group-seats/DISC-DPC-01" -Method Get -Headers $Headers
+
+    if ($rayFaultDone -and $hasRayFaultHit -and $rayFlagDeleted -and $effFaultInfo -match '^done\|([2-9]\d*)\|1$' -and $dpcGroupSeatsAfterFault.invariant_holds -eq $true) {
+        Write-Pass "РПО О3.4: Воркер Ray упав після ефекту до ack (fault.hit зафіксовано, прапорець видалено), задача автоматично повторена (dpc_applied_effects='$effFaultInfo', roster_count=1, invariant_holds=true)."
+    } else {
+        Write-Fail "Помилка РПО О3.4: done=$rayFaultDone, faultLog=$hasRayFaultHit, flagDeleted=$rayFlagDeleted, effFault='$effFaultInfo', invariant=$($dpcGroupSeatsAfterFault.invariant_holds)"
+    }
+
 } finally {
+    Stop-SpawnedClientServer
     Write-Info "Повернення середовища у штатно-захищений режим ALLOW_TEST_OVERRIDES=false..."
     $null = Set-TestOverridesMode -enable $false
     Write-Pass "Захищений режим ALLOW_TEST_OVERRIDES=false успішно відновлено."
 }
 
-Write-Header "РЕЗУЛЬТАТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1 + ЛР2"
+Write-Header "РЕЗУЛЬТАТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1 + ЛР2 + ЛР3"
 if ($script:ErrorCount -eq 0) {
     Write-Host "`n  Всі перевірки пройдено успішно (0 помилок).`n" -ForegroundColor Green
 } else {

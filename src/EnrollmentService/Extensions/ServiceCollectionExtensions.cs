@@ -39,15 +39,18 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<EnrollmentRepository>();
         services.AddSingleton<EnrollmentRequestRepository>();
         services.AddSingleton<DecanateRepository>();
+        services.AddSingleton<AuthRepository>();
         return services;
     }
 
     public static IServiceCollection AddApplicationServices(this IServiceCollection services)
     {
+        services.AddHttpClient();
         services.AddSingleton<EnrollmentService.Services.EnrollmentService>();
         services.AddSingleton<IWebEnrollmentConfirmationService>(sp => sp.GetRequiredService<EnrollmentService.Services.EnrollmentService>());
         services.AddSingleton<IWebEnrollmentNotifier, WebEnrollmentNotifier>();
         services.AddSingleton<ParallelComputeService>();
+        services.AddSingleton<WebAuthService>();
         return services;
     }
 
@@ -55,6 +58,8 @@ public static class ServiceCollectionExtensions
         this IServiceCollection services,
         bool migrateOnly)
     {
+        services.AddSingleton<RayEffectReceiverService>();
+        services.AddSingleton<IRayTaskClient, RayTaskClient>();
         services.AddSingleton<EnrollmentRequestProcessor>();
         services.AddSingleton<IEnrollmentRequestProcessor>(sp => sp.GetRequiredService<EnrollmentRequestProcessor>());
         services.AddSingleton<EnrollmentWorkerPool>();

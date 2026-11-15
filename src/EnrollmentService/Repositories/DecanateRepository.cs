@@ -146,7 +146,7 @@ public sealed class DecanateRepository
         NpgsqlConnection conn,
         CancellationToken cancellationToken = default)
     {
-        await using var cmd = new NpgsqlCommand(@"DELETE FROM decanate_roster;", conn);
+        await using var cmd = new NpgsqlCommand(@"DELETE FROM dpc_applied_effects; DELETE FROM decanate_roster;", conn);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }

@@ -28,6 +28,11 @@ public sealed class EnrollmentWorkerPool : IHostedService
     private readonly CancellationTokenSource _samplerCts = new();
     private readonly ConcurrentDictionary<Guid, byte> _enqueuedItemIds = new();
     private readonly Channel<byte> _replenishSignal = Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly SemaphoreSlim _dequeueGate = new(1, 1);
+    private readonly object _inFlightLock = new();
+    private readonly Queue<TaskCompletionSource<bool>> _inFlightAsyncWaiters = new();
+    private readonly ConcurrentDictionary<Task, byte> _activeInFlightTasks = new();
+    private int _activeInFlightCount;
 
     private Task? _periodicSamplerTask;
     private Task? _replenishmentTask;
@@ -35,6 +40,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
     private int _shutdownInitiated;
 
     public bool IsShuttingDown => _isShuttingDown;
+    public int CurrentInFlightCount { get { lock (_inFlightLock) return _activeInFlightCount; } }
 
     public EnrollmentWorkerPool(
         IBoundedRequestQueue queue,
@@ -244,6 +250,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
         StructuredJsonLogger.LogEvent(_options.InstanceId, "worker_pool_started", new Dictionary<string, object?>
         {
             ["workers"] = _options.Workers,
+            ["in_flight_limit"] = _options.InFlightLimit,
             ["execution_model"] = _options.ExecutionModel,
             ["queue_engine"] = _queue.EngineName,
             ["queue_capacity"] = _queue.Capacity,
@@ -353,6 +360,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
             }
 
             _queue.Complete();
+            NotifyInFlightLimitUpdated();
 
             if (_asyncWorkers.Count > 0)
             {
@@ -365,6 +373,12 @@ public sealed class EnrollmentWorkerPool : IHostedService
                 {
                     thread.Join();
                 }
+            }
+
+            var pendingInFlight = _activeInFlightTasks.Keys.ToArray();
+            if (pendingInFlight.Length > 0)
+            {
+                await Task.WhenAll(pendingInFlight);
             }
 
             _workerEpochCts.Cancel();
@@ -457,52 +471,198 @@ public sealed class EnrollmentWorkerPool : IHostedService
                 thread.Join();
             }
         }
+
+        var pendingInFlight = _activeInFlightTasks.Keys.ToArray();
+        if (pendingInFlight.Length > 0)
+        {
+            await Task.WhenAll(pendingInFlight);
+        }
+    }
+
+    public void NotifyInFlightLimitUpdated()
+    {
+        lock (_inFlightLock)
+        {
+            WakeInFlightWaitersLocked();
+        }
+    }
+
+    private bool TryAcquireInFlightSlotLocked()
+    {
+        int limit = Math.Max(1, _options.InFlightLimit);
+        if (_activeInFlightCount < limit)
+        {
+            _activeInFlightCount++;
+            return true;
+        }
+        return false;
+    }
+
+    private void ReleaseInFlightSlot()
+    {
+        lock (_inFlightLock)
+        {
+            if (_activeInFlightCount > 0)
+            {
+                _activeInFlightCount--;
+            }
+            WakeInFlightWaitersLocked();
+        }
+    }
+
+    private void WakeInFlightWaitersLocked()
+    {
+        int limit = Math.Max(1, _options.InFlightLimit);
+        while (_activeInFlightCount < limit && _inFlightAsyncWaiters.TryDequeue(out var waiter))
+        {
+            waiter.TrySetResult(true);
+        }
+        Monitor.PulseAll(_inFlightLock);
+    }
+
+    private async Task<bool> WaitForInFlightSlotAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            TaskCompletionSource<bool> tcs;
+            lock (_inFlightLock)
+            {
+                if (TryAcquireInFlightSlotLocked())
+                {
+                    return true;
+                }
+                tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _inFlightAsyncWaiters.Enqueue(tcs);
+            }
+
+            using var reg = token.Register(static state => ((TaskCompletionSource<bool>)state!).TrySetCanceled(), tcs);
+            try
+            {
+                await tcs.Task;
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private bool WaitForInFlightSlotBlocking(CancellationToken token)
+    {
+        using var reg = token.Register(() =>
+        {
+            lock (_inFlightLock)
+            {
+                Monitor.PulseAll(_inFlightLock);
+            }
+        });
+
+        lock (_inFlightLock)
+        {
+            while (!TryAcquireInFlightSlotLocked())
+            {
+                if (token.IsCancellationRequested)
+                {
+                    return false;
+                }
+                Monitor.Wait(_inFlightLock, 100);
+            }
+            return true;
+        }
     }
 
     private async Task AsyncTaskWorkerLoopAsync(int workerId, CancellationToken workerToken)
     {
         while (!workerToken.IsCancellationRequested)
         {
+            // Серіалізуємо пару (WaitForInFlightSlot + Dequeue), щоб не утримувати більше 1 очікуючого слота на порожній черзі
+            bool gateAcquired = false;
+            bool slotAcquired = false;
             QueuedRequestItem? item = null;
+
             try
             {
+                await _dequeueGate.WaitAsync(workerToken);
+                gateAcquired = true;
+
+                // РПО О3.2: Спершу отримуємо слот незавершеної задачі IN_FLIGHT_LIMIT;
+                // надлишкові запити залишаються чекати в обмеженій черзі _queue.
+                slotAcquired = await WaitForInFlightSlotAsync(workerToken);
+                if (!slotAcquired)
+                {
+                    break;
+                }
+
                 item = await _queue.DequeueAsync(workerToken);
+                if (item == null)
+                {
+                    ReleaseInFlightSlot();
+                    slotAcquired = false;
+                    break;
+                }
             }
             catch (OperationCanceledException)
             {
-                break;
-            }
-
-            if (item == null)
-            {
-                break;
-            }
-
-            try
-            {
-                if (_processor != null)
+                if (slotAcquired)
                 {
-                    await _processor.ProcessItemAsync(workerId, item, isAsyncModel: true, _queue, workerToken);
+                    ReleaseInFlightSlot();
                 }
-            }
-            catch (OperationCanceledException) when (workerToken.IsCancellationRequested)
-            {
                 break;
             }
-            catch (Exception ex)
+            catch
             {
-                StructuredJsonLogger.LogEvent(_options.InstanceId, "async_worker_loop_exception", new Dictionary<string, object?>
+                if (slotAcquired)
                 {
-                    ["worker_id"] = workerId,
-                    ["request_id"] = item.Id,
-                    ["error"] = ex.Message
-                });
+                    ReleaseInFlightSlot();
+                }
+                throw;
             }
             finally
             {
-                _enqueuedItemIds.TryRemove(item.Id, out _);
-                _replenishSignal.Writer.TryWrite(1);
+                if (gateAcquired)
+                {
+                    _dequeueGate.Release();
+                }
             }
+
+            var inFlightTask = ExecuteAsyncInFlightItemAsync(workerId, item, workerToken);
+            _activeInFlightTasks.TryAdd(inFlightTask, 0);
+            _ = inFlightTask.ContinueWith(
+                static (t, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(t, out _),
+                _activeInFlightTasks,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+    }
+
+    private async Task ExecuteAsyncInFlightItemAsync(int workerId, QueuedRequestItem item, CancellationToken workerToken)
+    {
+        try
+        {
+            if (_processor != null)
+            {
+                await _processor.ProcessItemAsync(workerId, item, isAsyncModel: true, _queue, workerToken);
+            }
+        }
+        catch (OperationCanceledException) when (workerToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            StructuredJsonLogger.LogEvent(_options.InstanceId, "async_worker_loop_exception", new Dictionary<string, object?>
+            {
+                ["worker_id"] = workerId,
+                ["request_id"] = item.Id,
+                ["error"] = ex.Message
+            });
+        }
+        finally
+        {
+            _enqueuedItemIds.TryRemove(item.Id, out _);
+            ReleaseInFlightSlot();
+            _replenishSignal.Writer.TryWrite(1);
         }
     }
 
@@ -510,19 +670,51 @@ public sealed class EnrollmentWorkerPool : IHostedService
     {
         while (!workerToken.IsCancellationRequested)
         {
+            bool gateAcquired = false;
+            bool slotAcquired = false;
             QueuedRequestItem? item = null;
+
             try
             {
+                _dequeueGate.Wait(workerToken);
+                gateAcquired = true;
+
+                slotAcquired = WaitForInFlightSlotBlocking(workerToken);
+                if (!slotAcquired)
+                {
+                    break;
+                }
+
                 item = _queue.DequeueBlocking(workerToken);
+                if (item == null)
+                {
+                    ReleaseInFlightSlot();
+                    slotAcquired = false;
+                    break;
+                }
             }
             catch (OperationCanceledException)
             {
+                if (slotAcquired)
+                {
+                    ReleaseInFlightSlot();
+                }
                 break;
             }
-
-            if (item == null)
+            catch
             {
-                break;
+                if (slotAcquired)
+                {
+                    ReleaseInFlightSlot();
+                }
+                throw;
+            }
+            finally
+            {
+                if (gateAcquired)
+                {
+                    _dequeueGate.Release();
+                }
             }
 
             try
@@ -548,6 +740,7 @@ public sealed class EnrollmentWorkerPool : IHostedService
             finally
             {
                 _enqueuedItemIds.TryRemove(item.Id, out _);
+                ReleaseInFlightSlot();
                 _replenishSignal.Writer.TryWrite(1);
             }
         }

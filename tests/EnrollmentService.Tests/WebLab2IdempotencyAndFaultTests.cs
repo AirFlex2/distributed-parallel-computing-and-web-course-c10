@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using EnrollmentService.Services;
@@ -41,9 +42,11 @@ public sealed partial class E2EHttpEndpointTests
                 ects: 3.0m,
                 dpcSandboxEnabled: false);
 
+            var tokens = new Dictionary<string, string>(totalStudents, StringComparer.Ordinal);
             foreach (var sid in studentIds)
             {
                 await EnsureTestStudentAsync(sid, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
+                tokens[sid] = await IssueFastWebTokenAsync(sid, "user", sid, factoryA);
             }
 
             using var startGate = new ManualResetEventSlim(false);
@@ -52,7 +55,7 @@ public sealed partial class E2EHttpEndpointTests
                 startGate.Wait();
                 var targetClient = (idx % 2 == 0) ? clientA : clientB;
                 using var req = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
-                req.Headers.Add("X-User-Id", sid);
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokens[sid]);
                 req.Headers.Add("Idempotency-Key", $"idem-o21-{sid}");
                 req.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
                 return await targetClient.SendAsync(req);
@@ -151,13 +154,25 @@ public sealed partial class E2EHttpEndpointTests
                 await seedCmd.ExecuteNonQueryAsync();
             }
 
+            var tokens = studentIds.ToDictionary(sid => sid, _ => WebAuthService.GenerateOpaqueToken(), StringComparer.Ordinal);
+            await using (var connTok = await TestEnvironment.OpenConnectionAsync())
+            {
+                await using var tokCmd = new NpgsqlCommand(@"
+                    INSERT INTO web_auth_tokens (token_hash, user_id, username, role, student_id, created_at, expires_at, revoked_at)
+                    SELECT h, u, u, 'user', u, NOW(), NOW() + INTERVAL '2 hours', NULL
+                    FROM UNNEST(@hashes, @users) AS t(h, u);", connTok);
+                tokCmd.Parameters.AddWithValue("hashes", studentIds.Select(sid => WebAuthService.HashToken(tokens[sid])).ToArray());
+                tokCmd.Parameters.AddWithValue("users", studentIds);
+                await tokCmd.ExecuteNonQueryAsync();
+            }
+
             using var startGate = new ManualResetEventSlim(false);
             var tasks = studentIds.Select((sid, idx) => Task.Run(async () =>
             {
                 startGate.Wait();
                 var targetClient = (idx % 2 == 0) ? clientA : clientB;
                 using var req = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
-                req.Headers.Add("X-User-Id", sid);
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokens[sid]);
                 req.Headers.Add("Idempotency-Key", $"idem-o21-500-{sid}");
                 req.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
                 return await targetClient.SendAsync(req);
@@ -230,9 +245,11 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, 5, 0, 0.0m);
             await EnsureTestGroupAsync(groupId, discId, 10, 10, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(2), 4.0m);
 
+            string webToken = await LoginWebAsync(clientA, studentId);
+            clientB.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", webToken);
+
             // 1. Перший запит на примірник app-a
             using var req1 = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
-            req1.Headers.Add("X-User-Id", studentId);
             req1.Headers.Add("Idempotency-Key", idemKey);
             req1.Content = new StringContent($"{{  \"group_id\" : \"{groupId}\"  }}", Encoding.UTF8, "application/json");
 
@@ -246,14 +263,12 @@ public sealed partial class E2EHttpEndpointTests
 
             // 2. Підтверджуємо запис (status стає "confirmed", version стає 2)
             using var confirmReq = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/confirm");
-            confirmReq.Headers.Add("X-User-Id", studentId);
             using var confirmResp = await clientA.SendAsync(confirmReq);
             Assert.Equal(HttpStatusCode.OK, confirmResp.StatusCode);
 
             // 3. Повторне надсилання POST /v1/enrollments із тим самим Idempotency-Key на ІНШИЙ примірник (app-b)
             // має повернути збережену ПОЧАТКОВУ відповідь (201 Created, status="held", version=1, instance_id="app-a")!
             using var req2 = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
-            req2.Headers.Add("X-User-Id", studentId);
             req2.Headers.Add("Idempotency-Key", idemKey);
             req2.Content = new StringContent($"{{\"group_id\":\"{groupId}\"}}", Encoding.UTF8, "application/json");
 
@@ -291,6 +306,7 @@ public sealed partial class E2EHttpEndpointTests
         {
             await EnsureTestStudentAsync(studentId, 5, 0, 0.0m);
             await EnsureTestGroupAsync(groupId, discId, 10, 10, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(2), 3.0m);
+            await LoginWebAsync(client, studentId);
 
             string fingerprint = EnrollmentDomainRules.ComputeWebEnrollmentFingerprint(studentId, groupId);
 
@@ -317,7 +333,6 @@ public sealed partial class E2EHttpEndpointTests
             // Поки ключ перебуває у стані 'processing', конкуруючий запит отримує 409 Conflict (idempotency_key_in_progress)
             using (var reqInFlight = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments"))
             {
-                reqInFlight.Headers.Add("X-User-Id", studentId);
                 reqInFlight.Headers.Add("Idempotency-Key", idemKey);
                 reqInFlight.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
 
@@ -340,7 +355,6 @@ public sealed partial class E2EHttpEndpointTests
             // Після завершення першої операції повтор повертає 201 Created
             using (var reqCompleted = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments"))
             {
-                reqCompleted.Headers.Add("X-User-Id", studentId);
                 reqCompleted.Headers.Add("Idempotency-Key", idemKey);
                 reqCompleted.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
 
@@ -450,6 +464,9 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, 5, 0, 0.0m);
             await EnsureTestGroupAsync(groupId, discId, 10, 10, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(2), 5.0m);
 
+            string webToken = await LoginWebAsync(clientA, studentId);
+            clientB.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", webToken);
+
             // Активуємо одноразовий прапорець /faults/after_commit_before_response
             await File.WriteAllTextAsync(flagFile, "1");
 
@@ -465,7 +482,6 @@ public sealed partial class E2EHttpEndpointTests
             try
             {
                 using var req1 = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
-                req1.Headers.Add("X-User-Id", studentId);
                 req1.Headers.Add("Idempotency-Key", idemKey);
                 req1.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
 
@@ -496,7 +512,6 @@ public sealed partial class E2EHttpEndpointTests
             // Клієнт повторює запит із ТИМ САМИМ Idempotency-Key на примірник app-b:
             // отримує збережений 201 Created без повторного списання місця!
             using var reqRetry = new HttpRequestMessage(HttpMethod.Post, "/v1/enrollments");
-            reqRetry.Headers.Add("X-User-Id", studentId);
             reqRetry.Headers.Add("Idempotency-Key", idemKey);
             reqRetry.Content = new StringContent(JsonSerializer.Serialize(new { group_id = groupId }), Encoding.UTF8, "application/json");
 

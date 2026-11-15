@@ -9,13 +9,18 @@ public static class GroupEndpoints
 {
     public static IEndpointRouteBuilder MapGroupEndpoints(this IEndpointRouteBuilder app)
     {
-        // Закриття запису на групу працівником деканату (Web С10)
+        // Закриття запису на групу працівником деканату (Web С10, О3.2: виключно роль 'staff')
         app.MapPost("/v1/groups/{id}/close", async (
             string id,
             HttpContext ctx,
             GroupRepository groupRepo,
             ServiceOptions opts) =>
         {
+            if (!RequestIdentity.TryRequireStaffRole(ctx, opts, out _, out var roleProblem))
+            {
+                return roleProblem!;
+            }
+
             var group = await groupRepo.CloseGroupAsync(id, ctx.RequestAborted);
             if (group == null)
             {

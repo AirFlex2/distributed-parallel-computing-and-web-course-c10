@@ -173,8 +173,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestGroupAsync(groupId2, discId2, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
             // Створюємо Web-запис у групі 1
-            var webClient = _factory.CreateClient();
-            webClient.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var webClient = await CreateAuthenticatedWebClientAsync(studentId);
             webClient.DefaultRequestHeaders.Add("Idempotency-Key", $"web-idem-{Guid.NewGuid():N}");
 
             var webResp = await webClient.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId1}\"}}", Encoding.UTF8, "application/json"));
@@ -254,8 +253,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
             // Створюємо Web-запис для student1
-            var webClient = _factory.CreateClient();
-            webClient.DefaultRequestHeaders.Add("X-User-Id", student1);
+            var webClient = await CreateAuthenticatedWebClientAsync(student1);
             webClient.DefaultRequestHeaders.Add("Idempotency-Key", $"web-idem-{Guid.NewGuid():N}");
 
             var webContent = new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json");
@@ -322,8 +320,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var webClient = _factory.CreateClient();
-            webClient.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var webClient = await CreateAuthenticatedWebClientAsync(studentId);
             webClient.DefaultRequestHeaders.Add("Idempotency-Key", $"web-idem-{Guid.NewGuid():N}");
 
             var webResp = await webClient.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -390,8 +387,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var webClient = _factory.CreateClient();
-            webClient.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var webClient = await CreateAuthenticatedWebClientAsync(studentId);
             webClient.DefaultRequestHeaders.Add("Idempotency-Key", $"web-idem-{Guid.NewGuid():N}");
 
             var webResp = await webClient.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -592,8 +588,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
@@ -648,8 +643,7 @@ public sealed partial class E2EHttpEndpointTests
             await EnsureTestStudentAsync(studentId, maxDisciplines: 5, activeCount: 0, activeEcts: 0.0m);
             await EnsureTestGroupAsync(groupId, discId, seats: 5, available: 5, opensAt: DateTimeOffset.UtcNow.AddDays(-1), closesAt: DateTimeOffset.UtcNow.AddDays(1), dpcSandboxEnabled: true);
 
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
             client.DefaultRequestHeaders.Add("Idempotency-Key", $"ik-web-{Guid.NewGuid():N}");
 
             // 1. Web створює held-запис (місце у групі 5 -> 4, student activeCount 0 -> 1)
@@ -899,8 +893,7 @@ public sealed partial class E2EHttpEndpointTests
             }
 
             // 4. Студент надсилає прямий HTTP-запит POST /v1/enrollments/{id}/confirm
-            var client = _factory.CreateClient();
-            client.DefaultRequestHeaders.Add("X-User-Id", studentId);
+            var client = await CreateAuthenticatedWebClientAsync(studentId);
 
             var confirmResp = await client.PostAsync($"/v1/enrollments/{heldEnrollmentId}/confirm", null);
             Assert.Equal(HttpStatusCode.OK, confirmResp.StatusCode);

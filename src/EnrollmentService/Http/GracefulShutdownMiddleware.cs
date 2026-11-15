@@ -24,7 +24,8 @@ public sealed class GracefulShutdownMiddleware
         if (_workerPool.IsShuttingDown
             && !HttpMethods.IsGet(context.Request.Method)
             && !HttpMethods.IsHead(context.Request.Method)
-            && !HttpMethods.IsOptions(context.Request.Method))
+            && !HttpMethods.IsOptions(context.Request.Method)
+            && !context.Request.Path.StartsWithSegments("/v1/internal/ray-effect-receiver", StringComparison.OrdinalIgnoreCase))
         {
             await ProblemDetailsMapper.WriteProblemResponseAsync(
                 context, _options,

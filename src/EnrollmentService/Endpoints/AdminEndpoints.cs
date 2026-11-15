@@ -2,6 +2,7 @@ using EnrollmentService.Http;
 using EnrollmentService.Metrics;
 using EnrollmentService.Queues;
 using EnrollmentService.Repositories;
+using EnrollmentService.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 
@@ -16,9 +17,13 @@ public static class AdminEndpoints
             HttpContext ctx,
             [FromQuery] bool? unsafeMode,
             [FromQuery] bool? metricsOnly,
+            [FromQuery] int? inFlightLimit,
+            [FromQuery] int? slowCallMinMs,
+            [FromQuery] int? slowCallMaxMs,
             ServiceOptions opts,
             MetricsCollector metrics,
             IBoundedRequestQueue queue,
+            EnrollmentWorkerPool workerPool,
             IDbConnectionFactory connectionFactory,
             GroupRepository groupRepo,
             EnrollmentRepository enrollmentRepo,
@@ -55,6 +60,25 @@ public static class AdminEndpoints
             for (int waitIdx = 0; waitIdx < 40 && metrics.InProcessingCount > 0; waitIdx++)
             {
                 await Task.Delay(25);
+            }
+
+            if (opts.AllowTestOverrides)
+            {
+                if (inFlightLimit.HasValue && inFlightLimit.Value > 0)
+                {
+                    opts.InFlightLimit = inFlightLimit.Value;
+                    workerPool.NotifyInFlightLimitUpdated();
+                }
+
+                if (slowCallMinMs.HasValue && slowCallMinMs.Value >= 0)
+                {
+                    opts.SlowCallMinMs = slowCallMinMs.Value;
+                }
+
+                if (slowCallMaxMs.HasValue && slowCallMaxMs.Value >= opts.SlowCallMinMs)
+                {
+                    opts.SlowCallMaxMs = slowCallMaxMs.Value;
+                }
             }
 
             await using (var conn = await connectionFactory.OpenConnectionAsync())
