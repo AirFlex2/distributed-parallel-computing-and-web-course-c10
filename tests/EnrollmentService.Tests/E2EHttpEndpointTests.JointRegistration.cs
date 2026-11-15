@@ -312,6 +312,7 @@ public sealed partial class E2EHttpEndpointTests
         string studentId = "student-e2e-joint-ac";
         string groupId = "GRP-E2E-JOINT-AC";
         string discId = "DISC-E2E-JOINT-AC";
+        Guid? regRequestId = null;
         Guid? createdRequestId = null;
 
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
@@ -329,14 +330,32 @@ public sealed partial class E2EHttpEndpointTests
             using var webDoc = JsonDocument.Parse(webJson);
             Guid heldEnrollmentId = Guid.Parse(webDoc.RootElement.GetProperty("id").GetString()!);
 
-            // Підтверджуємо запис через Web (held -> confirmed)
-            var confResp = await webClient.PostAsync($"/v1/enrollments/{heldEnrollmentId}/confirm", null);
-            Assert.Equal(HttpStatusCode.OK, confResp.StatusCode);
-
-            // Тепер передаємо цей вже підтверджений запис у DPC
             var dpcClient = _factory.CreateClient();
             dpcClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
 
+            // Підтверджуємо запис через штатний маршрут РПО (POST /registrations -> decanate_roster -> confirmed)
+            var regResp = await webClient.PostAsync($"/v1/enrollments/{heldEnrollmentId}/registrations", null);
+            Assert.Equal(HttpStatusCode.Accepted, regResp.StatusCode);
+            using var regDoc = JsonDocument.Parse(await regResp.Content.ReadAsStringAsync());
+            regRequestId = Guid.Parse(regDoc.RootElement.GetProperty("id").GetString()!);
+
+            await WaitForTerminalStatusAsync(dpcClient, regRequestId.Value);
+
+            string? confirmedStatus = null;
+            for (int i = 0; i < 40; i++)
+            {
+                var getResp = await webClient.GetAsync($"/v1/enrollments/{heldEnrollmentId}");
+                if (getResp.StatusCode == HttpStatusCode.OK)
+                {
+                    using var getDoc = JsonDocument.Parse(await getResp.Content.ReadAsStringAsync());
+                    confirmedStatus = getDoc.RootElement.GetProperty("status").GetString();
+                    if (confirmedStatus == "confirmed") break;
+                }
+                await Task.Delay(50);
+            }
+            Assert.Equal("confirmed", confirmedStatus);
+
+            // Тепер передаємо цей вже підтверджений запис у DPC
             var dpcResp = await dpcClient.PostAsync("/v1/enrollment-requests", new StringContent(
                 JsonSerializer.Serialize(new
                 {
@@ -368,6 +387,10 @@ public sealed partial class E2EHttpEndpointTests
         finally
         {
             await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, createdRequestId);
+            if (regRequestId.HasValue)
+            {
+                await TestEnvironment.CleanupTestDataAsync(null, null, null, regRequestId);
+            }
         }
     }
 
@@ -580,6 +603,7 @@ public sealed partial class E2EHttpEndpointTests
         string studentId = "stud-reg-already-conf";
         string groupId = "GRP-REG-ALREADY-CONF";
         string discId = "DISC-REG-ALREADY-CONF";
+        Guid? regRequestId = null;
 
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
 
@@ -593,15 +617,36 @@ public sealed partial class E2EHttpEndpointTests
 
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
             Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            client.DefaultRequestHeaders.Remove("Idempotency-Key");
             var postJson = await postResp.Content.ReadAsStringAsync();
             using var postDoc = JsonDocument.Parse(postJson);
             Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);
 
-            // Пряме підтвердження студентом через POST /confirm (Web О1.1: held -> confirmed)
-            var confResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/confirm", null);
-            Assert.Equal(HttpStatusCode.OK, confResp.StatusCode);
+            // Перша реєстрація у відомості деканату через чергу РПО (held -> done -> confirmed)
+            var firstRegResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/registrations", null);
+            Assert.Equal(HttpStatusCode.Accepted, firstRegResp.StatusCode);
+            using var firstRegDoc = JsonDocument.Parse(await firstRegResp.Content.ReadAsStringAsync());
+            regRequestId = Guid.Parse(firstRegDoc.RootElement.GetProperty("id").GetString()!);
 
-            // Спроба відправити вже підтверджений запис до черги РПО decanate_roster
+            var dpcClient = _factory.CreateClient();
+            dpcClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
+            await WaitForTerminalStatusAsync(dpcClient, regRequestId.Value);
+
+            string? webStatus = null;
+            for (int i = 0; i < 40; i++)
+            {
+                var getResp = await client.GetAsync($"/v1/enrollments/{enrollmentId}");
+                if (getResp.StatusCode == HttpStatusCode.OK)
+                {
+                    using var getDoc = JsonDocument.Parse(await getResp.Content.ReadAsStringAsync());
+                    webStatus = getDoc.RootElement.GetProperty("status").GetString();
+                    if (webStatus == "confirmed") break;
+                }
+                await Task.Delay(50);
+            }
+            Assert.Equal("confirmed", webStatus);
+
+            // Повторна спроба відправити вже підтверджений запис до черги РПО decanate_roster
             var regResp = await client.PostAsync($"/v1/enrollments/{enrollmentId}/registrations", null);
             Assert.Equal(HttpStatusCode.Conflict, regResp.StatusCode);
             var regErrJson = await regResp.Content.ReadAsStringAsync();
@@ -610,7 +655,7 @@ public sealed partial class E2EHttpEndpointTests
         }
         finally
         {
-            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, regRequestId);
         }
     }
 
@@ -649,6 +694,7 @@ public sealed partial class E2EHttpEndpointTests
             // 1. Web створює held-запис (місце у групі 5 -> 4, student activeCount 0 -> 1)
             var postResp = await client.PostAsync("/v1/enrollments", new StringContent($"{{\"group_id\": \"{groupId}\"}}", Encoding.UTF8, "application/json"));
             Assert.Equal(HttpStatusCode.Created, postResp.StatusCode);
+            client.DefaultRequestHeaders.Remove("Idempotency-Key");
             var postJson = await postResp.Content.ReadAsStringAsync();
             using var postDoc = JsonDocument.Parse(postJson);
             Guid enrollmentId = Guid.Parse(postDoc.RootElement.GetProperty("id").GetString()!);

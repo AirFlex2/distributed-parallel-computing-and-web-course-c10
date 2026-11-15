@@ -56,7 +56,7 @@ flowchart LR
 | **Auth / Web ЛР3** | `POST /v1/auth/login`, `POST /v1/auth/logout`, `GET /v1/me` | Вхід за `username`/`password`, спільна сесія в БД (`app-a`/`app-b`), негайне відкликання токена `wbt_...` |
 | **Каталог Web C10** | `GET /v1/disciplines`, `GET /v1/students`, `GET /v1/students/{id}` | Каталог із Base64-курсором; картка та список студентів із фільтрацією власника/`staff` |
 | **Записи Web C10** | `POST/GET /v1/enrollments`, `GET/PATCH /v1/enrollments/{id}` | Резервування (`held`, `Idempotency-Key`), читання (`404`-паритет), переведення групи (перевірка `If-Match`/`ETag` за наявності заголовка) |
-| **Дії над записом** | `POST .../confirm`, `.../cancel`, `.../registrations` | Підтвердження, скасування або передача попередньо зарезервованого запису (`held`) у чергу РПО |
+| **Дії над записом** | `POST .../registrations`, `.../confirm`, `.../cancel` | Передача `held` у чергу РПО, підтвердження за наявності запису в `decanate_roster` (`409 roster_registration_required` без нього) або скасування |
 | **Персонал (Staff)** | `POST /v1/groups/{id}/close` | Закриття групи персоналом деканату (`403` для ролі `user`) |
 | **Черга та інваріант** | `POST/GET /v1/enrollment-requests`, `GET /v1/group-seats`, `GET /v1/decanate-roster` | Черга РПО (`202`/`429`), опитування з `first_read_at`, інваріант місць, відомість деканату |
 | **Обчислення та службові** | `POST /v1/compute`, `GET /health`, `GET /metrics`, `/v1/internal/ray-effect-receiver`, `/v1/admin/reset` | Інтегрування в процесах ОС, стан вузлів, закон Літтла + `in_flight`, приймач Ray, тестове скидання |
@@ -124,7 +124,7 @@ flowchart LR
 | **Web О1.7** | `client/index.html`, `client/api.js` | Браузерний клієнт JS ES6+ безпечно ігнорує зайві поля сервера |
 | **Web Д1.1** | `Domain/EnrollmentDomainRules.cs`, `tests/EnrollmentService.Tests/` | Чиста функція `EnrollmentDomainRules.IsWithinEnrollmentWindow` перевірена unit-тестами xUnit |
 | **Web Д1.2** | `client/api.js`, `client/serve.mjs` | Окремий клієнтський стек на JavaScript (`:3000`) без фреймворків |
-| **Web Д1.3** | `Domain/EnrollmentDomainRules.cs`, `Repositories/EnrollmentRepository.cs` | Точне зберігання `NUMERIC(3,1)` / `decimal` ЄКТС без похибки `float` |
+| **Web Д1.3** | `tests/EnrollmentService.Tests/BusinessErrorStatusTests.cs`, `Http/ProblemDetailsMapper.cs` | Правило RFC 9457 перетворено на автоматичний тест: помилки повертають `application/problem+json` з полями `type`, `title`, `status`, `detail` |
 | **Web Д1.4** | `Http/RequestIdentityMiddleware.cs`, `Services/StructuredJsonLogger.cs` | W3C `traceparent` -> `X-Trace-Id`, структуровані JSON-логи |
 | **Web Д1.5** | `Domain/EnrollmentDomainRules.cs`, `Services/EnrollmentService.cs` | Перевірка розкладу в `Europe/Kyiv`, зберігання міток у UTC |
 | **Web О2.1** | `Repositories/EnrollmentRepository.cs`, `compose.yaml` | 45 конкурентних запитів на `app-a`/`app-b`: `25×201`, `20×409`, `available=0` |
@@ -133,7 +133,7 @@ flowchart LR
 | **Web О2.4** | `client/api.js` | `AbortController` таймаут, backoff + jitter, дотримання `Retry-After` |
 | **Web О3.1** | `Services/WebAuthService.cs`, `Repositories/AuthRepository.cs`, `Http/RequestIdentityMiddleware.cs` | `PBKDF2-SHA256`, непрозорі токени `wbt_...`, спільна сесія та миттєвий `logout` на `app-a`/`app-b`, ігнорування `X-User-Id`, розділення з `API_AUTH_TOKEN` |
 | **Web О3.2** | `Endpoints/EnrollmentEndpoints.cs`, `Endpoints/GroupEndpoints.cs`, `Repositories/EnrollmentRepository.cs` | Фільтрація за власником, однаковий `404`, `PATCH` (перевірка `If-Match`/`ETag` за наявності заголовка), `422` при підміні полів у тілі, `staff`-захист `/close` (`403` для `user`) |
-| **Web О3.3** | `Extensions/ServiceCollectionExtensions.cs`, `Program.cs` | Явний `CORS_ALLOWED_ORIGINS` без `*`, `Vary: Origin`, облік `OPTIONS` |
+| **Web О3.3** | `Extensions/ServiceCollectionExtensions.cs`, `Program.cs`, `client/api.js` | Web Bearer-токен зберігається в `sessionStorage`, передається через заголовок `Authorization` і видаляється при `logout`; CORS дозволяє лише явно задані origin (`*` заборонено), `Vary: Origin`, облік `OPTIONS` |
 | **Web О3.4** | `client/index.html`, `client/api.js` | Живе виконання 7 кроків `runWebLab3Scenario()` на `:3000` (`23` CORS-перевірки, `0` збоїв) |
 
 ### 6.2 Курс «Розподілені та паралельні обчислення» (РПО)
@@ -187,7 +187,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify_all.ps1
 
 | Експеримент / Перевірка | Зафіксований результат |
 | :--- | :--- |
-| **OpenAPI та xUnit** | Spectral CLI: `0` помилок / `0` попереджень; `dotnet test`: `206/206` (`Passed=206, Failed=0, Skipped=0`) |
+| **OpenAPI та xUnit** | Spectral CLI: `0` помилок / `0` попереджень; `dotnet test`: `207/207` (`Passed=207, Failed=0, Skipped=0`) |
 | **РПО О1.4 (SAFE vs UNSAFE)** | Контрольний прогін `verify_all.ps1`: SAFE `5/5` (`done=5, rejected=15`), UNSAFE `11/5` (серія прогонів: `7–11/5`) |
 | **Вибірка `N=500` (`empirical_metrics_500.json`)** | `done=150`, `rejected=350`, `failed=0`, `monotonic_order_violations=0`; `POST 202` p50 `3.2` мс / p95 `79.6` мс |
 | **Web О2.1–О2.4 (конкуренція та ідемпотентність)** | 45 одночасних запитів на `app-a`/`app-b`: `25×201 + 20×409` (`available=0, taken=25/25`); повтор після збою без дубля |

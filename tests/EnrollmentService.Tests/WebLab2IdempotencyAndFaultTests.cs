@@ -233,11 +233,14 @@ public sealed partial class E2EHttpEndpointTests
         string groupId = $"GRP-E2E-O22-ORIG-{Guid.NewGuid():N}"[..28];
         string discId = $"DISC-E2E-O22-ORIG-{Guid.NewGuid():N}"[..28];
         string idemKey = $"idem-o22-orig-{Guid.NewGuid():N}";
+        Guid? regRequestId = null;
 
         using var factoryA = _factory.WithWebHostBuilder(b => b.UseSetting("INSTANCE_ID", "app-a"));
         using var factoryB = _factory.WithWebHostBuilder(b => b.UseSetting("INSTANCE_ID", "app-b"));
         using var clientA = factoryA.CreateClient();
         using var clientB = factoryB.CreateClient();
+        using var dpcClientA = factoryA.CreateClient();
+        dpcClientA.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", TestEnvironment.ApiAuthToken);
 
         await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
         try
@@ -261,10 +264,28 @@ public sealed partial class E2EHttpEndpointTests
             Assert.Equal(1, doc1.RootElement.GetProperty("version").GetInt32());
             Assert.Equal("app-a", doc1.RootElement.GetProperty("instance_id").GetString());
 
-            // 2. Підтверджуємо запис (status стає "confirmed", version стає 2)
-            using var confirmReq = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/confirm");
-            using var confirmResp = await clientA.SendAsync(confirmReq);
-            Assert.Equal(HttpStatusCode.OK, confirmResp.StatusCode);
+            // 2. Реєструємо запис через чергу РПО (POST /registrations -> done -> status стає "confirmed", version стає 2)
+            using var regReq = new HttpRequestMessage(HttpMethod.Post, $"/v1/enrollments/{enrollmentId}/registrations");
+            using var regResp = await clientA.SendAsync(regReq);
+            Assert.Equal(HttpStatusCode.Accepted, regResp.StatusCode);
+            using var regDoc = JsonDocument.Parse(await regResp.Content.ReadAsStringAsync());
+            regRequestId = Guid.Parse(regDoc.RootElement.GetProperty("id").GetString()!);
+
+            await WaitForTerminalStatusAsync(dpcClientA, regRequestId.Value);
+
+            string? webStatus = null;
+            for (int i = 0; i < 40; i++)
+            {
+                using var getResp = await clientA.GetAsync($"/v1/enrollments/{enrollmentId}");
+                if (getResp.StatusCode == HttpStatusCode.OK)
+                {
+                    using var getDoc = JsonDocument.Parse(await getResp.Content.ReadAsStringAsync());
+                    webStatus = getDoc.RootElement.GetProperty("status").GetString();
+                    if (webStatus == "confirmed") break;
+                }
+                await Task.Delay(50);
+            }
+            Assert.Equal("confirmed", webStatus);
 
             // 3. Повторне надсилання POST /v1/enrollments із тим самим Idempotency-Key на ІНШИЙ примірник (app-b)
             // має повернути збережену ПОЧАТКОВУ відповідь (201 Created, status="held", version=1, instance_id="app-a")!
@@ -284,7 +305,7 @@ public sealed partial class E2EHttpEndpointTests
         }
         finally
         {
-            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId);
+            await TestEnvironment.CleanupTestDataAsync(studentId, groupId, discId, regRequestId);
         }
     }
 

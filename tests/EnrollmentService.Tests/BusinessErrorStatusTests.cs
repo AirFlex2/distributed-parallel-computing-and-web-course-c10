@@ -36,8 +36,15 @@ public sealed class BusinessErrorStatusTests
         var statusResult = Assert.IsAssignableFrom<IStatusCodeHttpResult>(problem);
         Assert.Equal(StatusCodes.Status400BadRequest, statusResult.StatusCode);
 
+        var contentTypeResult = Assert.IsAssignableFrom<IContentTypeHttpResult>(problem);
+        Assert.Equal("application/problem+json", contentTypeResult.ContentType);
+
         var valueResult = Assert.IsAssignableFrom<IValueHttpResult>(problem);
         var details = Assert.IsAssignableFrom<Microsoft.AspNetCore.Mvc.ProblemDetails>(valueResult.Value);
+        Assert.False(string.IsNullOrWhiteSpace(details.Type));
+        Assert.False(string.IsNullOrWhiteSpace(details.Title));
+        Assert.Equal(StatusCodes.Status400BadRequest, details.Status);
+        Assert.False(string.IsNullOrWhiteSpace(details.Detail));
         Assert.Equal("invalid_json_syntax", details.Extensions["error_code"]?.ToString());
     }
 

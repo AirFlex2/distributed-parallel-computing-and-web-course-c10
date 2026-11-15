@@ -11,7 +11,7 @@
 ```mermaid
 stateDiagram-v2
     [*] --> held: POST /v1/enrollments (expires_at = now + 15 хв)
-    held --> confirmed: POST /confirm або сповіщення від РПО (POST /registrations)
+    held --> confirmed: Запис у decanate_roster через РПО (POST /registrations) або POST /confirm після фіксації
     held --> cancelled: POST /cancel (місце повертається у групу)
     held --> expired: Фонове/ліниве прострочення після expires_at
     confirmed --> [*]
@@ -22,7 +22,7 @@ stateDiagram-v2
 | Початковий стан | Подія (HTTP-запит) | Кінцевий стан | Версія | Вплив на `available` і ліміти |
 | :--- | :--- | :--- | :--- | :--- |
 | *(новий)* | `POST /v1/enrollments` | `held` | `v = 1` | `available - 1`, `active_count + 1`, `active_ects + ects` |
-| `held` | `POST /v1/enrollments/{id}/confirm` | `confirmed` | `v + 1` | Без змін (вже зарезервовано) |
+| `held` (у відомості `decanate_roster`) | `POST /v1/enrollments/{id}/confirm` | `confirmed` | `v + 1` | Без змін; без запису в `decanate_roster` повертає `409 roster_registration_required` |
 | `held` | `POST /v1/enrollments/{id}/registrations` | `confirmed` | `v + 1` | Без змін; РПО створює запис у `decanate_roster` і сповіщає Web |
 | `held` | `PATCH /v1/enrollments/{id}` (`If-Match`) | `held` | `v + 1` | Переносить бронь у нову групу, перевіряє ліміти та коригує `active_ects` |
 | `held` | `POST /v1/enrollments/{id}/cancel` | `cancelled` | `v + 1` | `available + 1`, `active_count - 1`, `active_ects - ects` |

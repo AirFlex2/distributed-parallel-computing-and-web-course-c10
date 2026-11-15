@@ -273,8 +273,8 @@ if ($total -eq 0) {
 if ($testExit -eq 0 -and
     $failed -eq 0 -and
     $skipped -eq 0 -and
-    $passed -ge 206 -and
-    $total -ge 206) {
+    $passed -ge 207 -and
+    $total -ge 207) {
     Write-Pass "Модульні, інтеграційні та E2E-тести: УСІ ПРОЙДЕНО (Статистика: Passed=$passed, Failed=$failed, Skipped=$skipped, Total=$total)"
 } else {
     if ($skipped -gt 0) {
@@ -1157,17 +1157,38 @@ try {
         Write-Fail "Помилка сторінки 1 записів enrollments: count=$($enrPage1.items.Count), next_cursor=$($enrPage1.next_cursor)"
     }
 
-    # 10.11 Підтвердження запису (held -> confirmed) та ідемпотентність (О1.1 Web)
-    $confirmedResp = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId/confirm" -Method Post -Headers $webHeadersStudent1
-    if ($confirmedResp.status -eq "confirmed") {
-        Write-Pass "Web О1.1: Підтверджено попередній запис (held -> confirmed): отримано статус 'confirmed'"
+    # 10.11 Підтвердження запису: без decanate_roster -> 409 roster_registration_required; через /registrations -> done -> confirmed та ідемпотентний /confirm (О1.1 Web)
+    $unrosteredConfirmRes = Invoke-WebRequest -Uri "$BaseUrl/v1/enrollments/$heldId/confirm" -Method Post -Headers $webHeadersStudent1 -SkipHttpErrorCheck
+    $unrosteredConfirmJson = (Get-ResponseText $unrosteredConfirmRes) | ConvertFrom-Json
+    $heldAfterDeniedConfirm = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId" -Method Get -Headers $webHeadersStudent1
+    if ([int]$unrosteredConfirmRes.StatusCode -eq 409 -and $unrosteredConfirmJson.error_code -eq "roster_registration_required" -and $heldAfterDeniedConfirm.status -eq "held" -and $heldAfterDeniedConfirm.version -eq 1) {
+        Write-Pass "Web О1.1: /confirm без запису в decanate_roster відхилено з HTTP 409 (roster_registration_required), статус 'held' і версія (v1) збережені"
     } else {
-        Write-Fail "Очікувався статус confirmed, отримано: $($confirmedResp.status)"
+        Write-Fail "Очікувався 409 roster_registration_required при /confirm без відомості, отримано: HTTP=$([int]$unrosteredConfirmRes.StatusCode), error_code=$($unrosteredConfirmJson.error_code), status=$($heldAfterDeniedConfirm.status), v=$($heldAfterDeniedConfirm.version)"
+    }
+
+    $regHeldRes = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId/registrations" -Method Post -Headers $webHeadersStudent1
+    $regHeldReqId = [string]$regHeldRes.id
+    for ($hw = 0; $hw -lt 40; $hw++) {
+        Start-Sleep -Milliseconds 150
+        $regHeldStatus = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$regHeldReqId" -Method Get -Headers $Headers
+        if ($regHeldStatus.status -in @("done", "rejected", "failed")) { break }
+    }
+    $confirmedResp = $null
+    for ($cw = 0; $cw -lt 20; $cw++) {
+        $confirmedResp = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId" -Method Get -Headers $webHeadersStudent1
+        if ($confirmedResp.status -eq "confirmed") { break }
+        Start-Sleep -Milliseconds 100
+    }
+    if ($null -ne $confirmedResp -and $confirmedResp.status -eq "confirmed") {
+        Write-Pass "Web О1.1: Підтверджено попередній запис через /registrations -> done -> confirmed"
+    } else {
+        Write-Fail "Очікувався статус confirmed після /registrations, отримано: $($confirmedResp.status)"
     }
 
     $reConfirmedResp = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollments/$heldId/confirm" -Method Post -Headers $webHeadersStudent1
     if ($reConfirmedResp.status -eq "confirmed" -and $reConfirmedResp.version -eq $confirmedResp.version) {
-        Write-Pass "Web О1.1: Повторне підтвердження є ідемпотентним (HTTP 200, версія $($reConfirmedResp.version) не змінилась)"
+        Write-Pass "Web О1.1: Повторне підтвердження за наявності decanate_roster є ідемпотентним (HTTP 200, версія $($reConfirmedResp.version) не змінилась)"
     } else {
         Write-Fail "Помилка повторного підтвердження: status=$($reConfirmedResp.status), v=$($reConfirmedResp.version)"
     }
@@ -1313,7 +1334,17 @@ try {
     $o22Key = "idem-verify-o22-" + [guid]::NewGuid().ToString("N")
     $tokO22S1 = Get-WebToken "student-1"
     $o22First = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokO22S1"; "Idempotency-Key" = $o22Key } -Body '{  "group_id" : "DISC-WEB-01"  }'
-    $null = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments/$($o22First.id)/confirm" -Method Post -Headers @{ "Authorization" = "Bearer $tokO22S1" }
+    $o22Reg = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments/$($o22First.id)/registrations" -Method Post -Headers @{ "Authorization" = "Bearer $tokO22S1" }
+    for ($rw = 0; $rw -lt 40; $rw++) {
+        Start-Sleep -Milliseconds 150
+        $o22ReqSt = Invoke-RestMethod -Uri "$BaseUrl/v1/enrollment-requests/$($o22Reg.id)" -Method Get -Headers $Headers
+        if ($o22ReqSt.status -in @("done", "rejected", "failed")) { break }
+    }
+    for ($cw = 0; $cw -lt 20; $cw++) {
+        $o22State = Invoke-RestMethod -Uri "http://localhost:8001/v1/enrollments/$($o22First.id)" -Method Get -Headers @{ "Authorization" = "Bearer $tokO22S1" }
+        if ($o22State.status -eq "confirmed") { break }
+        Start-Sleep -Milliseconds 100
+    }
     $o22ReplayOnB = Invoke-RestMethod -Uri "http://localhost:8002/v1/enrollments" -Method Post -Headers @{ "Content-Type" = "application/json"; "Authorization" = "Bearer $tokO22S1"; "Idempotency-Key" = $o22Key } -Body '{"group_id":"DISC-WEB-01"}'
 
     if ($o22ReplayOnB.id -eq $o22First.id -and $o22ReplayOnB.status -eq "held" -and $o22ReplayOnB.version -eq 1 -and $o22ReplayOnB.instance_id -eq "app-a") {

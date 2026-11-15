@@ -924,7 +924,7 @@ async function registerWebEnrollmentToRoster(enrollmentId = null, triggerBtn = n
     }
 }
 
-// Підтвердження запису студентом (Web О1.1: held -> confirmed): POST /v1/enrollments/{id}/confirm
+// Підтвердження запису після фіксації у відомості деканату (decanate_roster): POST /v1/enrollments/{id}/confirm
 async function confirmWebEnrollment(enrollmentId) {
     if (isRegistrationBusy(enrollmentId)) {
         appendWebOpLog(
@@ -1152,7 +1152,7 @@ async function readAllWebEnrollmentPages() {
             btnConfirm.style.marginRight = '4px';
             btnConfirm.dataset.action = 'confirm';
             btnConfirm.textContent = 'Підтвердити';
-            btnConfirm.title = 'Пряме підтвердження студентом без запису до відомості (POST /confirm)';
+            btnConfirm.title = 'Підтвердити запис після фіксації у відомості деканату (POST /confirm)';
             btnConfirm.disabled = isBusy;
             btnConfirm.addEventListener('click', () => confirmWebEnrollment(item.id));
             tdActions.appendChild(btnConfirm);

@@ -1481,8 +1481,12 @@ paths:
     post:
       operationId: confirmStudentEnrollment
       tags: [Web]
-      summary: "Підтвердження попереднього запису студентом (Web О1.1, О3.2: held -> confirmed)"
-      description: Переводить власний запис студента у стан `confirmed` (остаточне зарахування).
+      summary: "Підтвердження запису після внесення до відомості деканату (Web О1.1, О3.2: held -> confirmed)"
+      description: |
+        Переводить власний запис студента зі стану `held` у стан `confirmed` за наявності відповідного запису
+        у відомості деканату (`decanate_roster`), або ідемпотентно повертає вже підтверджений запис.
+        Якщо запис у `decanate_roster` відсутній (і термін бронювання ще не сплив), повертає
+        `409 Conflict` (`roster_registration_required`) без зміни статусу та лічильників.
       security:
         - webBearerAuth: []
       parameters:
@@ -1520,11 +1524,30 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "409":
-          description: Термін дії резерву сплив (expired) або запис скасовано
+          description: Відсутній запис у decanate_roster (`roster_registration_required`), термін дії резерву сплив (`expired`) або запис скасовано
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                roster_registration_required:
+                  summary: Запис ще не внесено до відомості деканату
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/roster_registration_required"
+                    title: "Необхідна реєстрація у відомості деканату"
+                    status: 409
+                    detail: "Підтвердження запису (held -> confirmed) дозволене лише після фіксації у відомості деканату (decanate_roster) через контур РПО (POST /v1/enrollments/{id}/registrations)."
+                    instance: "/v1/enrollments/8f14e45f-ceea-467a-9a38-1b241d45b001/confirm"
+                    error_code: "roster_registration_required"
+                expired:
+                  summary: Термін резервування сплив
+                  value:
+                    type: "https://urn.c10.edu.ua/problems/enrollment_expired"
+                    title: "Термін резервування сплив"
+                    status: 409
+                    detail: "Час утримання місця (held, 15 хв) завершився, запис перейшов у стан 'expired'."
+                    instance: "/v1/enrollments/8f14e45f-ceea-467a-9a38-1b241d45b001/confirm"
+                    error_code: "enrollment_expired"
 
   /v1/enrollments/{id}/cancel:
     post:
@@ -1634,10 +1657,10 @@ paths:
         деканату (decanate_roster) та фіксації статусу confirmed.
 
         Семантичне розмежування:
-        - Прямий POST /v1/enrollments/{id}/confirm — базова операція Web-контуру (підтвердження вибору студентом).
-        - POST /v1/enrollments/{id}/registrations — наскрізна інтеграція Web + РПО (внесення до відомості через чергу).
+        - POST /v1/enrollments/{id}/registrations — штатна інтеграція Web + РПО (внесення `held`-запису до `decanate_roster` через чергу з переходом у `confirmed`).
+        - POST /v1/enrollments/{id}/confirm — повторна фіксація або завершення переходу `held -> confirmed` лише за наявності запису в `decanate_roster` (інакше повертає `409 roster_registration_required`).
 
-        Якщо запис вже переведено у confirmed (наприклад, прямим confirm), повторний виклик повертає
+        Якщо запис вже переведено у confirmed, повторний виклик повертає
         409 Conflict (enrollment_not_held), оскільки запис уже підтверджено і він не може потрапити до відомості двічі.
 
         Підтримка Idempotency-Key:

@@ -430,21 +430,14 @@ public sealed class EnrollmentService : IWebEnrollmentConfirmationService
                     "Час утримання місця (held, 15 хв) завершився, запис перейшов у стан 'expired'.");
             }
 
-            bool confirmed = await _enrollmentRepo.ConfirmEnrollmentHeldAsync(enrollmentId, conn, tx, cancellationToken);
-            if (!confirmed)
-            {
-                await tx.RollbackAsync(cancellationToken);
-                return ServiceResult<WebEnrollmentResponseDto>.Failure(
-                    StatusCodes.Status409Conflict,
-                    "enrollment_not_held",
-                    "Неможливо підтвердити запис",
-                    "Запис не перебуває у стані 'held' або вже був змінений.");
-            }
-
-            await tx.CommitAsync(cancellationToken);
-
-            var updated = await _enrollmentRepo.GetEnrollmentByIdAsync(enrollmentId, studentId, cancellationToken);
-            return ServiceResult<WebEnrollmentResponseDto>.Ok(updated!);
+            // Запис ще у стані held (не expired), але не зафіксований у decanate_roster:
+            // пряме підтвердження заборонено до проходження контуру РПО (/registrations).
+            await tx.RollbackAsync(cancellationToken);
+            return ServiceResult<WebEnrollmentResponseDto>.Failure(
+                StatusCodes.Status409Conflict,
+                "roster_registration_required",
+                "Необхідна реєстрація у відомості деканату",
+                "Підтвердження запису (held -> confirmed) дозволене лише після фіксації у відомості деканату (decanate_roster) через контур РПО (POST /v1/enrollments/{id}/registrations).");
         }
         catch
         {
