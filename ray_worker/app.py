@@ -38,7 +38,14 @@ def _log_json(event: str, **fields) -> None:
         "instance": socket.gethostname(),
         **fields,
     }
-    print(json.dumps(entry, ensure_ascii=False), flush=True)
+    line = json.dumps(entry, ensure_ascii=False)
+    print(line, flush=True)
+    try:
+        with open("/proc/1/fd/1", "a", encoding="utf-8") as pid1_stdout:
+            pid1_stdout.write(line + "\n")
+            pid1_stdout.flush()
+    except OSError:
+        pass
 
 
 def _get_ray_attempt_number() -> int:

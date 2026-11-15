@@ -23,8 +23,8 @@
 - **Спільна взаємодія С10 (Web + РПО)**:
   1. Web-контур (`app-a` / `app-b`) резервує місце в `enrollments` зі статусом `held` (`POST /v1/enrollments`).
   2. Реєстрація у відомості (`POST /v1/enrollments/{id}/registrations`) передає попередньо зарезервований запис (`held`) у чергу РПО.
-  3. Диспетчер `app-a` відправляє задачу у кластер Ray (`ray-head` / `ray-worker`).
-  4. Ray-воркер виконує затримку та викликає захищений приймач `POST /v1/internal/ray-effect-receiver`.
+  3. Диспетчер `app-a` відправляє задачу на `ray-head` (`0 CPU`), який планує виконання `@ray.remote`-функції на окремому воркері `ray-worker` (`4 CPU`).
+  4. Окремий Ray-воркер (`ray-worker`) виконує затримку та викликає захищений приймач `POST /v1/internal/ray-effect-receiver`.
   5. Приймач у транзакції БД атомарно фіксує ефект у `dpc_applied_effects` та оновлює `decanate_roster` без подвійного списання `available`.
   6. **Окремим етапом після коміту** транзакції приймача викликається сповіщення Web-контуру (`TryNotifyWebAsync`), яке переводить запис `enrollments` зі стану `held` у `confirmed`.
 
@@ -39,8 +39,9 @@ flowchart LR
     Client["Web UI :3000<br>(JS ES6+)"] -->|CORS + Bearer| Nginx["Nginx :8080 / :8000<br>(least_conn & dpc_backend)"]
     Nginx -->|"/v1/auth, /v1/enrollments,<br>/v1/disciplines, /v1/groups"| WebNodes["app-a :8001 & app-b :8002<br>(.NET 8 Minimal API)"]
     Nginx -->|"/v1/enrollment-requests,<br>/registrations, /v1/compute, /metrics"| AppA["app-a (Черга + IN_FLIGHT_LIMIT)"]
-    AppA -->|"Bearer + X-Ray-Internal-Secret"| RayHead["ray-head 127.0.0.1:8266<br>& ray-worker (4 CPU)"]
-    RayHead -->|"POST /v1/internal/ray-effect-receiver"| AppA
+    AppA -->|"Bearer + X-Ray-Internal-Secret"| RayHead["ray-head 127.0.0.1:8266<br>(0 CPU диспетчер)"]
+    RayHead -->|"Ray cluster"| RayWorker["ray-worker (4 CPU)"]
+    RayWorker -->|"POST /v1/internal/ray-effect-receiver"| AppA
     WebNodes --> Postgres[("PostgreSQL 16 :5432<br>dpc_c10 / dpc_c10_test")]
 ```
 
@@ -54,7 +55,7 @@ flowchart LR
 | :--- | :--- | :--- |
 | **Auth / Web ЛР3** | `POST /v1/auth/login`, `POST /v1/auth/logout`, `GET /v1/me` | Вхід за `username`/`password`, спільна сесія в БД (`app-a`/`app-b`), негайне відкликання токена `wbt_...` |
 | **Каталог Web C10** | `GET /v1/disciplines`, `GET /v1/students`, `GET /v1/students/{id}` | Каталог із Base64-курсором; картка та список студентів із фільтрацією власника/`staff` |
-| **Записи Web C10** | `POST/GET /v1/enrollments`, `GET/PATCH /v1/enrollments/{id}` | Резервування (`held`, `Idempotency-Key`), читання (`404`-паритет), переведення групи (`If-Match`/`ETag`) |
+| **Записи Web C10** | `POST/GET /v1/enrollments`, `GET/PATCH /v1/enrollments/{id}` | Резервування (`held`, `Idempotency-Key`), читання (`404`-паритет), переведення групи (перевірка `If-Match`/`ETag` за наявності заголовка) |
 | **Дії над записом** | `POST .../confirm`, `.../cancel`, `.../registrations` | Підтвердження, скасування або передача попередньо зарезервованого запису (`held`) у чергу РПО |
 | **Персонал (Staff)** | `POST /v1/groups/{id}/close` | Закриття групи персоналом деканату (`403` для ролі `user`) |
 | **Черга та інваріант** | `POST/GET /v1/enrollment-requests`, `GET /v1/group-seats`, `GET /v1/decanate-roster` | Черга РПО (`202`/`429`), опитування з `first_read_at`, інваріант місць, відомість деканату |
@@ -131,7 +132,7 @@ flowchart LR
 | **Web О2.3** | `Services/FaultInjector.cs`, `Endpoints/EnrollmentEndpoints.cs` | Збій `after_commit_before_response` -> `fault.hit`, повтор через `app-b` без дубля |
 | **Web О2.4** | `client/api.js` | `AbortController` таймаут, backoff + jitter, дотримання `Retry-After` |
 | **Web О3.1** | `Services/WebAuthService.cs`, `Repositories/AuthRepository.cs`, `Http/RequestIdentityMiddleware.cs` | `PBKDF2-SHA256`, непрозорі токени `wbt_...`, спільна сесія та миттєвий `logout` на `app-a`/`app-b`, ігнорування `X-User-Id`, розділення з `API_AUTH_TOKEN` |
-| **Web О3.2** | `Endpoints/EnrollmentEndpoints.cs`, `Endpoints/GroupEndpoints.cs`, `Repositories/EnrollmentRepository.cs` | Фільтрація за власником, однаковий `404`, `PATCH` + `If-Match`/`ETag`, `422` при підміні полів у тілі, `staff`-захист `/close` (`403` для `user`) |
+| **Web О3.2** | `Endpoints/EnrollmentEndpoints.cs`, `Endpoints/GroupEndpoints.cs`, `Repositories/EnrollmentRepository.cs` | Фільтрація за власником, однаковий `404`, `PATCH` (перевірка `If-Match`/`ETag` за наявності заголовка), `422` при підміні полів у тілі, `staff`-захист `/close` (`403` для `user`) |
 | **Web О3.3** | `Extensions/ServiceCollectionExtensions.cs`, `Program.cs` | Явний `CORS_ALLOWED_ORIGINS` без `*`, `Vary: Origin`, облік `OPTIONS` |
 | **Web О3.4** | `client/index.html`, `client/api.js` | Живе виконання 7 кроків `runWebLab3Scenario()` на `:3000` (`23` CORS-перевірки, `0` збоїв) |
 
@@ -152,7 +153,7 @@ flowchart LR
 | **РПО О2.2** | `Services/Compute/C10IntensityMath.cs`, `scripts/measure_compute.ps1` | При подвоєнні $n$ похибка падає в `4.0000` раза ($O(h^2)$) проти $I_{\text{ref}}$ |
 | **РПО О2.3** | `Services/Compute/ComputeWorkerProcess.cs`, `docs/architecture-and-experiments.md` | `dotnet-trace` + `naive -> composite`: прискорення `2.165x` ($p=1$), $S_{\text{med}}(4)=3.113$ |
 | **РПО О2.4** | `Services/Compute/ParallelComputeService.cs`, `Services/Compute/ComputeWorkerProcess.cs` | `MemoryMappedFile`: `local` і `lock` точні, `none` втрачає оновлення (похибка `552.08`) |
-| **РПО О3.1** | `ray_worker/app.py`, `Services/Processing/RayTaskClient.cs`, `compose.yaml` | Кластер `ray-head` + `ray-worker` (`alive_nodes=2`), порт `127.0.0.1:8266`, `/dispatch` перевіряє `Bearer` (`401`) і `X-Ray-Internal-Secret` (`403`) без довільного `receiver_url` |
+| **РПО О3.1** | `ray_worker/app.py`, `Services/Processing/RayTaskClient.cs`, `compose.yaml` | `ray-head` (`0 CPU`) + окремий `ray-worker` (`4 CPU`, `alive_nodes=2`, `worker_id=ray:ray-worker:pid-...`), порт `127.0.0.1:8266`, `/dispatch` перевіряє `Bearer` (`401`) і `X-Ray-Internal-Secret` (`403`) |
 | **РПО О3.2** | `Services/EnrollmentWorkerPool.cs` | `_dequeueGate` звільняється одразу після отримання слота й вилучення заявки, а слот `IN_FLIGHT_LIMIT` (`_activeInFlightCount`) утримується до завершення задачі (`ReleaseInFlightSlot()`); перевірено на 6 задачах (`max_in_flight_observed=2`) |
 | **РПО О3.3** | `Services/Processing/RayEffectReceiverService.cs`, `Repositories/EnrollmentRequestRepository.cs`, `Services/Processing/EnrollmentRequestProcessor.cs` | Атомарне збереження в `dpc_applied_effects` (`pg_advisory_xact_lock`), захист зафіксованих `done`/`rejected` від перезапису статусом `failed` при втраті відповіді Ray |
 | **РПО О3.4** | `ray_worker/app.py`, `Services/FaultInjector.cs` | Файловий прапорець `/faults/after_effect_before_ack`: збій після запису ефекту до ack, повтор Ray завершився ідемпотентно (`delivery_count=2`, `roster_count=1`) |
@@ -173,7 +174,10 @@ dotnet test tests/EnrollmentService.Tests/EnrollmentService.Tests.csproj --confi
 # 3. Заміри обчислень ЛР2 (окремі процеси ОС + shared memory)
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/measure_compute.ps1
 
-# 4. Повна контейнерна E2E-перевірка ЛР1–ЛР3 (включаючи автозапуск клієнта :3000)
+# 4. Відтворення емпіричної вибірки N=500 (empirical_metrics_500.json)
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/measure_metrics_500.ps1
+
+# 5. Повна контейнерна E2E-перевірка ЛР1–ЛР3 (включаючи автозапуск клієнта :3000)
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify_all.ps1
 ```
 

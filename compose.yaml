@@ -138,7 +138,7 @@ services:
     command:
       - sh
       - -c
-      - "ray start --head --port=6379 --include-dashboard=false --num-cpus=1 && RAY_ADDRESS=auto uvicorn app:app --host 0.0.0.0 --port 8266"
+      - "ray start --head --port=6379 --include-dashboard=false --num-cpus=0 && RAY_ADDRESS=auto uvicorn app:app --host 0.0.0.0 --port 8266"
     environment:
       RAY_ADDRESS: "auto"
       FAULTS_DIR: "/faults"

@@ -1177,17 +1177,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
         "403":
-          description: Роль користувача не дозволяє створення студентського запису
+          description: Роль автентифікованого користувача (за Web Bearer-токеном) не дозволяє створення студентського запису
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
-                title: "Відсутній обов'язковий заголовок X-User-Id"
-                status: 400
-                detail: "До введення автентифікації в ЛР3 ідентифікатор студента має обов'язково передаватися у заголовку X-User-Id."
+              example:
+                type: "https://urn.c10.edu.ua/problems/forbidden"
+                title: "Доступ заборонено"
+                status: 403
+                detail: "Ідентифікація виконується за Web Bearer-токеном; створення запису дозволено лише обліковим записам студентів (role = user)."
                 instance: "/v1/enrollments"
-                error_code: "missing_user_header"
-                request_id: "req-400-demo"
+                error_code: "forbidden"
+                request_id: "req-403-demo"
         "404":
           description: Навчальну групу або студента не знайдено
           content:
@@ -1401,6 +1403,7 @@ paths:
       tags: [Web]
       summary: Зміна групи активного запису (held) власником із перевіркою версії ETag (Web О3.2)
       description: Переводить власний запис студента в стані `held` в іншу відкриту групу. Для чужого об'єкта повертає 404; при спробі змінити `student_id`, `status` або `version` — 422.
+      x-course: update
       security:
         - webBearerAuth: []
       parameters:
@@ -1413,7 +1416,7 @@ paths:
         - name: If-Match
           in: header
           required: false
-          description: Поточна версія або ETag запису для оптимістичного блокування
+          description: Поточна версія або ETag запису для оптимістичного блокування (перевіряється за наявності заголовка)
           schema:
             type: string
         - $ref: "#/components/parameters/XRequestIdHeader"
@@ -1424,8 +1427,18 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/PatchWebEnrollmentRequest"
-            example:
-              group_id: "DISC-AI-02"
+            examples:
+              normal:
+                summary: Зміна навчальної групи активного запису (held)
+                value:
+                  group_id: "DISC-AI-02"
+              forbidden:
+                summary: Спроба змінити захищені поля student_id, status або version (очікується HTTP 422)
+                value:
+                  group_id: "DISC-AI-02"
+                  student_id: "student-2"
+                  status: "confirmed"
+                  version: 99
       responses:
         "200":
           description: Групу запису успішно змінено
@@ -1470,7 +1483,6 @@ paths:
       tags: [Web]
       summary: "Підтвердження попереднього запису студентом (Web О1.1, О3.2: held -> confirmed)"
       description: Переводить власний запис студента у стан `confirmed` (остаточне зарахування).
-      x-course: update
       security:
         - webBearerAuth: []
       parameters:

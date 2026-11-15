@@ -88,7 +88,7 @@ erDiagram
 
 ### 3.3 Серверна автентифікація, об'єктний доступ і CORS (Web ЛР3: О3.1–О3.4)
 - **Непрозорі токени (О3.1)**: таблиці `web_users` (`PBKDF2-SHA256`, 100 000 ітерацій з сіллю) та `web_auth_tokens` (SHA-256 хеш токена `wbt_...`, `expires_at`, `revoked_at`). Перевіряються у `RequestIdentityMiddleware` для обох вузлів `app-a` і `app-b`. Заголовок `X-User-Id` повністю ігнорується. Служебний `API_AUTH_TOKEN` РПО та користувацькі Web-токени суворо ізольовані (`401` при перехресному використанні).
-- **Доступ до об'єктів та RBAC (О3.2)**: списки `/v1/enrollments` та `/v1/students` фільтруються за поточним автентифікованим користувачем; читання/зміна/підтвердження/скасування чужого чи відсутнього `enrollmentId` однаково повертають `404`; `PATCH /v1/enrollments/{id}` вимагає `If-Match` та оновлює `ETag` (`409` при конфлікті версії); поля власника/статусу/версії в тілі заборонені (`422`); `POST /v1/groups/{id}/close` дозволено лише для `staff` (`403` для `user`, `401` без токена).
+- **Доступ до об'єктів та RBAC (О3.2)**: списки `/v1/enrollments` та `/v1/students` фільтруються за поточним автентифікованим користувачем; читання/зміна/підтвердження/скасування чужого чи відсутнього `enrollmentId` однаково повертають `404`; `PATCH /v1/enrollments/{id}` перевіряє заголовок `If-Match` за його наявності (`409` при конфлікті версії) та оновлює `ETag`; поля власника/статусу/версії в тілі заборонені (`422`); `POST /v1/groups/{id}/close` дозволено лише для `staff` (`403` для `user`, `401` без токена).
 - **CORS (О3.3)**: у `Program.cs` задано явний білий список `CORS_ALLOWED_ORIGINS` (`http://localhost:3000`, `http://127.0.0.1:3000`), методи `GET, POST, PATCH, OPTIONS` та дозволені заголовки; сторонній `Origin` не отримує `Access-Control-Allow-Origin` (і ніколи `*`).
 
 ---
@@ -107,7 +107,7 @@ erDiagram
 
 ### 4.3 Кластер Ray, `IN_FLIGHT_LIMIT`, приймач ефекту та відновлення (РПО ЛР3: О3.1–О3.4)
 1. **Захищений диспетчер Ray (`ray_worker/app.py`)**:
-   - Порт `8266` у `compose.yaml` публікується лише на `127.0.0.1:8266:8266`; контейнер `app-a` очікує `ray-head: service_healthy`.
+   - Головний вузол `ray-head` запускається з `--num-cpus=0` (координатор кластера та FastAPI-диспетчер `/dispatch`), а окремий контейнер `ray-worker` виділяє `--num-cpus=4` для фактичного виконання `@ray.remote`-задач. Порт `8266` у `compose.yaml` публікується лише на `127.0.0.1:8266:8266`; контейнер `app-a` очікує `ray-head: service_healthy`.
    - `POST /dispatch` перевіряє `Authorization: Bearer <API_AUTH_TOKEN>` (`401`) та `X-Ray-Internal-Secret` (`403`) через `hmac.compare_digest`, обмежує параметри (`slow_min_ms`/`slow_max_ms <= 5000`, `max_retries <= 5`), а `execute_dpc_enrollment_task` використовує виключно конфігурацію `INTERNAL_RECEIVER_URL`, `API_AUTH_TOKEN` і `INTERNAL_RECEIVER_SECRET` зі змінних оточення Ray-контейнера.
 2. **Обмежувач незавершених задач (`IN_FLIGHT_LIMIT`, О3.2)**:
    - В `EnrollmentWorkerPool` дозвіл на незавершену задачу (`WaitForInFlightSlotAsync`/`WaitForInFlightSlotBlocking`) під захистом `_dequeueGate` (`SemaphoreSlim(1, 1)`) береться **до** вилучення заявки з обмеженої черги. Звільнення слота виконується в `finally` одразу після завершення задачі незалежно від порядку фінішу.

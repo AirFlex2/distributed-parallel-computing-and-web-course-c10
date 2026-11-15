@@ -1686,10 +1686,10 @@ console.log(JSON.stringify({
     }
     $effRow = (& $DockerExe compose exec -e PGPASSWORD=dpc_password -T postgres psql -U dpc_user -d dpc_c10 -t -A -c "SELECT status || '|' || delivery_count || '|' || worker_id FROM dpc_applied_effects WHERE request_id = '$rayReqId';") | Out-String
     $effRowTrim = $effRow.Trim()
-    if ($null -ne $rayFinal -and $rayFinal.status -eq "done" -and $effRowTrim -match '^done\|1\|ray:') {
-        Write-Pass "РПО О3.1 та О3.3: Заявка $rayReqId виконана у Ray-кластері зі збереженням у dpc_applied_effects ($effRowTrim) та decanate_roster."
+    if ($null -ne $rayFinal -and $rayFinal.status -eq "done" -and $effRowTrim -match '^done\|1\|ray:ray-worker:pid-\d+$') {
+        Write-Pass "РПО О3.1 та О3.3: Заявка $rayReqId виконана на окремому воркері ray-worker зі збереженням у dpc_applied_effects ($effRowTrim) та decanate_roster."
     } else {
-        Write-Fail "Помилка виконання заявки у Ray О3.1/О3.3: status=$($rayFinal.status), effect='$effRowTrim'"
+        Write-Fail "Помилка виконання заявки на ray-worker О3.1/О3.3: status=$($rayFinal.status), effect='$effRowTrim' (очікується worker_id=ray:ray-worker:pid-...)"
     }
 
     # 14.2 О3.2: Обмеження кількості незавершених задач IN_FLIGHT_LIMIT=2
@@ -1768,9 +1768,14 @@ console.log(JSON.stringify({
 
 } finally {
     Stop-SpawnedClientServer
+    Remove-Item (Join-Path $RepoRoot "faults/after_*") -Force -ErrorAction SilentlyContinue
     Write-Info "Повернення середовища у штатно-захищений режим ALLOW_TEST_OVERRIDES=false..."
-    $null = Set-TestOverridesMode -enable $false
-    Write-Pass "Захищений режим ALLOW_TEST_OVERRIDES=false успішно відновлено."
+    $restored = Set-TestOverridesMode -enable $false
+    if ($restored) {
+        Write-Pass "Захищений режим ALLOW_TEST_OVERRIDES=false успішно відновлено."
+    } else {
+        Write-Fail "Не вдалося відновити захищений режим ALLOW_TEST_OVERRIDES=false після завершення перевірок!"
+    }
 }
 
 Write-Header "РЕЗУЛЬТАТ КОМПЛЕКСНОЇ ПЕРЕВІРКИ ЛР1 + ЛР2 + ЛР3"
